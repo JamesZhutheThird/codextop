@@ -35,6 +35,7 @@ DEFAULT_LOG_FILE = "quota_snapshots.jsonl"
 DEFAULT_CONTROL_FILE = "sampler_control.json"
 DEFAULT_STATE_FILE = "codextop_state.json"
 DEFAULT_SAMPLER_INTERVAL_SECONDS = 60
+APP_VERSION = "v1.0.1"
 DEFAULT_PERIOD = "5h"
 DEFAULT_CURVE_MODE = "connected"
 DEFAULT_DISPLAY_SCOPE = "all"
@@ -69,6 +70,16 @@ PERIOD_SECONDS = {
     "30d": 30 * 86400,
     "all": None,
 }
+WINDOW_MARKERS = {
+    "5h": "●",
+    "7d": "◆",
+}
+WINDOW_PRIORITIES = {
+    "5h": 2,
+    "7d": 1,
+}
+RESET_CREDIT_TITLE_WIDTH = 6
+RESET_CREDIT_MIN_BAR_WIDTH = 6
 GAP_SECONDS = 3 * 60
 ANSI_RE = re.compile(r"\x1b\[[0-9;?<>]*[A-Za-z~]")
 
@@ -232,6 +243,34 @@ def countdown(seconds: Any) -> str:
     return quota.countdown_text(seconds).strip()
 
 
+def reset_credit_countdown(seconds: Any, day_width: int) -> str:
+    day_width = max(1, day_width)
+    if not isinstance(seconds, (int, float)):
+        return f"{'-' * day_width}d --h"
+    total = max(0, int(seconds))
+    days, rem = divmod(total, 86400)
+    hours = rem // 3600
+    return f"{days:{day_width}d}d {hours:2d}h"
+
+
+def reset_credit_day_width(seconds_values: list[Any]) -> int:
+    max_days = 0
+    found_number = False
+    for seconds in seconds_values:
+        if not isinstance(seconds, (int, float)):
+            continue
+        found_number = True
+        max_days = max(max_days, max(0, int(seconds)) // 86400)
+    if not found_number:
+        return 1
+    return max(1, len(str(max_days)))
+
+
+def reset_credit_right_width(day_width: int) -> int:
+    digits = "9" * max(1, day_width)
+    return visible_width(f"于 {digits}d 23h 后过期")
+
+
 def format_time(ts: int | float | None) -> str:
     if not isinstance(ts, (int, float)):
         return "-"
@@ -365,11 +404,15 @@ def reset_rows(account: dict[str, Any], width: int) -> list[str]:
         if not credits:
             rows.append(center_ansi(paint("无可用重置次数", "dim"), width))
             return rows
+        reset_items: list[tuple[str, Any, Any]] = []
         for credit in credits[:4]:
             title = quota.compact_reset_title(credit.get("title"))
             seconds = credit.get("expires_after_seconds")
             remaining = credit.get("expires_remaining_percent")
-            rows.append(reset_credit_row(title, remaining, seconds, width))
+            reset_items.append((title, remaining, seconds))
+        day_width = reset_credit_day_width([item[2] for item in reset_items])
+        for title, remaining, seconds in reset_items:
+            rows.append(reset_credit_row(title, remaining, seconds, width, day_width))
         return rows
 
     available = account.get("rc")
@@ -379,26 +422,32 @@ def reset_rows(account: dict[str, Any], width: int) -> list[str]:
         rows.append(center_ansi(paint("无可用重置次数", "dim"), width))
         return rows
     now = int(time.time())
+    reset_items: list[tuple[str, Any, Any]] = []
     for credit in credits[:4]:
         if not isinstance(credit, list) or len(credit) < 2:
             continue
         title, expires_epoch = credit[:2]
         remaining_percent = credit[2] if len(credit) > 2 else None
         remaining = expires_epoch - now if isinstance(expires_epoch, int) else None
-        rows.append(reset_credit_row(str(title), remaining_percent, remaining, width))
+        reset_items.append((str(title), remaining_percent, remaining))
+    day_width = reset_credit_day_width([item[2] for item in reset_items])
+    for title, remaining_percent, remaining in reset_items:
+        rows.append(reset_credit_row(title, remaining_percent, remaining, width, day_width))
     return rows
 
 
-def reset_credit_row(title: str, remaining_percent: Any, seconds: Any, width: int) -> str:
-    left_width = 6
-    right_text = f"于 {countdown(seconds)} 后过期"
-    right_width = visible_width(right_text)
-    bar_width = max(6, width - left_width - right_width - 2)
+def reset_credit_row(title: str, remaining_percent: Any, seconds: Any, width: int, day_width: int = 1) -> str:
+    left_width = RESET_CREDIT_TITLE_WIDTH
+    right_text = f"于 {reset_credit_countdown(seconds, day_width)} 后过期"
+    right_width = min(
+        reset_credit_right_width(day_width),
+        max(0, width - left_width - RESET_CREDIT_MIN_BAR_WIDTH - 2),
+    )
+    bar_width = max(RESET_CREDIT_MIN_BAR_WIDTH, width - left_width - right_width - 2)
     style = quota.reset_after_style(seconds)
     left = f"{plain_fit(title, left_width):<{left_width}} {progress_bar(remaining_percent, bar_width)}"
-    right = paint_style(right_text, style)
-    gap = max(1, width - visible_width(left) - visible_width(right))
-    row = f"{left}{' ' * gap}{right}"
+    right = fit_ansi(paint_style(right_text, style), right_width) if right_width else ""
+    row = f"{left} {right}" if right else left
     return fit_ansi(row, width)
 
 
@@ -407,9 +456,10 @@ def quota_rows(account: dict[str, Any], width: int, *, compact: bool = False) ->
     for key in ("5h", "7d"):
         info = window_info(account, key)
         left = info["left"]
-        label = paint(key, bold=True)
+        label_text = f"{key}({WINDOW_MARKERS[key]})"
+        label = paint(label_text, bold=True)
         pct = paint(percent_text(left).rjust(4), percent_color(left))
-        bar_width = max(8, width - visible_width(key) - 1 - 1 - 4)
+        bar_width = max(8, width - visible_width(label_text) - 1 - 1 - 4)
         rows.append(f"{label} {progress_bar(left, bar_width)} {pct}")
         reset_line = f"于 {countdown(info['reset_after'])} 后在 {info['reset_at']} 重置"
         rows.append(right_ansi(paint_style(reset_line, quota.reset_after_style(info["reset_after"])), width))
@@ -598,11 +648,11 @@ def chart_lines(
         elif priority >= old_priority:
             grid[row][column] = (char, color, priority)
 
-    specs = {"7d": ("◆", 1), "5h": ("●", 2)}
     for label, series in points.items():
         if not series:
             continue
-        char, priority = specs[label]
+        char = WINDOW_MARKERS[label]
+        priority = WINDOW_PRIORITIES[label]
         previous_row: int | None = None
         previous_value: float | None = None
         for column in range(plot_width):
@@ -956,7 +1006,7 @@ def render_sidebar(state: MonitorState, width: int, height: int, x_origin: int, 
     zones.append(ClickZone(x_origin + exit_start, x_origin + exit_start + visible_width(exit_text) - 1, y, "exit", None))
     add_plain("")
     add_plain("@JamesZhutheThird", "dim")
-    add_plain("v20260702", "dim")
+    add_plain(APP_VERSION, "dim")
     lines.append(paint("╰" + "─" * inner + "╯", "cyan"))
     return [fit_ansi(line, width) for line in lines[:height]]
 
