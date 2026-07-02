@@ -19,9 +19,9 @@ TOOLKIT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLKIT_DIR))
 import check_codex_quota as quota
 try:
-    from .paths import default_paths, ensure_runtime_layout
+    from .paths import default_paths, ensure_runtime_layout, monthly_log_path
 except ImportError:
-    from paths import default_paths, ensure_runtime_layout
+    from paths import default_paths, ensure_runtime_layout, monthly_log_path
 
 
 DEFAULT_PATHS = default_paths()
@@ -120,9 +120,10 @@ def make_snapshot(auth_file: Path, auth_list: Path, all_auth: bool, tz_name: str
     }
 
 
-def append_snapshot(log_path: Path, snapshot: dict[str, Any]) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as handle:
+def append_snapshot(log_path: Path, snapshot: dict[str, Any], tz_name: str) -> None:
+    monthly_path = monthly_log_path(log_path, snapshot.get("t"), tz_name)
+    monthly_path.parent.mkdir(parents=True, exist_ok=True)
+    with monthly_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")))
         handle.write("\n")
         handle.flush()
@@ -229,7 +230,7 @@ def run_once(log_path: Path, auth_file: Path, auth_list: Path, all_auth: bool, t
         snapshot = make_snapshot(auth_file, auth_list, all_auth, tz_name)
     except Exception as exc:
         snapshot = {"t": epoch_now(), "err": str(exc)}
-    append_snapshot(log_path, snapshot)
+    append_snapshot(log_path, snapshot, tz_name)
     return snapshot
 
 
@@ -299,7 +300,7 @@ def main() -> int:
     parser.add_argument(
         "--log-file",
         default=DEFAULT_LOG_FILE,
-        help=f"Quota JSONL file name. Default: {DEFAULT_LOG_FILE}",
+        help=f"Base quota JSONL file name for monthly logs. Default: {DEFAULT_LOG_FILE}",
     )
     parser.add_argument(
         "--control-file",

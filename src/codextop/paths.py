@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 CODEX_DIR_ENV = "CODEXTOP_CODEX_DIR"
@@ -18,6 +19,7 @@ CODEX_HOME_ENV = "CODEX_HOME"
 RUNTIME_DIR_NAME = "codextop"
 AUTH_FILE_RE = re.compile(r"auth-([A-Za-z0-9][A-Za-z0-9_.-]*)\.json$")
 LEGACY_AUTH_FILE_RE = re.compile(r"auth-plus-(\d+)\.json$")
+MONTHLY_LOG_RE = re.compile(r"^(?P<stem>.+)_(?P<month>\d{4}-\d{2})(?P<suffix>\.[^.]+)?$")
 
 
 @dataclass(frozen=True)
@@ -88,6 +90,55 @@ def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
 
 def atomic_write_json(path: Path, payload: dict[str, Any], mode: int = 0o600) -> None:
     atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n", mode)
+
+
+def timezone_for_name(tz_name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
+
+
+def monthly_log_path(base_log_path: Path, timestamp: int | float | None, tz_name: str) -> Path:
+    base_log_path = base_log_path.expanduser()
+    tz = timezone_for_name(tz_name)
+    observed = datetime.fromtimestamp(timestamp, tz) if isinstance(timestamp, (int, float)) else datetime.now(tz)
+    suffix = base_log_path.suffix or ".jsonl"
+    return base_log_path.with_name(f"{base_log_path.stem}_{observed:%Y-%m}{suffix}")
+
+
+def recent_month_keys(tz_name: str, count: int = 2) -> set[str]:
+    tz = timezone_for_name(tz_name)
+    observed = datetime.now(tz)
+    year = observed.year
+    month = observed.month
+    keys: set[str] = set()
+    for _ in range(max(1, count)):
+        keys.add(f"{year:04d}-{month:02d}")
+        month -= 1
+        if month <= 0:
+            month = 12
+            year -= 1
+    return keys
+
+
+def iter_snapshot_log_paths(base_log_path: Path, months: set[str] | None = None) -> list[Path]:
+    base_log_path = base_log_path.expanduser()
+    parent = base_log_path.parent
+    suffix = base_log_path.suffix or ".jsonl"
+    pattern = f"{base_log_path.stem}_????-??{suffix}"
+    paths: list[Path] = []
+    if parent.exists():
+        for candidate in sorted(parent.glob(pattern)):
+            match = MONTHLY_LOG_RE.fullmatch(candidate.name)
+            if (
+                match
+                and match.group("stem") == base_log_path.stem
+                and (match.group("suffix") or "") == suffix
+                and (months is None or match.group("month") in months)
+            ):
+                paths.append(candidate)
+    return paths
 
 
 def auth_keyword_from_path(path: Path) -> str | None:

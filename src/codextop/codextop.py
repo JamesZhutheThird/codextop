@@ -24,9 +24,9 @@ TOOLKIT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLKIT_DIR))
 import check_codex_quota as quota
 try:
-    from .paths import default_paths, ensure_runtime_layout
+    from .paths import default_paths, ensure_runtime_layout, iter_snapshot_log_paths, recent_month_keys
 except ImportError:
-    from paths import default_paths, ensure_runtime_layout
+    from paths import default_paths, ensure_runtime_layout, iter_snapshot_log_paths, recent_month_keys
 
 
 DEFAULT_PATHS = default_paths()
@@ -35,7 +35,7 @@ DEFAULT_LOG_FILE = "quota_snapshots.jsonl"
 DEFAULT_CONTROL_FILE = "sampler_control.json"
 DEFAULT_STATE_FILE = "codextop_state.json"
 DEFAULT_SAMPLER_INTERVAL_SECONDS = 60
-APP_VERSION = "v1.0.1"
+APP_VERSION = "v1.0.2"
 DEFAULT_PERIOD = "5h"
 DEFAULT_CURVE_MODE = "connected"
 DEFAULT_DISPLAY_SCOPE = "all"
@@ -468,22 +468,23 @@ def quota_rows(account: dict[str, Any], width: int, *, compact: bool = False) ->
     return rows
 
 
-def read_snapshots(log_path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    if not log_path.exists():
-        return records
-    with log_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record.get("t"), int) and isinstance(record.get("a"), list):
-                records.append(record)
-    return sorted(records, key=lambda item: item["t"])
+def read_snapshots(log_path: Path, period: str, tz_name: str) -> list[dict[str, Any]]:
+    records_by_time: dict[int, dict[str, Any]] = {}
+    months = None if period == "all" else recent_month_keys(tz_name, 2)
+    for path in iter_snapshot_log_paths(log_path, months):
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                timestamp = record.get("t")
+                if isinstance(timestamp, int) and isinstance(record.get("a"), list):
+                    records_by_time[timestamp] = record
+    return [records_by_time[timestamp] for timestamp in sorted(records_by_time)]
 
 
 def account_at(record: dict[str, Any], index: int | str) -> dict[str, Any] | None:
@@ -564,7 +565,7 @@ def read_records_if_due(state: MonitorState, force: bool = False) -> list[dict[s
     now = time.time()
     if force or state.records is None or now >= state.next_read:
         try:
-            state.records = read_snapshots(state.log_path)
+            state.records = read_snapshots(state.log_path, state.period, state.tz)
             state.last_records_read = now
             state.next_read = now + state.interval
             if state.records:
@@ -1186,7 +1187,11 @@ def handle_click(state: MonitorState, zones: list[ClickZone], x: int, y: int) ->
             if zone.kind == "exit":
                 return False
             if zone.kind == "period":
-                state.period = str(zone.value)
+                period = str(zone.value)
+                if state.period != period:
+                    state.period = period
+                    state.records = None
+                    state.next_read = 0.0
             elif zone.kind == "curve_mode":
                 state.curve_mode = str(zone.value)
             elif zone.kind == "display_scope":
@@ -1357,7 +1362,7 @@ def main() -> int:
     parser.add_argument("--curve-mode", choices=["connected", "points"], default=None, help="历史曲线模式：connected 连续，points 间断。")
     parser.add_argument("--display-scope", choices=["all", "current"], default=None, help="展示范围：all 全部账号，current 启用账号。")
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR, help="quota 历史日志目录。")
-    parser.add_argument("--log-file", default=DEFAULT_LOG_FILE, help="quota 历史日志文件名。")
+    parser.add_argument("--log-file", default=DEFAULT_LOG_FILE, help="quota 历史日志基础文件名，用于匹配月度日志。")
     parser.add_argument("--control-file", default=DEFAULT_CONTROL_FILE, help="后台 sampler 控制文件名。")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help="CodexTOP 状态文件名。")
     parser.add_argument("--tz", default="Asia/Shanghai", help="本地时区。")

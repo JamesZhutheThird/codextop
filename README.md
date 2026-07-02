@@ -24,6 +24,8 @@
   <p>专注模式</p>
   <img src="./assets/demo2.png" alt="CodexTOP board mode" width="820">
   <p>看板模式</p>
+  <img src="./assets/demo3.png" alt="CodexTOP single check" width="820">
+  <p>命令行单次查询</p>
 </div>
 
 ## 功能概览
@@ -87,6 +89,7 @@ export CODEXTOP_CODEX_DIR=/path/to/.codex
 ```bash
 ~/.codex/codextop/auth_list/backup/
 ~/.codex/codextop/log/
+~/.codex/codextop/log/quota_snapshots_YYYY-MM.jsonl
 ~/.codex/codextop/settings/current_provider.json
 ~/.codex/codextop/settings/auth_registry.json
 ```
