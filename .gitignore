@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.DS_Store
+.idea/
+.vscode/
+logs/
+runtime/
+auth_list/
+log/
+settings/
+/codextop/
+*.log

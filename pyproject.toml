@@ -1,0 +1,25 @@
+[project]
+name = "codextop"
+version = "20260702"
+description = "Terminal monitor for Codex quota usage."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "rich>=13.0.0",
+]
+
+[project.scripts]
+codextop = "codextop.codextop:main"
+codextop-auth = "codextop.codex_auth:main"
+codextop-check = "codextop.check_codex_quota:main"
+codextop-sampler = "codextop.codex_quota_sampler:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
