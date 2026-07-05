@@ -35,7 +35,7 @@ DEFAULT_LOG_FILE = "quota_snapshots.jsonl"
 DEFAULT_CONTROL_FILE = "sampler_control.json"
 DEFAULT_STATE_FILE = "codextop_state.json"
 DEFAULT_SAMPLER_INTERVAL_SECONDS = 60
-APP_VERSION = "v1.1.0"
+APP_VERSION = "v1.1.1"
 DEFAULT_PERIOD = "5h"
 DEFAULT_CURVE_MODE = "connected"
 DEFAULT_DISPLAY_SCOPE = "all"
@@ -182,6 +182,18 @@ def center_ansi(text: str, width: int) -> str:
 
 def plain_fit(text: Any, width: int) -> str:
     return strip_ansi(fit_ansi(str(text or "-"), width)).rstrip()
+
+
+def ansi_ellipsis(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if visible_width(text) <= width:
+        return fit_ansi(text, width)
+    suffix = "..."
+    suffix_width = visible_width(suffix)
+    if width <= suffix_width:
+        return suffix[:width]
+    return fit_ansi(fit_ansi(text, width - suffix_width).rstrip() + suffix, width)
 
 
 def fg(color: str | None) -> str:
@@ -647,7 +659,7 @@ def account_quota_detail_line(accounts: list[dict[str, Any]], current: int | str
         text = f"{account_id}({percent_text(left)})"
         sortable.append((float(left), paint(text, percent_color(left))))
     entries = [text for _left, text in sorted(sortable, key=lambda item: item[0], reverse=True)]
-    return fit_ansi(", ".join(entries), width)
+    return ansi_ellipsis(", ".join(entries), width)
 
 
 def merged_quota_detail_reset_line(
@@ -657,10 +669,12 @@ def merged_quota_detail_reset_line(
     info: dict[str, Any],
     width: int,
 ) -> str:
-    reset_text = f"{info['reset_at']}重置"
+    reset_text = f"于 {countdown(info['reset_after'])} 后在 {info['reset_at']} 重置"
     reset = paint_style(reset_text, quota.reset_after_style(info["reset_after"]))
-    reset_width = min(visible_width(reset), max(12, width // 3))
-    detail_width = max(8, width - reset_width - 1)
+    reset_width = min(visible_width(reset), width)
+    detail_width = max(0, width - reset_width - 1)
+    if detail_width <= 0:
+        return right_ansi(reset, width)
     detail = account_quota_detail_line(accounts, current, key, detail_width)
     return fit_ansi(detail, detail_width) + " " + right_ansi(reset, reset_width)
 
@@ -837,13 +851,14 @@ def axis_value_text(value: float) -> str:
 
 
 def series_chart_lines(
-    points: dict[str, list[dict[str, Any]]],
+    points: dict[str, Any],
     start_ts: int,
     end_ts: int,
     width: int,
     height: int,
     curve_mode: str,
     max_value: float,
+    value_getter: Any = value_at,
 ) -> list[str]:
     if width <= 10 or height <= 3:
         return [paint("暂无历史数据", "dim")]
@@ -882,7 +897,7 @@ def series_chart_lines(
         for column in range(plot_width):
             ratio = column / max(1, plot_width - 1)
             ts = int(start_ts + (end_ts - start_ts) * ratio)
-            value, _predicted = value_at(series, ts, max_value)
+            value, _predicted = value_getter(series, ts, max_value)
             value = max(0, min(max_value, value))
             normalized = max(0.0, min(100.0, value / max_value * 100))
             row = round((max_value - value) / max_value * (chart_height - 1))
@@ -1125,39 +1140,51 @@ def merged_quota_summary_lines(accounts: list[dict[str, Any]], current: int | st
     return [fit_ansi(line, inner_width) for line in lines[:inner_height]]
 
 
-def merged_window_points(records: list[dict[str, Any]], window: str) -> list[dict[str, Any]]:
-    points: list[dict[str, Any]] = []
+def merged_account_window_points(records: list[dict[str, Any]], window: str) -> dict[str, list[dict[str, Any]]]:
+    account_points: dict[str, list[dict[str, Any]]] = {}
     for record in records:
         timestamp = record.get("t")
         accounts = record.get("a", [])
         if not isinstance(timestamp, int) or not isinstance(accounts, list):
             continue
-        total = 0.0
-        contributors = 0
-        reset_candidates: list[int] = []
         for account in accounts:
             if not isinstance(account, dict) or account_error(account):
+                continue
+            index = account_index(account)
+            if index is None:
                 continue
             info = window_info(account, window)
             left = info.get("left")
             if not isinstance(left, (int, float)):
                 continue
-            total += float(left)
-            contributors += 1
             reset_epoch = info.get("reset_epoch")
-            if isinstance(reset_epoch, int):
-                reset_candidates.append(reset_epoch)
-        if contributors == 0:
+            account_points.setdefault(str(index), []).append(
+                {
+                    "t": timestamp,
+                    "left": float(left),
+                    "reset": reset_epoch if isinstance(reset_epoch, int) else None,
+                }
+            )
+    return account_points
+
+
+def merged_value_at(account_points: dict[str, list[dict[str, Any]]], ts: int, _max_value: float) -> tuple[float, bool]:
+    total = 0.0
+    found = False
+    predicted = False
+    for points in account_points.values():
+        if not points or ts < points[0]["t"]:
             continue
-        points.append(
-            {
-                "t": timestamp,
-                "left": total,
-                "reset": min(reset_candidates) if reset_candidates else None,
-                "max": contributors * 100,
-            }
-        )
-    return points
+        value, account_predicted = value_at(points, ts, 100.0)
+        total += value
+        found = True
+        predicted = predicted or account_predicted
+    return total, predicted or not found
+
+
+def merged_max_value(points: dict[str, dict[str, list[dict[str, Any]]]]) -> float:
+    account_count = max((len(series) for series in points.values()), default=1)
+    return max(100.0, float(account_count * 100))
 
 
 def merged_chart_lines(
@@ -1171,15 +1198,11 @@ def merged_chart_lines(
         return [paint("暂无历史数据", "dim")]
     relevant, start_ts, end_ts = records_for_period(records, period)
     points = {
-        "5h": merged_window_points(relevant, "5h"),
-        "7d": merged_window_points(relevant, "7d"),
+        "5h": merged_account_window_points(relevant, "5h"),
+        "7d": merged_account_window_points(relevant, "7d"),
     }
-    max_value = max(
-        [float(point.get("max", 0)) for series in points.values() for point in series],
-        default=100.0,
-    )
-    max_value = max(100.0, max_value)
-    return series_chart_lines(points, start_ts, end_ts, width, height, curve_mode, max_value)
+    max_value = merged_max_value(points)
+    return series_chart_lines(points, start_ts, end_ts, width, height, curve_mode, max_value, merged_value_at)
 
 
 def merged_history_lines(

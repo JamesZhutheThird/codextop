@@ -24,6 +24,8 @@
   <p>专注模式</p>
   <img src="./assets/demo2.png" alt="CodexTOP board mode" width="820">
   <p>看板模式</p>
+  <img src="./assets/demo4.png" alt="CodexTOP merged mode" width="820">
+  <p>合并模式</p>
   <img src="./assets/demo3.png" alt="CodexTOP single check" width="820">
   <p>命令行单次查询</p>
 </div>
