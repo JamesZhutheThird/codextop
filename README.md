@@ -24,9 +24,9 @@
   <p>专注模式</p>
   <img src="./assets/demo2.png" alt="CodexTOP board mode" width="820">
   <p>看板模式</p>
-  <img src="./assets/demo4.png" alt="CodexTOP merged mode" width="820">
+  <img src="./assets/demo3.png" alt="CodexTOP merged mode" width="820">
   <p>合并模式</p>
-  <img src="./assets/demo3.png" alt="CodexTOP single check" width="820">
+  <img src="./assets/demo-check.png" alt="CodexTOP single check" width="820">
   <p>命令行单次查询</p>
 </div>
 
@@ -34,13 +34,14 @@
 
 | 状态   | 功能         | 说明                                            |
 |------|------------|-----------------------------------------------|
-| ✅已支持 | 彩色可交互终端界面  | 使用 Rich 呈现账号、额度、重置时间和后台采样状态，支持看板、专注、合并模式    |
+| ✅已支持 | 彩色可交互终端界面  | 使用 Rich 呈现账号、额度、重置时间和后台采样状态，支持看板、专注、合并模式      |
 | ✅已支持 | 命令行额度查询    | `CHECK_CODEX_QUOTA` 单次输出当前账号或全部账号额度           |
 | ✅已支持 | 后台采样服务     | 自动采样并写入本地 JSONL，供 CodexTOP 看板读取               |
 | ✅已支持 | 多账号切换      | `CODEXAUTH` 管理 `auth-openai-*` 账号并切换 provider |
 | ⏩规划中 | 新账号注册      | 后续补充新账号接入和初始化流程                               |
 | ⏩规划中 | 额度重置通知     | 额度恢复后通过系统通知提醒                                 |
 | ⏩规划中 | Token 用量统计 | 汇总本地会话 Token 使用趋势                             |
+| ⏩规划中 | 版本更新脚本     | 自动检测CodexTOP版本并进行更新                           |
 
 ## 安装
 
@@ -159,7 +160,49 @@ CODEXTOP --display-scope current  % 专注模式
 CODEXTOP --display-scope merged   % 合并模式
 ```
 
-合并模式会在顶部按 1:2 展示账号/重置次数和两条总额度进度条，并在底部展示合并后的历史曲线；总额度和曲线均在渲染时基于所有账号的最新采样数据实时汇总，单个账号读取失败时会跳过该账号以避免污染总计。
+合并模式会在顶部按 1:2 展示账号/重置次数和总额度进度条，并在底部展示合并后的历史曲线；总额度进度条始终显示 5h 和 7d，历史曲线绘图区域会按曲线窗口设置显示 5h、7d 或同时显示两者。合并数据会在渲染时基于所有账号的最新采样数据实时汇总，单个账号读取失败时会跳过该账号以避免污染总计。
+
+切换曲线风格：
+
+```bash
+CODEXTOP --curve-mode connected  % 连续字符线
+CODEXTOP --curve-mode box        % 线条
+CODEXTOP --curve-mode bar        % 柱状（半宽半高）
+CODEXTOP --curve-mode braille    % Braille 精细线
+CODEXTOP --curve-mode points     % 间断点线
+```
+
+切换曲线窗口（只影响历史曲线绘图区域）：
+
+```bash
+CODEXTOP --window-scope both  % 同时显示 5h / 7d
+CODEXTOP --window-scope 5h    % 只显示 5h
+CODEXTOP --window-scope 7d    % 只显示 7d
+```
+
+切换百分比配色：
+
+```bash
+CODEXTOP --color-scheme classic
+CODEXTOP --color-scheme bright
+CODEXTOP --color-scheme redblue
+CHECK_CODEX_QUOTA --color-scheme classic
+```
+
+百分比配色来自 `src/codextop/color_schemes.json`，也可以通过 `CODEXTOP_COLOR_SCHEME_FILE` 指向其他 JSON 文件。每个方案用 keyword 选择，`percent` 可以写满 `0` 到 `100`，也可以只写关键点；未写出的百分比会按相邻关键点线性插值。
+
+```json
+{
+  "classic": {
+    "label": "经典",
+    "percent": {
+      "0": "#e07b7b",
+      "50": "#e0e07b",
+      "100": "#7be07b"
+    }
+  }
+}
+```
 
 ### 后台采样服务
 

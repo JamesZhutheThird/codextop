@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import colorsys
 import json
 import os
 import re
@@ -22,6 +23,7 @@ from typing import Any
 
 TOOLKIT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLKIT_DIR))
+import color_schemes
 import check_codex_quota as quota
 try:
     from .paths import default_paths, ensure_runtime_layout, iter_snapshot_log_paths, recent_month_keys
@@ -35,10 +37,12 @@ DEFAULT_LOG_FILE = "quota_snapshots.jsonl"
 DEFAULT_CONTROL_FILE = "sampler_control.json"
 DEFAULT_STATE_FILE = "codextop_state.json"
 DEFAULT_SAMPLER_INTERVAL_SECONDS = 60
-APP_VERSION = "v1.1.1"
+APP_VERSION = "v1.2.0"
 DEFAULT_PERIOD = "5h"
 DEFAULT_CURVE_MODE = "connected"
 DEFAULT_DISPLAY_SCOPE = "all"
+DEFAULT_WINDOW_SCOPE = "both"
+DEFAULT_COLOR_SCHEME = color_schemes.default_color_scheme_key()
 INTERVAL_CHOICES = [
     ("5s", 5),
     ("10s", 10),
@@ -51,12 +55,20 @@ INTERVAL_CHOICES = [
 PERIOD_CHOICES = ["5m", "15m", "30m", "1h", "5h", "12h", "1d", "3d", "7d", "30d", "all"]
 CURVE_MODE_CHOICES = [
     ("连续", "connected"),
+    ("线条", "box"),
+    ("柱状", "bar"),
+    ("精细", "braille"),
     ("间断", "points"),
 ]
 DISPLAY_SCOPE_CHOICES = [
     ("看板模式", "all"),
     ("专注模式", "current"),
     ("合并模式", "merged"),
+]
+WINDOW_SCOPE_CHOICES = [
+    ("同时", "both"),
+    ("仅 5h", "5h"),
+    ("仅 7d", "7d"),
 ]
 PERIOD_SECONDS = {
     "5m": 5 * 60,
@@ -75,6 +87,10 @@ WINDOW_MARKERS = {
     "5h": "●",
     "7d": "◆",
 }
+WINDOW_KEYS = tuple(WINDOW_MARKERS.keys())
+BRAILLE_LEGEND_MARKER = "⣿"
+BOX_LEGEND_MARKER = "━"
+BAR_LEGEND_MARKER = "█"
 WINDOW_PRIORITIES = {
     "5h": 2,
     "7d": 1,
@@ -83,6 +99,40 @@ RESET_CREDIT_TITLE_WIDTH = 6
 RESET_CREDIT_MIN_BAR_WIDTH = 6
 GAP_SECONDS = 3 * 60
 ANSI_RE = re.compile(r"\x1b\[[0-9;?<>]*[A-Za-z~]")
+BRAILLE_DOT_BITS = {
+    (0, 0): 0x01,
+    (0, 1): 0x02,
+    (0, 2): 0x04,
+    (0, 3): 0x40,
+    (1, 0): 0x08,
+    (1, 1): 0x10,
+    (1, 2): 0x20,
+    (1, 3): 0x80,
+}
+BAR_QUADRANT_BITS = {
+    (0, 0): 0x01,
+    (1, 0): 0x02,
+    (0, 1): 0x04,
+    (1, 1): 0x08,
+}
+BAR_QUADRANT_CHARS = [
+    " ",
+    "▘",
+    "▝",
+    "▀",
+    "▖",
+    "▌",
+    "▞",
+    "▛",
+    "▗",
+    "▚",
+    "▐",
+    "▜",
+    "▄",
+    "▙",
+    "▟",
+    "█",
+]
 
 
 @dataclass
@@ -104,6 +154,8 @@ class MonitorState:
     state_path: Path
     curve_mode: str
     display_scope: str
+    window_scope: str
+    color_scheme: str
     last_update: float | None = None
     next_read: float = 0.0
     status: str = "启动中"
@@ -112,6 +164,9 @@ class MonitorState:
     records: list[dict[str, Any]] | None = None
     control_path: Path | None = None
     summary_offset: int = 0
+    settings_mode: str = "normal"
+    settings_focus: int = 0
+    settings_option_focus: int = 0
 
 
 def char_width(char: str) -> int:
@@ -219,6 +274,21 @@ def fg(color: str | None) -> str:
     return named.get(color, "")
 
 
+def bg(color: str | None) -> str:
+    if not color:
+        return ""
+    color = color.strip()
+    if color.startswith("#") and len(color) == 7:
+        r = int(color[1:3], 16)
+        g = int(color[3:5], 16)
+        b = int(color[5:7], 16)
+        return f"\x1b[48;2;{r};{g};{b}m"
+    named = {
+        "dark_cyan": "\x1b[48;5;24m",
+    }
+    return named.get(color, "")
+
+
 def paint(text: str, color: str | None = None, *, bold: bool = False, dim: bool = False, reverse: bool = False) -> str:
     codes = []
     if bold:
@@ -232,6 +302,18 @@ def paint(text: str, color: str | None = None, *, bold: bool = False, dim: bool 
     return f"{prefix}{text}\x1b[0m" if prefix else text
 
 
+def paint_on(text: str, color: str | None, background: str | None, *, bold: bool = False, dim: bool = False) -> str:
+    codes = []
+    if bold:
+        codes.append("\x1b[1m")
+    if dim:
+        codes.append("\x1b[2m")
+    codes.append(fg(color))
+    codes.append(bg(background))
+    prefix = "".join(code for code in codes if code)
+    return f"{prefix}{text}\x1b[0m" if prefix else text
+
+
 def paint_style(text: str, style: str | None) -> str:
     if not style:
         return text
@@ -241,7 +323,65 @@ def paint_style(text: str, style: str | None) -> str:
 
 
 def percent_color(value: Any) -> str:
-    return quota.percent_gradient_style(value)
+    return color_schemes.percent_gradient_style(value)
+
+
+def adjust_hex_color(color: str, *, saturation: float = 1.0, value: float = 1.0) -> str:
+    if not color.startswith("#") or len(color) != 7:
+        return color
+    red = int(color[1:3], 16) / 255.0
+    green = int(color[3:5], 16) / 255.0
+    blue = int(color[5:7], 16) / 255.0
+    hue, current_saturation, current_value = colorsys.rgb_to_hsv(red, green, blue)
+    current_saturation = max(0.0, min(1.0, current_saturation * saturation))
+    current_value = max(0.0, min(1.0, current_value * value))
+    red, green, blue = colorsys.hsv_to_rgb(hue, current_saturation, current_value)
+    return f"#{round(red * 255):02x}{round(green * 255):02x}{round(blue * 255):02x}"
+
+
+def chart_series_color(label: str, value: Any, *, dimmed: bool = False) -> str:
+    color = percent_color(value)
+    if label == "5h":
+        return adjust_hex_color(color, value=0.72) if dimmed else color
+    if label == "7d":
+        if dimmed:
+            return adjust_hex_color(color, saturation=1.15, value=0.5)
+        return adjust_hex_color(color, value=0.62)
+    return color
+
+
+def chart_row_percent(row: int, chart_height: int) -> float:
+    if chart_height <= 1:
+        return 100.0
+    return max(0.0, min(100.0, (chart_height - 1 - row) / (chart_height - 1) * 100.0))
+
+
+def window_marker_text(key: str, curve_mode: str) -> str:
+    if curve_mode == "braille":
+        marker = BRAILLE_LEGEND_MARKER
+    elif curve_mode == "box":
+        marker = BOX_LEGEND_MARKER
+    elif curve_mode == "bar":
+        marker = BAR_LEGEND_MARKER
+    else:
+        marker = WINDOW_MARKERS[key]
+    return f"{key}({marker})"
+
+
+def window_marker_label(key: str, curve_mode: str) -> str:
+    if curve_mode == "braille" and key == "7d":
+        return f"{key}({paint(BRAILLE_LEGEND_MARKER, 'dim')})"
+    if curve_mode == "box" and key == "7d":
+        return f"{key}({paint(BOX_LEGEND_MARKER, 'dim')})"
+    if curve_mode == "bar" and key == "7d":
+        return f"{key}({paint(BAR_LEGEND_MARKER, 'dim')})"
+    return window_marker_text(key, curve_mode)
+
+
+def window_keys(window_scope: str = DEFAULT_WINDOW_SCOPE) -> tuple[str, ...]:
+    if window_scope in WINDOW_MARKERS:
+        return (window_scope,)
+    return WINDOW_KEYS
 
 
 def percent_text(value: Any) -> str:
@@ -469,19 +609,25 @@ def reset_credit_row(title: str, remaining_percent: Any, seconds: Any, width: in
     return fit_ansi(row, width)
 
 
-def quota_rows(account: dict[str, Any], width: int, *, compact: bool = False) -> list[str]:
+def quota_rows(
+    account: dict[str, Any],
+    width: int,
+    *,
+    compact: bool = False,
+    curve_mode: str = DEFAULT_CURVE_MODE,
+) -> list[str]:
     rows: list[str] = []
-    for key in ("5h", "7d"):
+    for key in WINDOW_KEYS:
         info = window_info(account, key)
         left = info["left"]
-        label_text = f"{key}({WINDOW_MARKERS[key]})"
+        label_text = window_marker_label(key, curve_mode)
         label = paint(label_text, bold=True)
         pct = paint(percent_text(left).rjust(4), percent_color(left))
         bar_width = max(8, width - visible_width(label_text) - 1 - 1 - 4)
         rows.append(f"{label} {progress_bar(left, bar_width)} {pct}")
         reset_line = f"于 {countdown(info['reset_after'])} 后在 {info['reset_at']} 重置"
         rows.append(right_ansi(paint_style(reset_line, quota.reset_after_style(info["reset_after"])), width))
-        if key == "5h" and not compact:
+        if key != WINDOW_KEYS[-1] and not compact:
             rows.append("")
     return rows
 
@@ -560,18 +706,19 @@ def current_account_obj(accounts: list[dict[str, Any]], current: int | str | Non
     return None
 
 
-def current_account_quota_summary(accounts: list[dict[str, Any]], current: int | str | None) -> str:
+def current_account_quota_summary(
+    accounts: list[dict[str, Any]],
+    current: int | str | None,
+) -> str:
     account = current_account_obj(accounts, current)
     account_id = current_account_id(accounts, current)
     if not account or account_error(account):
         return account_id
-    left_5h = window_info(account, "5h").get("left")
-    left_7d = window_info(account, "7d").get("left")
-    return (
-        f"{account_id} "
-        f"(5h {paint(percent_text(left_5h), percent_color(left_5h))} "
-        f"7d {paint(percent_text(left_7d), percent_color(left_7d))})"
-    )
+    parts = []
+    for key in WINDOW_KEYS:
+        left = window_info(account, key).get("left")
+        parts.append(f"{key} {paint(percent_text(left), percent_color(left))}")
+    return f"{account_id} ({' '.join(parts)})"
 
 
 def credit_expire_epoch(credit: Any, observed_ts: int) -> int | None:
@@ -679,13 +826,20 @@ def merged_quota_detail_reset_line(
     return fit_ansi(detail, detail_width) + " " + right_ansi(reset, reset_width)
 
 
-def merged_quota_rows(accounts: list[dict[str, Any]], current: int | str | None, width: int, *, compact: bool = False) -> list[str]:
+def merged_quota_rows(
+    accounts: list[dict[str, Any]],
+    current: int | str | None,
+    width: int,
+    *,
+    compact: bool = False,
+    curve_mode: str = DEFAULT_CURVE_MODE,
+) -> list[str]:
     rows: list[str] = []
-    for key in ("5h", "7d"):
+    for key in WINDOW_KEYS:
         info = merged_window_info(accounts, key)
         left = info["left"]
         max_left = info["max_left"] if isinstance(info["max_left"], (int, float)) else 100
-        label_text = f"{key}({WINDOW_MARKERS[key]})"
+        label_text = window_marker_label(key, curve_mode)
         label = paint(label_text, bold=True)
         pct_raw = percent_sum_text(left)
         pct_width = max(4, visible_width(pct_raw))
@@ -694,7 +848,7 @@ def merged_quota_rows(accounts: list[dict[str, Any]], current: int | str | None,
         bar_width = max(8, width - visible_width(label_text) - 1 - 1 - pct_width)
         rows.append(f"{label} {progress_bar(left, bar_width, float(max_left))} {pct}")
         rows.append(merged_quota_detail_reset_line(accounts, current, key, info, width))
-        if key == "5h" and not compact:
+        if key != WINDOW_KEYS[-1] and not compact:
             rows.append("")
     return rows
 
@@ -850,6 +1004,230 @@ def axis_value_text(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else f"{value:g}"
 
 
+def chart_series_priority(
+    points: dict[str, Any],
+    label: str,
+    ts: int,
+    value: float,
+    max_value: float,
+    value_getter: Any,
+) -> int:
+    ranked: list[tuple[float, int, str]] = []
+    for other_label, series in points.items():
+        if not series:
+            continue
+        if other_label == label:
+            raw_value = value
+        else:
+            raw_value, _predicted = value_getter(series, ts, max_value)
+        if not isinstance(raw_value, (int, float)):
+            continue
+        bounded = max(0.0, min(max_value, float(raw_value)))
+        ranked.append((bounded, -WINDOW_PRIORITIES.get(other_label, 0), other_label))
+    ranked.sort()
+    for rank, (_value, _fallback, ranked_label) in enumerate(ranked):
+        if ranked_label == label:
+            return len(ranked) - rank
+    return WINDOW_PRIORITIES.get(label, 0)
+
+
+def braille_char(mask: int) -> str:
+    return chr(0x2800 + mask) if mask else " "
+
+
+def bar_cell_char(mask: int) -> str:
+    return BAR_QUADRANT_CHARS[mask] if 0 <= mask < len(BAR_QUADRANT_CHARS) else " "
+
+
+def braille_series_chart_lines(
+    points: dict[str, Any],
+    start_ts: int,
+    end_ts: int,
+    width: int,
+    height: int,
+    max_value: float,
+    value_getter: Any,
+) -> list[str]:
+    if width <= 10 or height <= 3:
+        return [paint("暂无历史数据", "dim")]
+    if not any(points.values()) or max_value <= 0:
+        return [paint("暂无历史数据", "dim")]
+
+    tick_values = [max_value * ratio for ratio in (1.0, 0.75, 0.5, 0.25, 0.0)]
+    axis_width = max(4, max(visible_width(axis_value_text(value)) for value in tick_values) + 1)
+    box_width = max(6, width - axis_width)
+    plot_width = max(2, box_width - 4)
+    chart_width = plot_width + 2
+    chart_height = max(1, height - 3)
+    dot_width = plot_width * 2
+    dot_height = chart_height * 4
+
+    grid: list[list[tuple[int, str, int]]] = [
+        [(0, "dim", 0) for _ in range(plot_width)]
+        for _ in range(chart_height)
+    ]
+
+    def put_dot(dot_row: int, dot_column: int, color: str, priority: int) -> None:
+        if not (0 <= dot_row < dot_height and 0 <= dot_column < dot_width):
+            return
+        cell_row = dot_row // 4
+        cell_column = dot_column // 2
+        bit = BRAILLE_DOT_BITS[(dot_column % 2, dot_row % 4)]
+        old_mask, old_color, old_priority = grid[cell_row][cell_column]
+        new_mask = old_mask | bit
+        if old_mask == 0 or priority >= old_priority:
+            grid[cell_row][cell_column] = (new_mask, color, priority)
+        else:
+            grid[cell_row][cell_column] = (new_mask, old_color, old_priority)
+
+    def value_row(value: float) -> int:
+        return round((max_value - value) / max_value * (dot_height - 1))
+
+    def draw_segment(
+        label: str,
+        previous_column: int,
+        previous_row: int,
+        previous_value: float,
+        column: int,
+        row: int,
+        value: float,
+        ts: int,
+    ) -> None:
+        steps = max(abs(column - previous_column), abs(row - previous_row), 1)
+        for step_index in range(1, steps + 1):
+            ratio = step_index / steps
+            dot_column = round(previous_column + (column - previous_column) * ratio)
+            dot_row = round(previous_row + (row - previous_row) * ratio)
+            interpolated = previous_value + (value - previous_value) * ratio
+            normalized = max(0.0, min(100.0, interpolated / max_value * 100))
+            priority = chart_series_priority(points, label, ts, interpolated, max_value, value_getter)
+            put_dot(dot_row, dot_column, chart_series_color(label, normalized), priority)
+
+    for label, series in points.items():
+        if not series:
+            continue
+        previous_column: int | None = None
+        previous_row: int | None = None
+        previous_value: float | None = None
+        for dot_column in range(dot_width):
+            ratio = dot_column / max(1, dot_width - 1)
+            ts = int(start_ts + (end_ts - start_ts) * ratio)
+            value, _predicted = value_getter(series, ts, max_value)
+            value = max(0, min(max_value, value))
+            row = value_row(value)
+            if previous_column is None or previous_row is None or previous_value is None:
+                normalized = max(0.0, min(100.0, value / max_value * 100))
+                priority = chart_series_priority(points, label, ts, float(value), max_value, value_getter)
+                put_dot(row, dot_column, chart_series_color(label, normalized), priority)
+            else:
+                draw_segment(
+                    label,
+                    previous_column,
+                    previous_row,
+                    previous_value,
+                    dot_column,
+                    row,
+                    float(value),
+                    ts,
+                )
+            previous_column = dot_column
+            previous_row = row
+            previous_value = float(value)
+
+    tick_rows = {
+        round((max_value - value) / max_value * (chart_height - 1)): value
+        for value in tick_values
+    }
+    lines: list[str] = []
+    lines.append((" " * axis_width) + paint("┌" + "─" * chart_width + "┐", "dim"))
+    for row_index, row in enumerate(grid):
+        axis = tick_rows.get(row_index)
+        prefix = paint(f"{axis_value_text(axis):>{axis_width - 1}} ", "dim") if axis is not None else " " * axis_width
+        plot = "".join(paint(braille_char(mask), color) if mask else " " for mask, color, _priority in row)
+        line = prefix + paint("│", "dim") + " " + plot + " " + paint("│", "dim")
+        lines.append(fit_ansi(line, width))
+    lines.append((" " * axis_width) + paint("└" + "─" * chart_width + "┘", "dim"))
+    lines.append(time_axis_line(start_ts, end_ts, plot_width, axis_width + 2))
+    while len(lines) < height:
+        lines.append("")
+    return [fit_ansi(line, width) for line in lines[:height]]
+
+
+def bar_series_chart_lines(
+    points: dict[str, Any],
+    start_ts: int,
+    end_ts: int,
+    width: int,
+    height: int,
+    max_value: float,
+    value_getter: Any,
+) -> list[str]:
+    if width <= 10 or height <= 3:
+        return [paint("暂无历史数据", "dim")]
+    if not any(points.values()) or max_value <= 0:
+        return [paint("暂无历史数据", "dim")]
+
+    tick_values = [max_value * ratio for ratio in (1.0, 0.75, 0.5, 0.25, 0.0)]
+    axis_width = max(4, max(visible_width(axis_value_text(value)) for value in tick_values) + 1)
+    box_width = max(6, width - axis_width)
+    plot_width = max(2, box_width - 4)
+    chart_width = plot_width + 2
+    chart_height = max(2, height - 3)
+    sub_width = plot_width * 2
+    sub_height = chart_height * 2
+
+    grid: list[list[tuple[int, str, int, int]]] = [
+        [(0, "dim", 0, sub_height) for _ in range(plot_width)]
+        for _ in range(chart_height)
+    ]
+
+    def put_subcell(sub_row: int, sub_column: int, color: str, priority: int) -> None:
+        if not (0 <= sub_row < sub_height and 0 <= sub_column < sub_width):
+            return
+        cell_row = sub_row // 2
+        cell_column = sub_column // 2
+        bit = BAR_QUADRANT_BITS[(sub_column % 2, sub_row % 2)]
+        old_mask, old_color, old_priority, old_color_row = grid[cell_row][cell_column]
+        new_mask = old_mask | bit
+        if old_mask == 0 or priority > old_priority or (priority == old_priority and sub_row <= old_color_row):
+            grid[cell_row][cell_column] = (new_mask, color, priority, sub_row)
+        else:
+            grid[cell_row][cell_column] = (new_mask, old_color, old_priority, old_color_row)
+
+    for label, series in points.items():
+        if not series:
+            continue
+        for sub_column in range(sub_width):
+            ratio = sub_column / max(1, sub_width - 1)
+            ts = int(start_ts + (end_ts - start_ts) * ratio)
+            value, _predicted = value_getter(series, ts, max_value)
+            value = max(0, min(max_value, value))
+            priority = chart_series_priority(points, label, ts, float(value), max_value, value_getter)
+            filled_units = max(1, min(sub_height, round(float(value) / max_value * sub_height)))
+            start_sub_row = sub_height - filled_units
+            for sub_row in range(start_sub_row, sub_height):
+                row_normalized = chart_row_percent(sub_row, sub_height)
+                put_subcell(sub_row, sub_column, chart_series_color(label, row_normalized, dimmed=True), priority)
+
+    tick_rows = {
+        round((max_value - value) / max_value * (chart_height - 1)): value
+        for value in tick_values
+    }
+    lines: list[str] = []
+    lines.append((" " * axis_width) + paint("┌" + "─" * chart_width + "┐", "dim"))
+    for row_index, row in enumerate(grid):
+        axis = tick_rows.get(row_index)
+        prefix = paint(f"{axis_value_text(axis):>{axis_width - 1}} ", "dim") if axis is not None else " " * axis_width
+        plot = "".join(paint(bar_cell_char(mask), color) if mask else " " for mask, color, _priority, _color_row in row)
+        line = prefix + paint("│", "dim") + " " + plot + " " + paint("│", "dim")
+        lines.append(fit_ansi(line, width))
+    lines.append((" " * axis_width) + paint("└" + "─" * chart_width + "┘", "dim"))
+    lines.append(time_axis_line(start_ts, end_ts, plot_width, axis_width + 2))
+    while len(lines) < height:
+        lines.append("")
+    return [fit_ansi(line, width) for line in lines[:height]]
+
+
 def series_chart_lines(
     points: dict[str, Any],
     start_ts: int,
@@ -864,6 +1242,10 @@ def series_chart_lines(
         return [paint("暂无历史数据", "dim")]
     if not any(points.values()) or max_value <= 0:
         return [paint("暂无历史数据", "dim")]
+    if curve_mode == "braille":
+        return braille_series_chart_lines(points, start_ts, end_ts, width, height, max_value, value_getter)
+    if curve_mode == "bar":
+        return bar_series_chart_lines(points, start_ts, end_ts, width, height, max_value, value_getter)
 
     tick_values = [max_value * ratio for ratio in (1.0, 0.75, 0.5, 0.25, 0.0)]
     axis_width = max(4, max(visible_width(axis_value_text(value)) for value in tick_values) + 1)
@@ -887,11 +1269,19 @@ def series_chart_lines(
         elif priority >= old_priority:
             grid[row][column] = (char, color, priority)
 
+    def box_segment_char(previous_row: int, row: int, filled_row: int) -> str:
+        if row == previous_row:
+            return "─"
+        if filled_row == previous_row:
+            return "╮" if row > previous_row else "╯"
+        if filled_row == row:
+            return "╰" if row > previous_row else "╭"
+        return "│"
+
     for label, series in points.items():
         if not series:
             continue
         char = WINDOW_MARKERS[label]
-        priority = WINDOW_PRIORITIES[label]
         previous_row: int | None = None
         previous_value: float | None = None
         for column in range(plot_width):
@@ -901,19 +1291,62 @@ def series_chart_lines(
             value = max(0, min(max_value, value))
             normalized = max(0.0, min(100.0, value / max_value * 100))
             row = round((max_value - value) / max_value * (chart_height - 1))
-            if curve_mode == "connected" and previous_row is not None and previous_value is not None:
+            if curve_mode == "box" and previous_row is not None and previous_value is not None:
                 row_span = abs(row - previous_row)
                 if row_span == 0:
-                    put_cell(row, column, char, percent_color(normalized), priority)
+                    priority = chart_series_priority(points, label, ts, float(value), max_value, value_getter)
+                    put_cell(row, column, "─", chart_series_color(label, normalized), priority)
+                else:
+                    step = 1 if row > previous_row else -1
+                    for filled_row in range(previous_row, row + step, step):
+                        row_ratio = abs(filled_row - previous_row) / row_span
+                        interpolated = previous_value + (value - previous_value) * row_ratio
+                        interpolated_normalized = max(0.0, min(100.0, interpolated / max_value * 100))
+                        priority = chart_series_priority(
+                            points,
+                            label,
+                            ts,
+                            interpolated,
+                            max_value,
+                            value_getter,
+                        )
+                        put_cell(
+                            filled_row,
+                            column,
+                            box_segment_char(previous_row, row, filled_row),
+                            chart_series_color(label, interpolated_normalized),
+                            priority,
+                        )
+            elif curve_mode == "connected" and previous_row is not None and previous_value is not None:
+                row_span = abs(row - previous_row)
+                if row_span == 0:
+                    priority = chart_series_priority(points, label, ts, float(value), max_value, value_getter)
+                    put_cell(row, column, char, chart_series_color(label, normalized), priority)
                 else:
                     step = 1 if row > previous_row else -1
                     for filled_row in range(previous_row + step, row + step, step):
                         row_ratio = abs(filled_row - previous_row) / row_span
                         interpolated = previous_value + (value - previous_value) * row_ratio
                         interpolated_normalized = max(0.0, min(100.0, interpolated / max_value * 100))
-                        put_cell(filled_row, column, char, percent_color(interpolated_normalized), priority)
+                        priority = chart_series_priority(
+                            points,
+                            label,
+                            ts,
+                            interpolated,
+                            max_value,
+                            value_getter,
+                        )
+                        put_cell(
+                            filled_row,
+                            column,
+                            char,
+                            chart_series_color(label, interpolated_normalized),
+                            priority,
+                        )
             else:
-                put_cell(row, column, char, percent_color(normalized), priority)
+                point_char = "─" if curve_mode == "box" else char
+                priority = chart_series_priority(points, label, ts, float(value), max_value, value_getter)
+                put_cell(row, column, point_char, chart_series_color(label, normalized), priority)
             previous_row = row
             previous_value = float(value)
 
@@ -943,13 +1376,14 @@ def chart_lines(
     width: int,
     height: int,
     curve_mode: str,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> list[str]:
     if not records:
         return [paint("暂无历史数据", "dim")]
     relevant, start_ts, end_ts = records_for_period(records, period)
     points = {
-        "5h": window_points(relevant, index, "5h"),
-        "7d": window_points(relevant, index, "7d"),
+        key: window_points(relevant, index, key)
+        for key in window_keys(window_scope)
     }
     return series_chart_lines(points, start_ts, end_ts, width, height, curve_mode, 100.0)
 
@@ -976,6 +1410,7 @@ def account_lines(
     period: str,
     current: int | str | None,
     curve_mode: str,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> list[str]:
     inner_width = max(10, panel_width - 2)
     inner_height = max(4, panel_height - 2)
@@ -1006,7 +1441,7 @@ def account_lines(
     for line in reset_rows(account, inner_width - 2):
         add_text(line)
     add_section("当前额度")
-    for line in quota_rows(account, inner_width - 2):
+    for line in quota_rows(account, inner_width - 2, curve_mode=curve_mode):
         if line:
             add_text(line)
         else:
@@ -1016,7 +1451,7 @@ def account_lines(
     chart_height = max(4, inner_height - len(lines))
     chart_width = max(8, inner_width - 2)
     if index is not None:
-        chart = chart_lines(records, index, period, chart_width, chart_height, curve_mode)
+        chart = chart_lines(records, index, period, chart_width, chart_height, curve_mode, window_scope)
     else:
         chart = chart_box([paint("暂无历史数据", "dim")], chart_width, chart_height)
     lines.extend(" " + fit_ansi(line, chart_width) for line in chart)
@@ -1026,7 +1461,11 @@ def account_lines(
     return [fit_ansi(line, inner_width) for line in lines[:inner_height]]
 
 
-def account_summary_body(account: dict[str, Any], inner_width: int) -> list[str]:
+def account_summary_body(
+    account: dict[str, Any],
+    inner_width: int,
+    curve_mode: str = DEFAULT_CURVE_MODE,
+) -> list[str]:
     lines: list[str] = []
 
     def add_text(line: str) -> None:
@@ -1044,16 +1483,26 @@ def account_summary_body(account: dict[str, Any], inner_width: int) -> list[str]
         for line in reset_rows(account, inner_width - 2):
             add_text(line)
         lines.append(section_rule("当前额度", inner_width))
-        for line in quota_rows(account, inner_width - 2, compact=True):
+        for line in quota_rows(
+            account,
+            inner_width - 2,
+            compact=True,
+            curve_mode=curve_mode,
+        ):
             add_text(line)
 
     return [fit_ansi(line, inner_width) for line in lines]
 
 
-def account_summary_lines(account: dict[str, Any], panel_width: int, panel_height: int) -> list[str]:
+def account_summary_lines(
+    account: dict[str, Any],
+    panel_width: int,
+    panel_height: int,
+    curve_mode: str = DEFAULT_CURVE_MODE,
+) -> list[str]:
     inner_width = max(10, panel_width - 2)
     inner_height = max(4, panel_height - 2)
-    lines = account_summary_body(account, inner_width)
+    lines = account_summary_body(account, inner_width, curve_mode)
 
     if len(lines) < inner_height:
         lines.extend([""] * (inner_height - len(lines)))
@@ -1067,6 +1516,7 @@ def account_history_lines(
     panel_height: int,
     period: str,
     curve_mode: str,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> list[str]:
     inner_width = max(10, panel_width - 2)
     inner_height = max(4, panel_height - 2)
@@ -1075,14 +1525,18 @@ def account_history_lines(
     if index is None:
         chart = chart_box([paint("暂无历史数据", "dim")], chart_width, inner_height)
     else:
-        chart = chart_lines(records, index, period, chart_width, inner_height, curve_mode)
+        chart = chart_lines(records, index, period, chart_width, inner_height, curve_mode, window_scope)
     lines = [" " + fit_ansi(line, chart_width) for line in chart]
     if len(lines) < inner_height:
         lines.extend([""] * (inner_height - len(lines)))
     return [fit_ansi(line, inner_width) for line in lines[:inner_height]]
 
 
-def merged_account_reset_body(accounts: list[dict[str, Any]], current: int | str | None, inner_width: int) -> list[str]:
+def merged_account_reset_body(
+    accounts: list[dict[str, Any]],
+    current: int | str | None,
+    inner_width: int,
+) -> list[str]:
     lines: list[str] = []
 
     def add_text(line: str) -> None:
@@ -1110,7 +1564,12 @@ def merged_account_reset_body(accounts: list[dict[str, Any]], current: int | str
     return [fit_ansi(line, inner_width) for line in lines]
 
 
-def merged_account_reset_lines(accounts: list[dict[str, Any]], current: int | str | None, panel_width: int, panel_height: int) -> list[str]:
+def merged_account_reset_lines(
+    accounts: list[dict[str, Any]],
+    current: int | str | None,
+    panel_width: int,
+    panel_height: int,
+) -> list[str]:
     inner_width = max(10, panel_width - 2)
     inner_height = max(4, panel_height - 2)
     lines = merged_account_reset_body(accounts, current, inner_width)
@@ -1119,7 +1578,13 @@ def merged_account_reset_lines(accounts: list[dict[str, Any]], current: int | st
     return [fit_ansi(line, inner_width) for line in lines[:inner_height]]
 
 
-def merged_quota_summary_lines(accounts: list[dict[str, Any]], current: int | str | None, panel_width: int, panel_height: int) -> list[str]:
+def merged_quota_summary_lines(
+    accounts: list[dict[str, Any]],
+    current: int | str | None,
+    panel_width: int,
+    panel_height: int,
+    curve_mode: str = DEFAULT_CURVE_MODE,
+) -> list[str]:
     inner_width = max(10, panel_width - 2)
     inner_height = max(4, panel_height - 2)
     lines: list[str] = []
@@ -1127,7 +1592,13 @@ def merged_quota_summary_lines(accounts: list[dict[str, Any]], current: int | st
     def add_text(line: str) -> None:
         lines.append(" " + fit_ansi(line, max(1, inner_width - 2)).rstrip())
 
-    quota_lines = merged_quota_rows(accounts, current, inner_width - 2, compact=True)
+    quota_lines = merged_quota_rows(
+        accounts,
+        current,
+        inner_width - 2,
+        compact=True,
+        curve_mode=curve_mode,
+    )
     lines.append("")
     for line in quota_lines[:2]:
         add_text(line)
@@ -1193,13 +1664,14 @@ def merged_chart_lines(
     width: int,
     height: int,
     curve_mode: str,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> list[str]:
     if not records:
         return [paint("暂无历史数据", "dim")]
     relevant, start_ts, end_ts = records_for_period(records, period)
     points = {
-        "5h": merged_account_window_points(relevant, "5h"),
-        "7d": merged_account_window_points(relevant, "7d"),
+        key: merged_account_window_points(relevant, key)
+        for key in window_keys(window_scope)
     }
     max_value = merged_max_value(points)
     return series_chart_lines(points, start_ts, end_ts, width, height, curve_mode, max_value, merged_value_at)
@@ -1211,11 +1683,12 @@ def merged_history_lines(
     panel_height: int,
     period: str,
     curve_mode: str,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> list[str]:
     inner_width = max(10, panel_width - 2)
     inner_height = max(4, panel_height - 2)
     chart_width = max(8, inner_width - 2)
-    chart = merged_chart_lines(records, period, chart_width, inner_height, curve_mode)
+    chart = merged_chart_lines(records, period, chart_width, inner_height, curve_mode, window_scope)
     lines = [" " + fit_ansi(line, chart_width) for line in chart]
     if len(lines) < inner_height:
         lines.extend([""] * (inner_height - len(lines)))
@@ -1291,6 +1764,7 @@ def stacked_summary_panels(
     width: int,
     height: int,
     offset: int,
+    curve_mode: str,
     zones: list[ClickZone],
     x_origin: int,
 ) -> list[str]:
@@ -1300,7 +1774,7 @@ def stacked_summary_panels(
     inner_width = max(10, width - 2)
 
     panel_heights = [
-        max(4, len(account_summary_body(account, inner_width)) + 2)
+        max(4, len(account_summary_body(account, inner_width, curve_mode)) + 2)
         for account in accounts
     ]
     overflow = sum(panel_heights) > height
@@ -1315,11 +1789,11 @@ def stacked_summary_panels(
     start = offset % len(accounts)
     ordered = accounts[start:] + accounts[:start]
     for account in ordered:
-        panel_height = max(4, len(account_summary_body(account, inner_width)) + 2)
+        panel_height = max(4, len(account_summary_body(account, inner_width, curve_mode)) + 2)
         title = provider_name(account)
         if current is not None and account_index(account) == current:
             title = f"【{title}】"
-        body = account_summary_lines(account, width, panel_height)
+        body = account_summary_lines(account, width, panel_height, curve_mode)
         rendered = panel(title, body, width, panel_height, border_color(account, current))
         rows.extend(rendered[:remaining])
         remaining -= min(panel_height, remaining)
@@ -1342,9 +1816,99 @@ def interval_label(seconds: int) -> str:
     return f"{seconds}s"
 
 
+def setting_items() -> list[tuple[str, str, list[tuple[str, Any]]]]:
+    return [
+        ("interval", "更新间隔", list(INTERVAL_CHOICES)),
+        ("period", "历史长度", [(period, period) for period in PERIOD_CHOICES]),
+        ("curve_mode", "曲线模式", list(CURVE_MODE_CHOICES)),
+        ("window_scope", "曲线窗口", list(WINDOW_SCOPE_CHOICES)),
+        ("color_scheme", "配色方案", color_schemes.color_scheme_choices()),
+        ("display_scope", "展示范围", list(DISPLAY_SCOPE_CHOICES)),
+    ]
+
+
+def setting_current_value(state: MonitorState, key: str) -> Any:
+    if key == "interval":
+        return state.interval
+    if key == "period":
+        return state.period
+    if key == "curve_mode":
+        return state.curve_mode
+    if key == "window_scope":
+        return state.window_scope
+    if key == "color_scheme":
+        return state.color_scheme
+    if key == "display_scope":
+        return state.display_scope
+    return None
+
+
+def setting_index_for_key(key: str) -> int:
+    for index, (item_key, _title, _choices) in enumerate(setting_items()):
+        if item_key == key:
+            return index
+    return 0
+
+
+def setting_current_option_index(state: MonitorState, key: str) -> int:
+    current = setting_current_value(state, key)
+    items = setting_items()
+    for item_key, _title, choices in items:
+        if item_key != key:
+            continue
+        for index, (_label, value) in enumerate(choices):
+            if value == current:
+                return index
+    return 0
+
+
+def setting_current_label(state: MonitorState, key: str) -> str:
+    current = setting_current_value(state, key)
+    for item_key, _title, choices in setting_items():
+        if item_key != key:
+            continue
+        for label, value in choices:
+            if value == current:
+                return label
+    return interval_label(current) if key == "interval" and isinstance(current, int) else str(current or "-")
+
+
+def normalize_settings_state(state: MonitorState) -> list[tuple[str, str, list[tuple[str, Any]]]]:
+    items = setting_items()
+    if state.settings_mode not in {"normal", "select", "options"}:
+        state.settings_mode = "normal"
+    if not items:
+        state.settings_focus = 0
+        state.settings_option_focus = 0
+        return items
+    state.settings_focus %= len(items)
+    choices = items[state.settings_focus][2]
+    if choices:
+        state.settings_option_focus %= len(choices)
+    else:
+        state.settings_option_focus = 0
+    return items
+
+
+def focused_setting(state: MonitorState) -> tuple[int, str, str, list[tuple[str, Any]]]:
+    items = normalize_settings_state(state)
+    index = state.settings_focus if items else 0
+    if not items:
+        return 0, "", "", []
+    key, title, choices = items[index]
+    return index, key, title, choices
+
+
+def open_focused_setting(state: MonitorState) -> None:
+    _index, key, _title, _choices = focused_setting(state)
+    state.settings_mode = "options"
+    state.settings_option_focus = setting_current_option_index(state, key)
+
+
 def render_sidebar(state: MonitorState, width: int, height: int, x_origin: int, zones: list[ClickZone]) -> list[str]:
     inner = max(8, width - 2)
     lines: list[str] = [paint("╭" + "─" * inner + "╮", "cyan")]
+    items = normalize_settings_state(state)
 
     def center_text(text: str) -> str:
         text_width = visible_width(text)
@@ -1353,41 +1917,86 @@ def render_sidebar(state: MonitorState, width: int, height: int, x_origin: int, 
         right = pad - left
         return " " * left + text + " " * right
 
-    def add_plain(text: str = "", color: str | None = None, *, bold: bool = False) -> None:
-        rendered = paint(center_text(text), color, bold=bold)
+    def add_plain(
+        text: str = "",
+        color: str | None = None,
+        *,
+        bold: bool = False,
+        dim: bool = False,
+        reverse: bool = False,
+    ) -> int:
+        y = len(lines) + 1
+        rendered = paint(center_text(text), color, bold=bold, dim=dim, reverse=reverse)
+        lines.append(paint("│", "cyan") + fit_ansi(rendered, inner) + paint("│", "cyan"))
+        return y
+
+    def add_click_row(text: str, color: str, kind: str, value: Any, *, selected: bool = False) -> None:
+        y = len(lines) + 1
+        centered = center_text(text)
+        rendered = paint(centered, color, bold=True, reverse=selected)
+        lines.append(paint("│", "cyan") + fit_ansi(rendered, inner) + paint("│", "cyan"))
+        zones.append(ClickZone(x_origin + 1, x_origin + inner, y, kind, value))
+
+    def add_setting_title(title: str) -> None:
+        rendered = paint_on(center_text(title), "white", "dark_cyan", bold=True)
         lines.append(paint("│", "cyan") + fit_ansi(rendered, inner) + paint("│", "cyan"))
 
-    def add_option(label: str, selected: bool, kind: str, value: Any) -> None:
-        y = len(lines) + 1
-        prefix = "● " if selected else "  "
-        text = f"{prefix}{label}"
-        centered = center_text(text)
-        rendered = paint(centered, "green", bold=True, reverse=selected)
-        lines.append(paint("│", "cyan") + fit_ansi(rendered, inner) + paint("│", "cyan"))
-        text_start = max(1, (inner - visible_width(text)) // 2 + 1)
-        zones.append(ClickZone(x_origin + text_start, x_origin + text_start + visible_width(text) - 1, y, kind, value))
+    def add_setting_item(index: int, key: str, title: str) -> None:
+        focused = state.settings_mode == "select" and state.settings_focus == index
+        add_setting_title(title)
+        current = setting_current_label(state, key)
+        add_click_row(current, "cyan" if focused else "green", "settings_item", index, selected=focused)
+
+    def add_setting_options(key: str, title: str, choices: list[tuple[str, Any]]) -> None:
+        add_setting_title(title)
+        add_plain("")
+        current = setting_current_value(state, key)
+        for option_index, (label, value) in enumerate(choices):
+            focused = option_index == state.settings_option_focus
+            marker = "● " if value == current else "  "
+            color = "cyan" if focused else ("green" if value == current else "white")
+            add_click_row(f"{marker}{label}", color, "settings_option", (key, value), selected=focused)
+
+    status_bottom_rows = 13 if state.last_update else 12
+    settings_limit = max(1, height - status_bottom_rows)
 
     add_plain("CodexTOP", "cyan", bold=True)
     add_plain("")
-    add_plain("更新间隔", "white", bold=True)
-    for label, value in INTERVAL_CHOICES:
-        add_option(label, state.interval == value, "interval", value)
+    if state.settings_mode == "options":
+        _index, key, title, choices = focused_setting(state)
+        add_setting_options(key, title, choices)
+    else:
+        for index, (key, title, _choices) in enumerate(items):
+            add_setting_item(index, key, title)
+            if index != len(items) - 1:
+                add_plain("")
 
+    lines = lines[:settings_limit]
+    zones[:] = [
+        zone for zone in zones
+        if not (
+            zone.x1 >= x_origin
+            and zone.kind in {"settings_item", "settings_option"}
+            and zone.y > settings_limit
+        )
+    ]
+    while len(lines) < settings_limit:
+        add_plain("")
+
+    y = len(lines) + 1
+    settings_text = " F9 / 设置模式 "
+    centered_settings = center_text(settings_text)
+    lines.append(paint("│", "cyan") + fit_ansi(paint(centered_settings, "cyan", bold=True, reverse=True), inner) + paint("│", "cyan"))
+    settings_start = max(1, (inner - visible_width(settings_text)) // 2 + 1)
+    zones.append(ClickZone(x_origin + settings_start, x_origin + settings_start + visible_width(settings_text) - 1, y, "settings_activate", None))
     add_plain("")
-    add_plain("历史长度", "white", bold=True)
-    for period in PERIOD_CHOICES:
-        add_option(period, state.period == period, "period", period)
 
-    add_plain("")
-    add_plain("曲线模式", "white", bold=True)
-    for label, value in CURVE_MODE_CHOICES:
-        add_option(label, state.curve_mode == value, "curve_mode", value)
-
-    add_plain("")
-    add_plain("展示范围", "white", bold=True)
-    for label, value in DISPLAY_SCOPE_CHOICES:
-        add_option(label, state.display_scope == value, "display_scope", value)
-
+    y = len(lines) + 1
+    exit_text = " F10 / 点击退出 "
+    centered_exit = center_text(exit_text)
+    lines.append(paint("│", "cyan") + fit_ansi(paint(centered_exit, "red", bold=True, reverse=True), inner) + paint("│", "cyan"))
+    exit_start = max(1, (inner - visible_width(exit_text)) // 2 + 1)
+    zones.append(ClickZone(x_origin + exit_start, x_origin + exit_start + visible_width(exit_text) - 1, y, "exit", None))
     add_plain("")
     add_plain("状态", "white", bold=True)
     add_plain(state.status, "yellow" if state.error else "green")
@@ -1399,19 +2008,9 @@ def render_sidebar(state: MonitorState, width: int, height: int, x_origin: int, 
         remain = max(0, int(state.next_read - time.time()))
         add_plain(f"下次读取 {remain}s", "dim")
     add_plain(sampler_status(state.log_path.parent), "dim")
-
-    while len(lines) < height - 5:
-        add_plain("")
-
-    y = len(lines) + 1
-    exit_text = " F10 / 点击退出 "
-    centered_exit = center_text(exit_text)
-    lines.append(paint("│", "cyan") + fit_ansi(paint(centered_exit, "red", bold=True, reverse=True), inner) + paint("│", "cyan"))
-    exit_start = max(1, (inner - visible_width(exit_text)) // 2 + 1)
-    zones.append(ClickZone(x_origin + exit_start, x_origin + exit_start + visible_width(exit_text) - 1, y, "exit", None))
     add_plain("")
-    add_plain("@JamesZhutheThird", "dim")
-    add_plain(APP_VERSION, "dim")
+    add_plain("@JamesZhutheThird")
+    add_plain(APP_VERSION)
     lines.append(paint("╰" + "─" * inner + "╯", "cyan"))
     return [fit_ansi(line, width) for line in lines[:height]]
 
@@ -1442,6 +2041,7 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
             left_width,
             content_height,
             state.summary_offset,
+            state.curve_mode,
             zones,
             1,
         )
@@ -1453,6 +2053,7 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
             content_height,
             state.period,
             state.curve_mode,
+            state.window_scope,
         )
         right_block = panel(
             history_title,
@@ -1483,7 +2084,13 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
         )
         top_right_block = panel(
             "总额度",
-            merged_quota_summary_lines(accounts, current, top_right_width, top_height),
+            merged_quota_summary_lines(
+                accounts,
+                current,
+                top_right_width,
+                top_height,
+                state.curve_mode,
+            ),
             top_right_width,
             top_height,
             color,
@@ -1495,7 +2102,14 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
         )
         history_block = panel(
             "合并额度历史",
-            merged_history_lines(records, main_width, history_height, state.period, state.curve_mode),
+            merged_history_lines(
+                records,
+                main_width,
+                history_height,
+                state.period,
+                state.curve_mode,
+                state.window_scope,
+            ),
             main_width,
             history_height,
             color,
@@ -1523,7 +2137,16 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
                 title = provider_name(account)
                 if current is not None and index == current:
                     title = f"【{title}】"
-                body = account_lines(account, records, width, row_height, state.period, current, state.curve_mode)
+                body = account_lines(
+                    account,
+                    records,
+                    width,
+                    row_height,
+                    state.period,
+                    current,
+                    state.curve_mode,
+                    state.window_scope,
+                )
                 blocks.append(panel(title, body, width, row_height, border_color(account, current)))
             while len(blocks) < columns:
                 blocks.append([" " * panel_width for _ in range(row_height)])
@@ -1605,6 +2228,17 @@ def saved_display_scope(payload: dict[str, Any]) -> str | None:
     return scope if isinstance(scope, str) and scope in valid_scopes else None
 
 
+def saved_window_scope(payload: dict[str, Any]) -> str | None:
+    scope = payload.get("window_scope")
+    valid_scopes = {value for _label, value in WINDOW_SCOPE_CHOICES}
+    return scope if isinstance(scope, str) and scope in valid_scopes else None
+
+
+def saved_color_scheme(payload: dict[str, Any]) -> str | None:
+    scheme = payload.get("color_scheme")
+    return scheme if isinstance(scheme, str) and color_schemes.color_scheme_exists(scheme) else None
+
+
 def save_codextop_state(state: MonitorState) -> None:
     state.state_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -1613,6 +2247,8 @@ def save_codextop_state(state: MonitorState) -> None:
         "interval": max(1, int(state.interval)),
         "curve_mode": state.curve_mode,
         "display_scope": state.display_scope,
+        "window_scope": state.window_scope,
+        "color_scheme": state.color_scheme,
     }
     tmp_path = state.state_path.with_name(f".{state.state_path.name}.{os.getpid()}.tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -1635,48 +2271,110 @@ def sampler_status(log_dir: Path) -> str:
     return f"后台 PID {pid}"
 
 
+def apply_setting_value(state: MonitorState, key: str, value: Any) -> None:
+    if key == "period":
+        period = str(value)
+        if state.period != period:
+            state.period = period
+            state.records = None
+            state.next_read = 0.0
+    elif key == "curve_mode":
+        state.curve_mode = str(value)
+    elif key == "window_scope":
+        state.window_scope = str(value)
+    elif key == "color_scheme":
+        state.color_scheme = color_schemes.set_active_color_scheme(str(value))
+    elif key == "display_scope":
+        scope = str(value)
+        if state.display_scope != scope:
+            state.display_scope = scope
+            state.records = None
+            state.next_read = 0.0
+            if scope in {"all", "merged"}:
+                try:
+                    send_sampler_interval(state, state.interval, sample_now=True, all_auth=True)
+                    state.status = "已请求所有账号数据"
+                    state.error = None
+                except Exception as exc:
+                    state.status = "命令失败"
+                    state.error = str(exc)
+    elif key == "interval":
+        state.interval = int(value)
+        state.next_read = 0.0
+        try:
+            send_sampler_interval(state, state.interval)
+            state.status = "已发送间隔"
+            state.error = None
+        except Exception as exc:
+            state.status = "命令失败"
+            state.error = str(exc)
+
+
+def handle_setting_key(state: MonitorState, key: str) -> bool:
+    if key == "f9":
+        state.settings_mode = "select"
+        normalize_settings_state(state)
+        return True
+    if key == "esc":
+        if state.settings_mode == "options":
+            state.settings_mode = "select"
+        elif state.settings_mode == "select":
+            state.settings_mode = "normal"
+        return True
+    if state.settings_mode == "normal":
+        return True
+
+    items = normalize_settings_state(state)
+    if not items:
+        return True
+    if key in {"up", "down"}:
+        step = -1 if key == "up" else 1
+        if state.settings_mode == "options":
+            choices = items[state.settings_focus][2]
+            if choices:
+                state.settings_option_focus = (state.settings_option_focus + step) % len(choices)
+        else:
+            state.settings_focus = (state.settings_focus + step) % len(items)
+            item_key = items[state.settings_focus][0]
+            state.settings_option_focus = setting_current_option_index(state, item_key)
+        return True
+    if key == "enter":
+        if state.settings_mode == "select":
+            open_focused_setting(state)
+        elif state.settings_mode == "options":
+            _index, item_key, _title, choices = focused_setting(state)
+            if choices:
+                _label, value = choices[state.settings_option_focus % len(choices)]
+                apply_setting_value(state, item_key, value)
+            state.settings_mode = "select"
+        return True
+    return True
+
+
 def handle_click(state: MonitorState, zones: list[ClickZone], x: int, y: int) -> bool:
     for zone in zones:
         if zone.y == y and zone.x1 <= x <= zone.x2:
             if zone.kind == "exit":
                 return False
-            if zone.kind == "period":
-                period = str(zone.value)
-                if state.period != period:
-                    state.period = period
-                    state.records = None
-                    state.next_read = 0.0
-            elif zone.kind == "curve_mode":
-                state.curve_mode = str(zone.value)
-            elif zone.kind == "display_scope":
-                scope = str(zone.value)
-                if state.display_scope != scope:
-                    state.display_scope = scope
-                    state.records = None
-                    state.next_read = 0.0
-                    if scope in {"all", "merged"}:
-                        try:
-                            send_sampler_interval(state, state.interval, sample_now=True, all_auth=True)
-                            state.status = "已请求所有账号数据"
-                            state.error = None
-                        except Exception as exc:
-                            state.status = "命令失败"
-                            state.error = str(exc)
+            if zone.kind == "settings_activate":
+                state.settings_mode = "select"
+                normalize_settings_state(state)
+            elif zone.kind == "settings_item":
+                state.settings_focus = int(zone.value)
+                open_focused_setting(state)
+            elif zone.kind == "settings_option":
+                item_key, value = zone.value
+                state.settings_focus = setting_index_for_key(str(item_key))
+                apply_setting_value(state, str(item_key), value)
+                state.settings_option_focus = setting_current_option_index(state, str(item_key))
+                state.settings_mode = "normal"
+            elif zone.kind in {"period", "curve_mode", "window_scope", "color_scheme", "display_scope", "interval"}:
+                apply_setting_value(state, zone.kind, zone.value)
             elif zone.kind == "summary_scroll":
                 records = list(state.records or [])
                 accounts = current_accounts(state, records)
                 if accounts:
                     state.summary_offset = (state.summary_offset + int(zone.value)) % len(accounts)
-            elif zone.kind == "interval":
-                state.interval = int(zone.value)
-                state.next_read = 0.0
-                try:
-                    send_sampler_interval(state, state.interval)
-                    state.status = "已发送间隔"
-                    state.error = None
-                except Exception as exc:
-                    state.status = "命令失败"
-                    state.error = str(exc)
             return True
     return True
 
@@ -1719,33 +2417,87 @@ class TerminalSession:
 
 
 MOUSE_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+CSI_RE = re.compile(rb"\x1b\[[0-9;?<>]*[A-Za-z~]")
+KEY_PATTERNS = [
+    (re.compile(rb"\x1b\[20(?:;[0-9]+)?~"), "f9"),
+    (re.compile(rb"\x1b\[21(?:;[0-9]+)?~"), "f10"),
+    (re.compile(rb"\x1b\[(?:1;[0-9]+)?A"), "up"),
+    (re.compile(rb"\x1b\[(?:1;[0-9]+)?B"), "down"),
+    (re.compile(rb"\x1bOA"), "up"),
+    (re.compile(rb"\x1bOB"), "down"),
+]
 
 
-def parse_input(session: TerminalSession) -> tuple[bool, list[tuple[int, int]]]:
+def parse_input(session: TerminalSession) -> tuple[bool, list[tuple[int, int]], list[str]]:
     session.buffer += session.read()
     data = session.buffer
     keep_running = True
     clicks: list[tuple[int, int]] = []
+    keys: list[str] = []
+    trailing = b""
+    pos = 0
 
-    if b"\x03" in data or b"q" in data or b"Q" in data:
-        keep_running = False
-    if re.search(rb"\x1b\[21(?:;[0-9]+)?~", data):
-        keep_running = False
+    while pos < len(data):
+        byte = data[pos:pos + 1]
+        if byte == b"\x03":
+            keep_running = False
+            pos += 1
+            continue
+        if byte in {b"q", b"Q"}:
+            keep_running = False
+            pos += 1
+            continue
+        if byte in {b"\r", b"\n"}:
+            keys.append("enter")
+            pos += 1
+            continue
+        if byte != b"\x1b":
+            pos += 1
+            continue
 
-    for match in MOUSE_RE.finditer(data):
-        button = int(match.group(1))
-        x = int(match.group(2))
-        y = int(match.group(3))
-        event = match.group(4)
-        if event == b"M" and button & 3 == 0:
-            clicks.append((x, y))
+        mouse = MOUSE_RE.match(data, pos)
+        if mouse:
+            button = int(mouse.group(1))
+            x = int(mouse.group(2))
+            y = int(mouse.group(3))
+            event = mouse.group(4)
+            if event == b"M" and button & 3 == 0:
+                clicks.append((x, y))
+            pos = mouse.end()
+            continue
 
-    last_escape = data.rfind(b"\x1b")
-    if last_escape >= 0 and len(data) - last_escape < 16:
-        session.buffer = data[last_escape:]
-    else:
-        session.buffer = b""
-    return keep_running, clicks
+        matched_key = False
+        for pattern, key in KEY_PATTERNS:
+            match = pattern.match(data, pos)
+            if not match:
+                continue
+            if key == "f10":
+                keep_running = False
+            else:
+                keys.append(key)
+            pos = match.end()
+            matched_key = True
+            break
+        if matched_key:
+            continue
+
+        if pos == len(data) - 1:
+            keys.append("esc")
+            pos += 1
+            continue
+
+        csi = CSI_RE.match(data, pos)
+        if csi:
+            pos = csi.end()
+            continue
+        if data[pos:pos + 2] == b"\x1b[":
+            trailing = data[pos:]
+            break
+        keys.append("esc")
+        pos += 1
+
+    session.buffer = trailing
+    return keep_running, clicks, keys
 
 
 def run_once(state: MonitorState) -> int:
@@ -1777,9 +2529,15 @@ def run_tui(state: MonitorState) -> int:
 
                 deadline = time.monotonic() + 0.2
                 while time.monotonic() < deadline:
-                    keep_running, clicks = parse_input(session)
+                    keep_running, clicks, keys = parse_input(session)
                     if not keep_running:
                         running = False
+                        break
+                    for key in keys:
+                        running = handle_setting_key(state, key)
+                        if not running:
+                            break
+                    if not running:
                         break
                     for x, y in clicks:
                         running = handle_click(state, zones, x, y)
@@ -1825,7 +2583,24 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="全屏 Codex quota 监控。")
     parser.add_argument("-p", "--period", choices=PERIOD_CHOICES, default=None, help="初始历史长度。")
     parser.add_argument("-i", "--interval", type=parse_interval, default=None, help="初始读取/后台更新间隔，如 30s 或 2m。")
-    parser.add_argument("--curve-mode", choices=["connected", "points"], default=None, help="历史曲线模式：connected 连续，points 间断。")
+    parser.add_argument(
+        "--curve-mode",
+        choices=[value for _label, value in CURVE_MODE_CHOICES],
+        default=None,
+        help="历史曲线模式：connected 连续，box 线条，bar 柱状，braille 精细，points 间断。",
+    )
+    parser.add_argument(
+        "--window-scope",
+        choices=[value for _label, value in WINDOW_SCOPE_CHOICES],
+        default=None,
+        help="历史窗口：both 同时显示 5h/7d，5h 只显示 5h，7d 只显示 7d。",
+    )
+    parser.add_argument(
+        "--color-scheme",
+        choices=[value for _label, value in color_schemes.color_scheme_choices()],
+        default=None,
+        help="百分比配色方案 keyword。",
+    )
     parser.add_argument("--display-scope", choices=["all", "current", "merged"], default=None, help="展示范围：all 全部账号，current 启用账号，merged 合并账号。")
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR, help="quota 历史日志目录。")
     parser.add_argument("--log-file", default=DEFAULT_LOG_FILE, help="quota 历史日志基础文件名，用于匹配月度日志。")
@@ -1840,6 +2615,9 @@ def main() -> int:
     state_path = args.log_dir.expanduser() / args.state_file
     saved_state = read_codextop_state(state_path)
     restore_interval = read_sampler_interval(control_path, DEFAULT_SAMPLER_INTERVAL_SECONDS)
+    selected_color_scheme = color_schemes.set_active_color_scheme(
+        args.color_scheme or saved_color_scheme(saved_state) or DEFAULT_COLOR_SCHEME
+    )
     state = MonitorState(
         period=args.period or saved_period(saved_state) or DEFAULT_PERIOD,
         interval=args.interval if args.interval is not None else (saved_interval(saved_state) or restore_interval),
@@ -1849,6 +2627,8 @@ def main() -> int:
         state_path=state_path,
         curve_mode=args.curve_mode or saved_curve_mode(saved_state) or DEFAULT_CURVE_MODE,
         display_scope=args.display_scope or saved_display_scope(saved_state) or DEFAULT_DISPLAY_SCOPE,
+        window_scope=args.window_scope or saved_window_scope(saved_state) or DEFAULT_WINDOW_SCOPE,
+        color_scheme=selected_color_scheme,
         control_path=control_path,
     )
     if args.once:

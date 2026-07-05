@@ -8,7 +8,6 @@ in memory, and never prints tokens, cookies, account IDs, or credit IDs.
 from __future__ import annotations
 
 import argparse
-import colorsys
 import json
 import re
 import sys
@@ -21,6 +20,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 try:
+    from . import color_schemes
     from .paths import (
         auth_keyword_from_path,
         auth_sort_key,
@@ -30,6 +30,7 @@ try:
         normalize_auth_keyword,
     )
 except ImportError:
+    import color_schemes
     from paths import (
         auth_keyword_from_path,
         auth_sort_key,
@@ -488,12 +489,7 @@ def left_style(value: Any) -> str:
 
 
 def percent_gradient_style(value: Any) -> str:
-    if not isinstance(value, (int, float)):
-        return "dim"
-    percent = max(0.0, min(100.0, float(value)))
-    hue = percent / 100.0 / 3.0
-    red, green, blue = colorsys.hsv_to_rgb(hue, 0.45, 0.88)
-    return f"#{int(red * 255):02x}{int(green * 255):02x}{int(blue * 255):02x}"
+    return color_schemes.percent_gradient_style(value)
 
 
 def reset_after_style(seconds: Any) -> str:
@@ -836,9 +832,16 @@ def main() -> int:
         default=None,
         help="Total card width budget; each account panel uses width/3. Default: 50 per account.",
     )
+    parser.add_argument(
+        "--color-scheme",
+        choices=[value for _label, value in color_schemes.color_scheme_choices()],
+        default=None,
+        help="Percent color scheme keyword.",
+    )
     args = parser.parse_args()
 
     try:
+        color_schemes.set_active_color_scheme(args.color_scheme)
         ensure_runtime_layout()
         auth_list = (args.auth_list or DEFAULT_AUTH_LIST).expanduser()
         configs, current_index = select_requested_configs(

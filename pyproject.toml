@@ -1,6 +1,6 @@
 [project]
 name = "codextop"
-version = "1.1.1"
+version = "1.2.0"
 description = "Terminal monitor for Codex quota usage."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+codextop = ["color_schemes.json"]
 
 [tool.ruff]
 line-length = 120
