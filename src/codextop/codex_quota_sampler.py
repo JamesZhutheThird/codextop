@@ -133,11 +133,22 @@ def control_path_for(log_dir: Path, control_file: str) -> Path:
     return log_dir.expanduser() / control_file
 
 
-def write_control(control_path: Path, interval: int | None = None, sample_now: bool = True) -> None:
+def write_control(
+    control_path: Path,
+    interval: int | None = None,
+    sample_now: bool = True,
+    all_auth: bool | None = None,
+) -> None:
     control_path.parent.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, Any] = {"updated_at": epoch_now(), "sample_now": bool(sample_now)}
+    payload: dict[str, Any] = {
+        "updated_at": epoch_now(),
+        "updated_at_ns": time.time_ns(),
+        "sample_now": bool(sample_now),
+    }
     if interval is not None:
         payload["interval"] = max(1, int(interval))
+    if all_auth is not None:
+        payload["all_auth"] = bool(all_auth)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{control_path.name}.", dir=control_path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -164,26 +175,32 @@ def read_control_interval(control_path: Path, fallback: int) -> int:
     return fallback
 
 
-def read_control_command(control_path: Path, fallback: int, last_seen_ns: int) -> tuple[int, int, bool]:
+def read_control_command(control_path: Path, fallback: int, last_seen_ns: int) -> tuple[int, int, bool, bool | None]:
     try:
         stat = control_path.stat()
     except OSError:
-        return fallback, last_seen_ns, False
-    seen_ns = stat.st_mtime_ns
-    if seen_ns == last_seen_ns:
-        return fallback, last_seen_ns, False
+        return fallback, last_seen_ns, False, None
 
     try:
         payload = json.loads(control_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return fallback, seen_ns, False
+        return fallback, stat.st_mtime_ns, False, None
+
+    raw_seen_ns = payload.get("updated_at_ns") if isinstance(payload, dict) else None
+    seen_ns = raw_seen_ns if isinstance(raw_seen_ns, int) and raw_seen_ns > 0 else stat.st_mtime_ns
+    if seen_ns == last_seen_ns:
+        return fallback, last_seen_ns, False, None
 
     interval = fallback
     raw_interval = payload.get("interval") if isinstance(payload, dict) else None
     if isinstance(raw_interval, (int, float)) and raw_interval > 0:
         interval = max(1, int(raw_interval))
     sample_now = bool(payload.get("sample_now")) if isinstance(payload, dict) else False
-    return interval, seen_ns, sample_now
+    all_auth_override = None
+    raw_all_auth = payload.get("all_auth") if isinstance(payload, dict) else None
+    if isinstance(raw_all_auth, bool):
+        all_auth_override = raw_all_auth
+    return interval, seen_ns, sample_now, all_auth_override
 
 
 def pid_is_running(pid: int) -> bool:
@@ -248,23 +265,26 @@ def run_loop(
     acquire_pid_lock(log_path.parent / "sampler.pid")
 
     current_interval = max(1, interval)
+    current_all_auth = bool(all_auth)
     last_sample = 0.0
     last_control_seen_ns = 0
     last_control_check = 0.0
     while not stop["value"]:
         now = time.monotonic()
         if last_control_check <= 0 or now - last_control_check >= CONTROL_POLL_SECONDS:
-            current_interval, last_control_seen_ns, sample_now = read_control_command(
+            current_interval, last_control_seen_ns, sample_now, all_auth_override = read_control_command(
                 control_path,
                 current_interval,
                 last_control_seen_ns,
             )
+            if all_auth_override is not None:
+                current_all_auth = all_auth_override
             last_control_check = now
             if sample_now:
                 last_sample = 0.0
             now = time.monotonic()
         if last_sample <= 0 or now - last_sample >= current_interval:
-            run_once(log_path, auth_file, auth_list, all_auth, tz_name)
+            run_once(log_path, auth_file, auth_list, current_all_auth, tz_name)
             last_sample = time.monotonic()
         time.sleep(1.0)
 

@@ -35,7 +35,7 @@ DEFAULT_LOG_FILE = "quota_snapshots.jsonl"
 DEFAULT_CONTROL_FILE = "sampler_control.json"
 DEFAULT_STATE_FILE = "codextop_state.json"
 DEFAULT_SAMPLER_INTERVAL_SECONDS = 60
-APP_VERSION = "v1.0.2"
+APP_VERSION = "v1.1.0"
 DEFAULT_PERIOD = "5h"
 DEFAULT_CURVE_MODE = "connected"
 DEFAULT_DISPLAY_SCOPE = "all"
@@ -56,6 +56,7 @@ CURVE_MODE_CHOICES = [
 DISPLAY_SCOPE_CHOICES = [
     ("看板模式", "all"),
     ("专注模式", "current"),
+    ("合并模式", "merged"),
 ]
 PERIOD_SECONDS = {
     "5m": 5 * 60,
@@ -330,15 +331,16 @@ def compact_reset_at(value: Any, reset_epoch: int | None = None) -> str:
     return value[-11:] if len(value) > 11 else value
 
 
-def progress_bar(value: Any, width: int) -> str:
+def progress_bar(value: Any, width: int, max_value: float = 100.0) -> str:
     width = max(4, width)
-    if not isinstance(value, (int, float)):
+    if not isinstance(value, (int, float)) or max_value <= 0:
         return paint("░" * width, "dim")
-    value = max(0.0, min(100.0, float(value)))
-    filled = max(0, min(width, round(width * value / 100)))
-    if value <= 0:
+    raw_value = max(0.0, float(value))
+    ratio = max(0.0, min(100.0, raw_value / max_value * 100))
+    filled = max(0, min(width, round(width * ratio / 100)))
+    if raw_value <= 0:
         filled = 1
-    color = "#b95f5f" if value <= 0 else percent_color(value)
+    color = "#b95f5f" if raw_value <= 0 else percent_color(ratio)
     return paint("█" * filled, color) + paint("░" * (width - filled), "dim")
 
 
@@ -375,10 +377,13 @@ def account_plan(account: dict[str, Any]) -> str:
 def window_info(account: dict[str, Any], key: str) -> dict[str, Any]:
     if "quota" in account:
         window = account.get("quota", {}).get(key, {})
+        reset_after = window.get("reset_after_seconds")
+        reset_epoch = int(time.time() + reset_after) if isinstance(reset_after, (int, float)) else None
         return {
             "left": window.get("remaining_percent"),
-            "reset_after": window.get("reset_after_seconds"),
+            "reset_after": reset_after,
             "reset_at": compact_reset_at(window.get("reset_at")),
+            "reset_epoch": reset_epoch,
         }
     raw = account.get("q", {}).get(key)
     if isinstance(raw, list) and len(raw) >= 4:
@@ -387,8 +392,9 @@ def window_info(account: dict[str, Any], key: str) -> dict[str, Any]:
             "left": left,
             "reset_after": reset_after,
             "reset_at": compact_reset_at(None, reset_epoch if isinstance(reset_epoch, int) else None),
+            "reset_epoch": reset_epoch if isinstance(reset_epoch, int) else None,
         }
-    return {"left": None, "reset_after": None, "reset_at": "-"}
+    return {"left": None, "reset_after": None, "reset_at": "-", "reset_epoch": None}
 
 
 def reset_rows(account: dict[str, Any], width: int) -> list[str]:
@@ -468,6 +474,217 @@ def quota_rows(account: dict[str, Any], width: int, *, compact: bool = False) ->
     return rows
 
 
+def percent_sum_text(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "--%"
+    if float(value).is_integer():
+        return f"{int(value)}%"
+    return f"{value:g}%"
+
+
+def merged_ratio_percent(value: Any, max_value: Any) -> float | None:
+    if not isinstance(value, (int, float)) or not isinstance(max_value, (int, float)) or max_value <= 0:
+        return None
+    return max(0.0, min(100.0, float(value) / float(max_value) * 100))
+
+
+def valid_quota_accounts(accounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        account for account in accounts
+        if isinstance(account, dict) and not account_error(account)
+    ]
+
+
+def merged_plan_text(accounts: list[dict[str, Any]]) -> str:
+    counts: dict[str, int] = {}
+    for account in valid_quota_accounts(accounts):
+        plan = account_plan(account)
+        if not plan or plan == "-":
+            continue
+        counts[plan] = counts.get(plan, 0) + 1
+    if not counts:
+        return "-"
+    return " / ".join(f"{plan} x{count}" if count > 1 else plan for plan, count in counts.items())
+
+
+def merged_available_resets(accounts: list[dict[str, Any]]) -> int | None:
+    total = 0
+    found = False
+    for account in valid_quota_accounts(accounts):
+        if "reset_credits" in account:
+            available = account.get("reset_credits", {}).get("available_count")
+        else:
+            available = account.get("rc")
+        if isinstance(available, int):
+            total += available
+            found = True
+    return total if found else None
+
+
+def current_account_id(accounts: list[dict[str, Any]], current: int | str | None) -> str:
+    if current is not None:
+        return str(current)
+    for account in accounts:
+        if not isinstance(account, dict):
+            continue
+        if is_current(account):
+            index = account_index(account)
+            return str(index) if index is not None else "-"
+    return "-"
+
+
+def current_account_obj(accounts: list[dict[str, Any]], current: int | str | None) -> dict[str, Any] | None:
+    if current is not None:
+        for account in accounts:
+            if not isinstance(account, dict):
+                continue
+            if account_index(account) == current:
+                return account
+    for account in accounts:
+        if not isinstance(account, dict):
+            continue
+        if is_current(account):
+            return account
+    return None
+
+
+def current_account_quota_summary(accounts: list[dict[str, Any]], current: int | str | None) -> str:
+    account = current_account_obj(accounts, current)
+    account_id = current_account_id(accounts, current)
+    if not account or account_error(account):
+        return account_id
+    left_5h = window_info(account, "5h").get("left")
+    left_7d = window_info(account, "7d").get("left")
+    return (
+        f"{account_id} "
+        f"(5h {paint(percent_text(left_5h), percent_color(left_5h))} "
+        f"7d {paint(percent_text(left_7d), percent_color(left_7d))})"
+    )
+
+
+def credit_expire_epoch(credit: Any, observed_ts: int) -> int | None:
+    if isinstance(credit, list) and len(credit) >= 2 and isinstance(credit[1], int):
+        return credit[1]
+    if not isinstance(credit, dict):
+        return None
+    seconds = credit.get("expires_after_seconds")
+    if isinstance(seconds, (int, float)):
+        return observed_ts + int(seconds)
+    expires_dt = quota.parse_datetime_utc(credit.get("expires_at"))
+    return int(expires_dt.timestamp()) if expires_dt is not None else None
+
+
+def merged_reset_expiration_rows(accounts: list[dict[str, Any]], limit: int = 3) -> list[tuple[int, str, str]]:
+    now = int(time.time())
+    rows: list[tuple[int, str, str]] = []
+    for account in valid_quota_accounts(accounts):
+        index = account_index(account)
+        account_id = str(index) if index is not None else "-"
+        if "reset_credits" in account:
+            credits = [
+                credit for credit in account.get("reset_credits", {}).get("credits", [])
+                if isinstance(credit, dict) and credit.get("status") == "available"
+            ]
+        else:
+            credits = account.get("r", [])
+        if not isinstance(credits, list):
+            continue
+        for credit in credits:
+            expire_epoch = credit_expire_epoch(credit, now)
+            if expire_epoch is None:
+                continue
+            title = quota.compact_reset_title(credit.get("title")) if isinstance(credit, dict) else str(credit[0] if credit else "-")
+            rows.append((expire_epoch, account_id, title))
+    return sorted(rows, key=lambda item: item[0])[:limit]
+
+
+def merged_window_info(accounts: list[dict[str, Any]], key: str) -> dict[str, Any]:
+    total = 0.0
+    contributors = 0
+    reset_candidates: list[int] = []
+    for account in valid_quota_accounts(accounts):
+        info = window_info(account, key)
+        left = info.get("left")
+        if not isinstance(left, (int, float)):
+            continue
+        total += float(left)
+        contributors += 1
+        reset_epoch = info.get("reset_epoch")
+        if isinstance(reset_epoch, int):
+            reset_candidates.append(reset_epoch)
+
+    if contributors == 0:
+        return {
+            "left": None,
+            "max_left": None,
+            "contributors": 0,
+            "reset_after": None,
+            "reset_at": "-",
+            "reset_epoch": None,
+        }
+
+    nearest_reset = min(reset_candidates) if reset_candidates else None
+    reset_after = max(0, nearest_reset - int(time.time())) if nearest_reset is not None else None
+    left: int | float = int(total) if total.is_integer() else round(total, 2)
+    return {
+        "left": left,
+        "max_left": contributors * 100,
+        "contributors": contributors,
+        "reset_after": reset_after,
+        "reset_at": compact_reset_at(None, nearest_reset),
+        "reset_epoch": nearest_reset,
+    }
+
+
+def account_quota_detail_line(accounts: list[dict[str, Any]], current: int | str | None, key: str, width: int) -> str:
+    sortable: list[tuple[float, str]] = []
+    for account in valid_quota_accounts(accounts):
+        index = account_index(account)
+        account_id = str(index) if index is not None else "-"
+        left = window_info(account, key).get("left")
+        if not isinstance(left, (int, float)):
+            continue
+        text = f"{account_id}({percent_text(left)})"
+        sortable.append((float(left), paint(text, percent_color(left))))
+    entries = [text for _left, text in sorted(sortable, key=lambda item: item[0], reverse=True)]
+    return fit_ansi(", ".join(entries), width)
+
+
+def merged_quota_detail_reset_line(
+    accounts: list[dict[str, Any]],
+    current: int | str | None,
+    key: str,
+    info: dict[str, Any],
+    width: int,
+) -> str:
+    reset_text = f"{info['reset_at']}重置"
+    reset = paint_style(reset_text, quota.reset_after_style(info["reset_after"]))
+    reset_width = min(visible_width(reset), max(12, width // 3))
+    detail_width = max(8, width - reset_width - 1)
+    detail = account_quota_detail_line(accounts, current, key, detail_width)
+    return fit_ansi(detail, detail_width) + " " + right_ansi(reset, reset_width)
+
+
+def merged_quota_rows(accounts: list[dict[str, Any]], current: int | str | None, width: int, *, compact: bool = False) -> list[str]:
+    rows: list[str] = []
+    for key in ("5h", "7d"):
+        info = merged_window_info(accounts, key)
+        left = info["left"]
+        max_left = info["max_left"] if isinstance(info["max_left"], (int, float)) else 100
+        label_text = f"{key}({WINDOW_MARKERS[key]})"
+        label = paint(label_text, bold=True)
+        pct_raw = percent_sum_text(left)
+        pct_width = max(4, visible_width(pct_raw))
+        ratio = merged_ratio_percent(left, max_left)
+        pct = paint(pct_raw.rjust(pct_width), percent_color(ratio))
+        bar_width = max(8, width - visible_width(label_text) - 1 - 1 - pct_width)
+        rows.append(f"{label} {progress_bar(left, bar_width, float(max_left))} {pct}")
+        rows.append(merged_quota_detail_reset_line(accounts, current, key, info, width))
+        if key == "5h" and not compact:
+            rows.append("")
+    return rows
+
+
 def read_snapshots(log_path: Path, period: str, tz_name: str) -> list[dict[str, Any]]:
     records_by_time: dict[int, dict[str, Any]] = {}
     months = None if period == "all" else recent_month_keys(tz_name, 2)
@@ -532,7 +749,7 @@ def reset_in_gap(prev: dict[str, Any], next_point: dict[str, Any] | None, start_
     return min(candidates, key=lambda item: abs(item - midpoint))
 
 
-def value_at(points: list[dict[str, Any]], ts: int) -> tuple[float, bool]:
+def value_at(points: list[dict[str, Any]], ts: int, reset_value: float = 100.0) -> tuple[float, bool]:
     times = [point["t"] for point in points]
     pos = bisect.bisect_right(times, ts) - 1
     if pos < 0:
@@ -548,14 +765,14 @@ def value_at(points: list[dict[str, Any]], ts: int) -> tuple[float, bool]:
         predicted = True
         reset_ts = reset_in_gap(prev, next_point, prev["t"], next_point["t"])
         if reset_ts and ts >= reset_ts:
-            return 100.0, True
+            return reset_value, True
         return prev["left"], True
 
     if not next_point and ts - prev["t"] > GAP_SECONDS:
         predicted = True
         reset_ts = reset_in_gap(prev, None, prev["t"], gap_end)
         if reset_ts and ts >= reset_ts:
-            return 100.0, True
+            return reset_value, True
         return prev["left"], True
 
     return prev["left"], predicted
@@ -600,16 +817,7 @@ def current_index(state: MonitorState, records: list[dict[str, Any]]) -> int | s
     return None
 
 
-def chart_lines(
-    records: list[dict[str, Any]],
-    index: int | str,
-    period: str,
-    width: int,
-    height: int,
-    curve_mode: str,
-) -> list[str]:
-    if not records or width <= 10 or height <= 3:
-        return [paint("暂无历史数据", "dim")]
+def records_for_period(records: list[dict[str, Any]], period: str) -> tuple[list[dict[str, Any]], int, int]:
     end_ts = int(time.time())
     if period == "all":
         start_ts = records[0]["t"]
@@ -621,18 +829,33 @@ def chart_lines(
         relevant.insert(0, context[-1])
     if not relevant:
         relevant = records[-1:]
+    return relevant, start_ts, end_ts
 
-    axis_width = 4
+
+def axis_value_text(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
+def series_chart_lines(
+    points: dict[str, list[dict[str, Any]]],
+    start_ts: int,
+    end_ts: int,
+    width: int,
+    height: int,
+    curve_mode: str,
+    max_value: float,
+) -> list[str]:
+    if width <= 10 or height <= 3:
+        return [paint("暂无历史数据", "dim")]
+    if not any(points.values()) or max_value <= 0:
+        return [paint("暂无历史数据", "dim")]
+
+    tick_values = [max_value * ratio for ratio in (1.0, 0.75, 0.5, 0.25, 0.0)]
+    axis_width = max(4, max(visible_width(axis_value_text(value)) for value in tick_values) + 1)
     box_width = max(6, width - axis_width)
     plot_width = max(2, box_width - 4)
     chart_width = plot_width + 2
     chart_height = max(2, height - 3)
-    points = {
-        "5h": window_points(relevant, index, "5h"),
-        "7d": window_points(relevant, index, "7d"),
-    }
-    if not any(points.values()):
-        return [paint("暂无历史数据", "dim")]
 
     grid: list[list[tuple[str, str, int]]] = [
         [(" ", "dim", 0) for _ in range(plot_width)]
@@ -659,33 +882,35 @@ def chart_lines(
         for column in range(plot_width):
             ratio = column / max(1, plot_width - 1)
             ts = int(start_ts + (end_ts - start_ts) * ratio)
-            value, _predicted = value_at(series, ts)
-            value = max(0, min(100, value))
-            row = round((100 - value) / 100 * (chart_height - 1))
+            value, _predicted = value_at(series, ts, max_value)
+            value = max(0, min(max_value, value))
+            normalized = max(0.0, min(100.0, value / max_value * 100))
+            row = round((max_value - value) / max_value * (chart_height - 1))
             if curve_mode == "connected" and previous_row is not None and previous_value is not None:
                 row_span = abs(row - previous_row)
                 if row_span == 0:
-                    put_cell(row, column, char, percent_color(value), priority)
+                    put_cell(row, column, char, percent_color(normalized), priority)
                 else:
                     step = 1 if row > previous_row else -1
                     for filled_row in range(previous_row + step, row + step, step):
                         row_ratio = abs(filled_row - previous_row) / row_span
                         interpolated = previous_value + (value - previous_value) * row_ratio
-                        put_cell(filled_row, column, char, percent_color(interpolated), priority)
+                        interpolated_normalized = max(0.0, min(100.0, interpolated / max_value * 100))
+                        put_cell(filled_row, column, char, percent_color(interpolated_normalized), priority)
             else:
-                put_cell(row, column, char, percent_color(value), priority)
+                put_cell(row, column, char, percent_color(normalized), priority)
             previous_row = row
             previous_value = float(value)
 
     tick_rows = {
-        round((100 - value) / 100 * (chart_height - 1)): value
-        for value in (100, 75, 50, 25, 0)
+        round((max_value - value) / max_value * (chart_height - 1)): value
+        for value in tick_values
     }
     lines: list[str] = []
     lines.append((" " * axis_width) + paint("┌" + "─" * chart_width + "┐", "dim"))
     for row_index, row in enumerate(grid):
         axis = tick_rows.get(row_index)
-        prefix = paint(f"{axis:>3} ", "dim") if axis is not None else "    "
+        prefix = paint(f"{axis_value_text(axis):>{axis_width - 1}} ", "dim") if axis is not None else " " * axis_width
         plot = "".join(paint(char, color) if char != " " else " " for char, color, _priority in row)
         line = prefix + paint("│", "dim") + " " + plot + " " + paint("│", "dim")
         lines.append(fit_ansi(line, width))
@@ -694,6 +919,24 @@ def chart_lines(
     while len(lines) < height:
         lines.append("")
     return [fit_ansi(line, width) for line in lines[:height]]
+
+
+def chart_lines(
+    records: list[dict[str, Any]],
+    index: int | str,
+    period: str,
+    width: int,
+    height: int,
+    curve_mode: str,
+) -> list[str]:
+    if not records:
+        return [paint("暂无历史数据", "dim")]
+    relevant, start_ts, end_ts = records_for_period(records, period)
+    points = {
+        "5h": window_points(relevant, index, "5h"),
+        "7d": window_points(relevant, index, "7d"),
+    }
+    return series_chart_lines(points, start_ts, end_ts, width, height, curve_mode, 100.0)
 
 
 def chart_box(lines: list[str], width: int, height: int) -> list[str]:
@@ -824,11 +1067,149 @@ def account_history_lines(
     return [fit_ansi(line, inner_width) for line in lines[:inner_height]]
 
 
+def merged_account_reset_body(accounts: list[dict[str, Any]], current: int | str | None, inner_width: int) -> list[str]:
+    lines: list[str] = []
+
+    def add_text(line: str) -> None:
+        lines.append(" " + fit_ansi(line, max(1, inner_width - 2)).rstrip())
+
+    add_text(f"{paint('账号类型', 'dim')} {plain_fit(merged_plan_text(accounts), inner_width - 10)}")
+    add_text(f"{paint('当前账号', 'dim')} {current_account_quota_summary(accounts, current)}")
+    lines.append(section_rule("额度重置", inner_width))
+    available = merged_available_resets(accounts)
+    add_text(f"{paint('重置次数', 'dim')} 合计 {available if isinstance(available, int) else '-'} 次可用")
+    expirations = merged_reset_expiration_rows(accounts, 3)
+    day_width = reset_credit_day_width([expire_epoch - int(time.time()) for expire_epoch, _account_id, _title in expirations])
+    for rank in range(1, 4):
+        if rank <= len(expirations):
+            expire_epoch, account_id, _title = expirations[rank - 1]
+            remaining = max(0, expire_epoch - int(time.time()))
+            countdown_text = reset_credit_countdown(remaining, day_width)
+            row = f"{rank}. 来自 {account_id} 于 {countdown_text} 后过期"
+            if visible_width(row) > inner_width:
+                row = f"{rank}. {account_id} 于 {countdown_text} 后过期"
+            lines.append(center_ansi(row, inner_width))
+        else:
+            lines.append(center_ansi(f"{rank}. -", inner_width))
+
+    return [fit_ansi(line, inner_width) for line in lines]
+
+
+def merged_account_reset_lines(accounts: list[dict[str, Any]], current: int | str | None, panel_width: int, panel_height: int) -> list[str]:
+    inner_width = max(10, panel_width - 2)
+    inner_height = max(4, panel_height - 2)
+    lines = merged_account_reset_body(accounts, current, inner_width)
+    if len(lines) < inner_height:
+        lines.extend([""] * (inner_height - len(lines)))
+    return [fit_ansi(line, inner_width) for line in lines[:inner_height]]
+
+
+def merged_quota_summary_lines(accounts: list[dict[str, Any]], current: int | str | None, panel_width: int, panel_height: int) -> list[str]:
+    inner_width = max(10, panel_width - 2)
+    inner_height = max(4, panel_height - 2)
+    lines: list[str] = []
+
+    def add_text(line: str) -> None:
+        lines.append(" " + fit_ansi(line, max(1, inner_width - 2)).rstrip())
+
+    quota_lines = merged_quota_rows(accounts, current, inner_width - 2, compact=True)
+    lines.append("")
+    for line in quota_lines[:2]:
+        add_text(line)
+    lines.append("")
+    for line in quota_lines[2:4]:
+        add_text(line)
+    lines.append("")
+    if len(lines) < inner_height:
+        lines.extend([""] * (inner_height - len(lines)))
+    return [fit_ansi(line, inner_width) for line in lines[:inner_height]]
+
+
+def merged_window_points(records: list[dict[str, Any]], window: str) -> list[dict[str, Any]]:
+    points: list[dict[str, Any]] = []
+    for record in records:
+        timestamp = record.get("t")
+        accounts = record.get("a", [])
+        if not isinstance(timestamp, int) or not isinstance(accounts, list):
+            continue
+        total = 0.0
+        contributors = 0
+        reset_candidates: list[int] = []
+        for account in accounts:
+            if not isinstance(account, dict) or account_error(account):
+                continue
+            info = window_info(account, window)
+            left = info.get("left")
+            if not isinstance(left, (int, float)):
+                continue
+            total += float(left)
+            contributors += 1
+            reset_epoch = info.get("reset_epoch")
+            if isinstance(reset_epoch, int):
+                reset_candidates.append(reset_epoch)
+        if contributors == 0:
+            continue
+        points.append(
+            {
+                "t": timestamp,
+                "left": total,
+                "reset": min(reset_candidates) if reset_candidates else None,
+                "max": contributors * 100,
+            }
+        )
+    return points
+
+
+def merged_chart_lines(
+    records: list[dict[str, Any]],
+    period: str,
+    width: int,
+    height: int,
+    curve_mode: str,
+) -> list[str]:
+    if not records:
+        return [paint("暂无历史数据", "dim")]
+    relevant, start_ts, end_ts = records_for_period(records, period)
+    points = {
+        "5h": merged_window_points(relevant, "5h"),
+        "7d": merged_window_points(relevant, "7d"),
+    }
+    max_value = max(
+        [float(point.get("max", 0)) for series in points.values() for point in series],
+        default=100.0,
+    )
+    max_value = max(100.0, max_value)
+    return series_chart_lines(points, start_ts, end_ts, width, height, curve_mode, max_value)
+
+
+def merged_history_lines(
+    records: list[dict[str, Any]],
+    panel_width: int,
+    panel_height: int,
+    period: str,
+    curve_mode: str,
+) -> list[str]:
+    inner_width = max(10, panel_width - 2)
+    inner_height = max(4, panel_height - 2)
+    chart_width = max(8, inner_width - 2)
+    chart = merged_chart_lines(records, period, chart_width, inner_height, curve_mode)
+    lines = [" " + fit_ansi(line, chart_width) for line in chart]
+    if len(lines) < inner_height:
+        lines.extend([""] * (inner_height - len(lines)))
+    return [fit_ansi(line, inner_width) for line in lines[:inner_height]]
+
+
 def border_color(account: dict[str, Any], current: int | str | None) -> str:
     if account_error(account):
         return "dim"
     left = window_info(account, "5h").get("left")
     return percent_color(left) if isinstance(left, (int, float)) else "dim"
+
+
+def merged_border_color(accounts: list[dict[str, Any]]) -> str:
+    info = merged_window_info(accounts, "5h")
+    ratio = merged_ratio_percent(info.get("left"), info.get("max_left"))
+    return percent_color(ratio) if ratio is not None else "dim"
 
 
 def panel(title: str, body: list[str], width: int, height: int, color: str) -> list[str]:
@@ -1058,6 +1439,48 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
             border_color(active, current),
         )
         left_lines = compose_columns([left_block, right_block], [left_width, right_width], content_height)
+    elif state.display_scope == "merged":
+        color = merged_border_color(accounts)
+        if content_height >= 17:
+            top_height = 9
+        elif content_height >= 14:
+            top_height = 8
+        else:
+            top_height = max(4, content_height // 2)
+        history_height = max(4, content_height - top_height)
+        top_left_width = min(50, max(37, main_width // 3))
+        top_right_width = max(24, main_width - top_left_width)
+        top_left_width = main_width - top_right_width
+        top_left_block = panel(
+            "账号信息",
+            merged_account_reset_lines(accounts, current, top_left_width, top_height),
+            top_left_width,
+            top_height,
+            color,
+        )
+        top_right_block = panel(
+            "总额度",
+            merged_quota_summary_lines(accounts, current, top_right_width, top_height),
+            top_right_width,
+            top_height,
+            color,
+        )
+        top_lines = compose_columns(
+            [top_left_block, top_right_block],
+            [top_left_width, top_right_width],
+            top_height,
+        )
+        history_block = panel(
+            "合并额度历史",
+            merged_history_lines(records, main_width, history_height, state.period, state.curve_mode),
+            main_width,
+            history_height,
+            color,
+        )
+        left_lines = top_lines + history_block
+        if len(left_lines) < content_height:
+            left_lines.extend([" " * main_width] * (content_height - len(left_lines)))
+        left_lines = left_lines[:content_height]
     else:
         columns = min(3, len(accounts))
         row_count = max(1, (len(accounts) + columns - 1) // columns)
@@ -1094,13 +1517,21 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
     return [fit_ansi(line, term_width) for line in lines[:term_height]], zones
 
 
-def send_sampler_interval(state: MonitorState, interval: int, *, sample_now: bool = True) -> None:
+def send_sampler_interval(
+    state: MonitorState,
+    interval: int,
+    *,
+    sample_now: bool = True,
+    all_auth: bool = True,
+) -> None:
     control_path = state.control_path or (state.log_path.parent / DEFAULT_CONTROL_FILE)
     control_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "updated_at": int(time.time()),
+        "updated_at_ns": time.time_ns(),
         "interval": max(1, int(interval)),
         "sample_now": bool(sample_now),
+        "all_auth": bool(all_auth),
     }
     tmp_path = control_path.with_name(f".{control_path.name}.{os.getpid()}.tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -1195,7 +1626,19 @@ def handle_click(state: MonitorState, zones: list[ClickZone], x: int, y: int) ->
             elif zone.kind == "curve_mode":
                 state.curve_mode = str(zone.value)
             elif zone.kind == "display_scope":
-                state.display_scope = str(zone.value)
+                scope = str(zone.value)
+                if state.display_scope != scope:
+                    state.display_scope = scope
+                    state.records = None
+                    state.next_read = 0.0
+                    if scope in {"all", "merged"}:
+                        try:
+                            send_sampler_interval(state, state.interval, sample_now=True, all_auth=True)
+                            state.status = "已请求所有账号数据"
+                            state.error = None
+                        except Exception as exc:
+                            state.status = "命令失败"
+                            state.error = str(exc)
             elif zone.kind == "summary_scroll":
                 records = list(state.records or [])
                 accounts = current_accounts(state, records)
@@ -1292,9 +1735,9 @@ def run_once(state: MonitorState) -> int:
 
 def run_tui(state: MonitorState) -> int:
     state.next_read = 0.0
-    if state.interval != state.restore_interval:
+    if state.interval != state.restore_interval or state.display_scope == "merged":
         try:
-            send_sampler_interval(state, state.interval, sample_now=True)
+            send_sampler_interval(state, state.interval, sample_now=True, all_auth=True)
         except Exception as exc:
             state.status = "命令失败"
             state.error = str(exc)
@@ -1360,7 +1803,7 @@ def main() -> int:
     parser.add_argument("-p", "--period", choices=PERIOD_CHOICES, default=None, help="初始历史长度。")
     parser.add_argument("-i", "--interval", type=parse_interval, default=None, help="初始读取/后台更新间隔，如 30s 或 2m。")
     parser.add_argument("--curve-mode", choices=["connected", "points"], default=None, help="历史曲线模式：connected 连续，points 间断。")
-    parser.add_argument("--display-scope", choices=["all", "current"], default=None, help="展示范围：all 全部账号，current 启用账号。")
+    parser.add_argument("--display-scope", choices=["all", "current", "merged"], default=None, help="展示范围：all 全部账号，current 启用账号，merged 合并账号。")
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR, help="quota 历史日志目录。")
     parser.add_argument("--log-file", default=DEFAULT_LOG_FILE, help="quota 历史日志基础文件名，用于匹配月度日志。")
     parser.add_argument("--control-file", default=DEFAULT_CONTROL_FILE, help="后台 sampler 控制文件名。")
