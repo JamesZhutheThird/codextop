@@ -13,38 +13,25 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-try:
-    from .paths import (
-        CodexTopPaths,
-        atomic_write_json,
-        atomic_write_text,
-        auth_keyword_from_path,
-        auth_keyword_number,
-        auth_sort_key,
-        default_paths,
-        ensure_runtime_layout,
-        normalize_auth_keyword,
-        now_iso,
-        provider_config_payload,
-    )
-except ImportError:
-    from paths import (
-        CodexTopPaths,
-        atomic_write_json,
-        atomic_write_text,
-        auth_keyword_from_path,
-        auth_keyword_number,
-        auth_sort_key,
-        default_paths,
-        ensure_runtime_layout,
-        normalize_auth_keyword,
-        now_iso,
-        provider_config_payload,
-    )
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from core.paths import (
+    CodexTopPaths,
+    atomic_write_json,
+    atomic_write_text,
+    auth_keyword_from_path,
+    auth_keyword_number,
+    auth_sort_key,
+    default_paths,
+    ensure_runtime_layout,
+    normalize_auth_keyword,
+    now_iso,
+    provider_config_payload,
+)
 
 
-TOOLKIT_DIR = Path(__file__).resolve().parent
-REPO_DIR = TOOLKIT_DIR.parent.parent
+REPO_DIR = Path(__file__).resolve().parents[2]
 PATHS = ensure_runtime_layout(default_paths())
 CODEX_DIR = PATHS.codex_dir
 CONFIG_FILE = PATHS.config_file

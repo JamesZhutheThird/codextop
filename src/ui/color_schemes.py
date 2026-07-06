@@ -9,35 +9,52 @@ from pathlib import Path
 from typing import Any
 
 
+COLOR_SCHEME_DIR_ENV = "CODEXTOP_COLOR_SCHEME_DIR"
 COLOR_SCHEME_FILE_ENV = "CODEXTOP_COLOR_SCHEME_FILE"
-DEFAULT_COLOR_SCHEME_FILE = Path(__file__).with_name("color_schemes.json")
+DEFAULT_COLOR_SCHEME_DIR = Path(__file__).with_name("styles")
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 _ACTIVE_SCHEME_KEY: str | None = None
-_ACTIVE_SCHEME_FILE: Path | None = None
+_ACTIVE_SCHEME_SOURCE: Path | None = None
 _SCHEME_CACHE: dict[Path, dict[str, Any]] = {}
 
 
-def color_scheme_file(path: Path | str | None = None) -> Path:
+def color_scheme_source(path: Path | str | None = None) -> Path:
     if path is not None:
         return Path(path).expanduser()
+    env_dir = os.environ.get(COLOR_SCHEME_DIR_ENV)
+    if env_dir:
+        return Path(env_dir).expanduser()
     env_path = os.environ.get(COLOR_SCHEME_FILE_ENV)
     if env_path:
         return Path(env_path).expanduser()
-    return DEFAULT_COLOR_SCHEME_FILE
+    return DEFAULT_COLOR_SCHEME_DIR
 
 
-def _read_payload(path: Path) -> dict[str, Any]:
-    resolved = path.resolve()
+def _read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"color style file not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"color style file is not valid JSON: {path}") from exc
+
+
+def _read_payload(source: Path) -> dict[str, Any]:
+    resolved = source.resolve()
     if resolved not in _SCHEME_CACHE:
-        try:
-            payload = json.loads(resolved.read_text(encoding="utf-8"))
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"color scheme file not found: {resolved}") from exc
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"color scheme file is not valid JSON: {resolved}") from exc
-        if not isinstance(payload, dict):
-            raise RuntimeError(f"color scheme file root must be an object: {resolved}")
+        if resolved.is_dir():
+            payload = {}
+            scheme_files = sorted(resolved.glob("*.json"), key=lambda path: (path.stem != "classic", path.stem))
+            for scheme_file in scheme_files:
+                scheme = _read_json(scheme_file)
+                if not isinstance(scheme, dict):
+                    raise RuntimeError(f"color style root must be an object: {scheme_file}")
+                payload[scheme_file.stem] = scheme
+        else:
+            payload = _read_json(resolved)
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"color style source root must be an object: {resolved}")
         _validate_payload(payload, resolved)
         _prepare_payload(payload)
         _SCHEME_CACHE[resolved] = payload
@@ -81,7 +98,7 @@ def _prepare_payload(payload: dict[str, Any]) -> None:
 
 
 def color_scheme_choices(path: Path | str | None = None) -> list[tuple[str, str]]:
-    payload = _read_payload(color_scheme_file(path))
+    payload = _read_payload(color_scheme_source(path))
     choices: list[tuple[str, str]] = []
     for key, scheme in payload.items():
         label = scheme.get("label") if isinstance(scheme, dict) else None
@@ -90,25 +107,25 @@ def color_scheme_choices(path: Path | str | None = None) -> list[tuple[str, str]
 
 
 def default_color_scheme_key(path: Path | str | None = None) -> str:
-    payload = _read_payload(color_scheme_file(path))
+    payload = _read_payload(color_scheme_source(path))
     if "classic" in payload:
         return "classic"
     return next(iter(payload))
 
 
 def color_scheme_exists(key: str, path: Path | str | None = None) -> bool:
-    payload = _read_payload(color_scheme_file(path))
+    payload = _read_payload(color_scheme_source(path))
     return key in payload
 
 
 def set_active_color_scheme(key: str | None = None, path: Path | str | None = None) -> str:
-    global _ACTIVE_SCHEME_FILE, _ACTIVE_SCHEME_KEY
-    scheme_file = color_scheme_file(path).resolve()
-    payload = _read_payload(scheme_file)
-    selected = key or default_color_scheme_key(scheme_file)
+    global _ACTIVE_SCHEME_SOURCE, _ACTIVE_SCHEME_KEY
+    scheme_source = color_scheme_source(path).resolve()
+    payload = _read_payload(scheme_source)
+    selected = key or default_color_scheme_key(scheme_source)
     if selected not in payload:
         raise RuntimeError(f"color scheme not found: {selected}")
-    _ACTIVE_SCHEME_FILE = scheme_file
+    _ACTIVE_SCHEME_SOURCE = scheme_source
     _ACTIVE_SCHEME_KEY = selected
     return selected
 
@@ -120,13 +137,13 @@ def active_color_scheme_key() -> str:
 
 
 def _active_scheme(path: Path | str | None = None, key: str | None = None) -> dict[str, Any]:
-    scheme_file = color_scheme_file(path).resolve()
+    scheme_source = color_scheme_source(path).resolve()
     if key is None:
-        if _ACTIVE_SCHEME_KEY is None or _ACTIVE_SCHEME_FILE != scheme_file:
-            key = set_active_color_scheme(path=scheme_file)
+        if _ACTIVE_SCHEME_KEY is None or _ACTIVE_SCHEME_SOURCE != scheme_source:
+            key = set_active_color_scheme(path=scheme_source)
         else:
             key = _ACTIVE_SCHEME_KEY
-    payload = _read_payload(scheme_file)
+    payload = _read_payload(scheme_source)
     if key not in payload:
         raise RuntimeError(f"color scheme not found: {key}")
     return payload[key]

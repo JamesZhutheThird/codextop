@@ -1,28 +1,33 @@
 [project]
 name = "codextop"
-version = "1.2.0"
+version = "2.0.0"
 description = "Terminal monitor for Codex quota usage."
 readme = "README.md"
+license = { text = "CC BY-NC-SA 4.0" }
 requires-python = ">=3.10"
 dependencies = [
   "rich>=13.0.0",
 ]
 
 [project.scripts]
-codextop = "codextop.codextop:main"
-codextop-auth = "codextop.codex_auth:main"
-codextop-check = "codextop.check_codex_quota:main"
-codextop-sampler = "codextop.codex_quota_sampler:main"
+codextop = "codextop:main"
+codextop-auth = "auth.codex_auth:main"
+codextop-check = "quota.check_codex_quota:main"
+codextop-sampler = "quota.codex_quota_sampler:main"
+codextop-update = "core.updater:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+py-modules = ["codextop"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-codextop = ["color_schemes.json"]
+ui = ["styles/*.json"]
 
 [tool.ruff]
 line-length = 120

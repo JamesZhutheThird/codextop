@@ -27,7 +27,7 @@ if [[ -f "$PID_FILE" ]]; then
 fi
 
 ARGS=(
-  "$REPO_DIR/src/codextop/codex_quota_sampler.py"
+  "$REPO_DIR/src/quota/codex_quota_sampler.py"
   --auth "$AUTH_FILE"
   --auth-list "$AUTH_LIST"
   --interval "$INTERVAL"

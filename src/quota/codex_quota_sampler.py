@@ -15,13 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-TOOLKIT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(TOOLKIT_DIR))
-import check_codex_quota as quota
-try:
-    from .paths import default_paths, ensure_runtime_layout, monthly_log_path
-except ImportError:
-    from paths import default_paths, ensure_runtime_layout, monthly_log_path
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from quota import check_codex_quota as quota
+from core.paths import default_paths, ensure_runtime_layout, monthly_log_path
 
 
 DEFAULT_PATHS = default_paths()

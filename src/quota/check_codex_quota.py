@@ -19,26 +19,18 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-try:
-    from . import color_schemes
-    from .paths import (
-        auth_keyword_from_path,
-        auth_sort_key,
-        current_provider_file_for_auth_list,
-        default_paths,
-        ensure_runtime_layout,
-        normalize_auth_keyword,
-    )
-except ImportError:
-    import color_schemes
-    from paths import (
-        auth_keyword_from_path,
-        auth_sort_key,
-        current_provider_file_for_auth_list,
-        default_paths,
-        ensure_runtime_layout,
-        normalize_auth_keyword,
-    )
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from core.paths import (
+    auth_keyword_from_path,
+    auth_sort_key,
+    current_provider_file_for_auth_list,
+    default_paths,
+    ensure_runtime_layout,
+    normalize_auth_keyword,
+)
+from ui import color_schemes
 
 
 CHATGPT_BACKEND = "https://chatgpt.com/backend-api"

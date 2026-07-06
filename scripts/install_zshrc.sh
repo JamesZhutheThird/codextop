@@ -43,19 +43,23 @@ export CODEXTOP_HOME="$REPO_DIR"
 export CODEXTOP_CODEX_DIR="\${CODEXTOP_CODEX_DIR:-\$HOME/.codex}"
 
 CODEXTOP() {
-  command python3 "\$CODEXTOP_HOME/src/codextop/codextop.py" "\$@"
+  command python3 "\$CODEXTOP_HOME/src/codextop.py" "\$@"
 }
 
 CHECK_CODEX_QUOTA() {
-  command python3 "\$CODEXTOP_HOME/src/codextop/check_codex_quota.py" "\$@"
+  command python3 "\$CODEXTOP_HOME/src/quota/check_codex_quota.py" "\$@"
 }
 
 CODEXAUTH() {
-  command python3 "\$CODEXTOP_HOME/src/codextop/codex_auth.py" "\$@"
+  command python3 "\$CODEXTOP_HOME/src/auth/codex_auth.py" "\$@"
 }
 
 SWITCH_CODEX_PROVIDER() {
-  command python3 "\$CODEXTOP_HOME/src/codextop/codex_auth.py" "\$@"
+  command python3 "\$CODEXTOP_HOME/src/auth/codex_auth.py" "\$@"
+}
+
+CODEXTOP_UPDATE() {
+  command python3 "\$CODEXTOP_HOME/src/core/updater.py" "\$@"
 }
 
 if [[ -x "\$CODEXTOP_HOME/scripts/start_codextop_backend.sh" ]]; then
@@ -92,21 +96,22 @@ PY
 
 write_wrapper() {
   local name="$1"
-  local module="$2"
+  local module_path="$2"
   local target="$BIN_DIR/$name"
   cat > "$target" <<EOF
 #!/usr/bin/env bash
 export CODEXTOP_HOME="$REPO_DIR"
 export CODEXTOP_CODEX_DIR="\${CODEXTOP_CODEX_DIR:-\${CODEX_HOME:-\$HOME/.codex}}"
-exec python3 "$REPO_DIR/src/codextop/$module.py" "\$@"
+exec python3 "$REPO_DIR/src/$module_path" "\$@"
 EOF
   chmod +x "$target"
 }
 
-write_wrapper CODEXTOP codextop
-write_wrapper CHECK_CODEX_QUOTA check_codex_quota
-write_wrapper CODEXAUTH codex_auth
-write_wrapper SWITCH_CODEX_PROVIDER codex_auth
+write_wrapper CODEXTOP codextop.py
+write_wrapper CHECK_CODEX_QUOTA quota/check_codex_quota.py
+write_wrapper CODEXAUTH auth/codex_auth.py
+write_wrapper SWITCH_CODEX_PROVIDER auth/codex_auth.py
+write_wrapper CODEXTOP_UPDATE core/updater.py
 
 "$REPO_DIR/scripts/start_codextop_backend.sh"
 echo "Installed CODEXTOP shell hook in $ZSHRC"

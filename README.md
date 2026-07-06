@@ -38,10 +38,10 @@
 | ✅已支持 | 命令行额度查询    | `CHECK_CODEX_QUOTA` 单次输出当前账号或全部账号额度           |
 | ✅已支持 | 后台采样服务     | 自动采样并写入本地 JSONL，供 CodexTOP 看板读取               |
 | ✅已支持 | 多账号切换      | `CODEXAUTH` 管理 `auth-openai-*` 账号并切换 provider |
+| ✅已支持 | 版本更新       | 从 GitHub remote 检测版本/分支更新并自动快进同步              |
 | ⏩规划中 | 新账号注册      | 后续补充新账号接入和初始化流程                               |
 | ⏩规划中 | 额度重置通知     | 额度恢复后通过系统通知提醒                                 |
 | ⏩规划中 | Token 用量统计 | 汇总本地会话 Token 使用趋势                             |
-| ⏩规划中 | 版本更新脚本     | 自动检测CodexTOP版本并进行更新                           |
 
 ## 安装
 
@@ -59,6 +59,7 @@ rehash
 CODEXTOP                % 打开 CodexTOP 主界面
 CHECK_CODEX_QUOTA       % 单次查看账号额度信息
 CODEXAUTH               % 查看当前账号信息/切换账号
+CODEXTOP_UPDATE         % 检测 GitHub 更新并自动同步
 ```
 
 ## 配置
@@ -105,6 +106,12 @@ CODEXAUTH sync
 
 ## 使用
 
+打开 CodexTOP 主界面：
+
+```bash
+CODEXTOP
+```
+
 ### 账号切换功能
 
 查看当前 provider 和账号列表：
@@ -137,7 +144,7 @@ env_key = "API_AUTH_TOKEN"
 
 如果有命令名以 `codex` 开头的 Codex 主程序正在运行，会拒绝切换。
 
-### 终端输出
+### 命令行查询
 
 查询额度信息：
 
@@ -146,60 +153,51 @@ CHECK_CODEX_QUOTA             % 输出当前账号额度信息
 CHECK_CODEX_QUOTA --all-auth  % 输出所有账号额度信息
 ```
 
-打开 CodexTOP 主界面：
+### 更新
+
+检测并同步 CodexTOP 更新：
 
 ```bash
-CODEXTOP
+CODEXTOP_UPDATE              % 有更新时自动从 GitHub 快进同步
+CODEXTOP_UPDATE --check-only % 只检测，不更新
 ```
 
-指定展示模式：
+每天第一次打开 `CODEXTOP` 主界面时，会在后台自动检测一次 GitHub 更新；如果有新版本，侧栏版本号下面会显示类似：
+
+```text
+v1.5.0 可用（F11）
+```
+
+点击该行或按 `F11` 会显示确认提示；再次点击或按回车后，CodexTOP 会退出全屏界面并执行更新脚本，直接展示更新过程中的命令行输出。更新完成后需要手动重新打开 `CODEXTOP`。
+
+默认更新源是当前仓库的 `origin`，分支默认使用当前分支。也可以通过环境变量覆盖：
 
 ```bash
-CODEXTOP --display-scope all      % 看板模式
-CODEXTOP --display-scope current  % 专注模式
-CODEXTOP --display-scope merged   % 合并模式
+export CODEXTOP_UPDATE_REMOTE=origin
+export CODEXTOP_UPDATE_BRANCH=main
 ```
 
-合并模式会在顶部按 1:2 展示账号/重置次数和总额度进度条，并在底部展示合并后的历史曲线；总额度进度条始终显示 5h 和 7d，历史曲线绘图区域会按曲线窗口设置显示 5h、7d 或同时显示两者。合并数据会在渲染时基于所有账号的最新采样数据实时汇总，单个账号读取失败时会跳过该账号以避免污染总计。
+自动更新只接受 GitHub remote，并且只执行 fast-forward；如果本地有未提交改动或远端不是快进更新，会拒绝自动同步。
 
-切换曲线风格：
+### 样式文件
 
-```bash
-CODEXTOP --curve-mode connected  % 连续字符线
-CODEXTOP --curve-mode box        % 线条
-CODEXTOP --curve-mode bar        % 柱状（半宽半高）
-CODEXTOP --curve-mode braille    % Braille 精细线
-CODEXTOP --curve-mode points     % 间断点线
+内置配色定义位于 `src/ui/styles/`，每个方案一个文件，文件名就是方案 key，例如：
+
+```text
+src/ui/styles/classic.json
+src/ui/styles/redblue.json
+src/ui/styles/bright.json
 ```
 
-切换曲线窗口（只影响历史曲线绘图区域）：
-
-```bash
-CODEXTOP --window-scope both  % 同时显示 5h / 7d
-CODEXTOP --window-scope 5h    % 只显示 5h
-CODEXTOP --window-scope 7d    % 只显示 7d
-```
-
-切换百分比配色：
-
-```bash
-CODEXTOP --color-scheme classic
-CODEXTOP --color-scheme bright
-CODEXTOP --color-scheme redblue
-CHECK_CODEX_QUOTA --color-scheme classic
-```
-
-百分比配色来自 `src/codextop/color_schemes.json`，也可以通过 `CODEXTOP_COLOR_SCHEME_FILE` 指向其他 JSON 文件。每个方案用 keyword 选择，`percent` 可以写满 `0` 到 `100`，也可以只写关键点；未写出的百分比会按相邻关键点线性插值。
+也可以通过 `CODEXTOP_COLOR_SCHEME_DIR` 指向其他样式目录。`percent` 可以写满 `0` 到 `100`，也可以只写关键点；未写出的百分比会按相邻关键点线性插值。
 
 ```json
 {
-  "classic": {
-    "label": "经典",
-    "percent": {
-      "0": "#e07b7b",
-      "50": "#e0e07b",
-      "100": "#7be07b"
-    }
+  "label": "经典",
+  "percent": {
+    "0": "#e07b7b",
+    "50": "#e0e07b",
+    "100": "#7be07b"
   }
 }
 ```
@@ -212,3 +210,7 @@ CHECK_CODEX_QUOTA --color-scheme classic
 ./scripts/start_codextop_backend.sh
 ./scripts/stop_codextop_backend.sh
 ```
+
+## License
+
+本项目使用 `CC BY-NC-SA 4.0` 协议。
