@@ -11,6 +11,15 @@ fi
 
 PID="$(<"$PID_FILE")"
 if [[ "$PID" =~ ^[0-9]+$ ]] && kill -0 "$PID" >/dev/null 2>&1; then
+  if [[ ! -r "/proc/$PID/cmdline" ]]; then
+    echo "refusing to stop unverified process $PID" >&2
+    exit 1
+  fi
+  CMDLINE="$(tr '\0' ' ' < "/proc/$PID/cmdline")"
+  if [[ "$CMDLINE" != *"codex_quota_sampler.py"* ]]; then
+    rm -f "$PID_FILE"
+    exit 0
+  fi
   kill "$PID"
   for _ in {1..20}; do
     if ! kill -0 "$PID" >/dev/null 2>&1; then

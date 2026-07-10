@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import fcntl
 import json
 import os
 import signal
@@ -201,26 +202,24 @@ def read_control_command(control_path: Path, fallback: int, last_seen_ns: int) -
     return interval, seen_ns, sample_now, all_auth_override
 
 
-def pid_is_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def acquire_pid_lock(pid_path: Path) -> None:
+    """Hold an advisory lock for the sampler lifetime and publish its PID."""
     pid_path.parent.mkdir(parents=True, exist_ok=True)
-    if pid_path.exists():
-        try:
-            old_pid = int(pid_path.read_text(encoding="utf-8").strip())
-        except ValueError:
-            old_pid = -1
-        if old_pid > 0 and old_pid != os.getpid() and pid_is_running(old_pid):
-            raise RuntimeError(f"sampler already running with pid {old_pid}")
-    pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    handle = pid_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.seek(0)
+        owner_pid = handle.read().strip()
+        handle.close()
+        owner = f" with pid {owner_pid}" if owner_pid else ""
+        raise RuntimeError(f"sampler already running{owner}") from exc
+
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    os.fsync(handle.fileno())
 
     def cleanup() -> None:
         try:
@@ -228,6 +227,9 @@ def acquire_pid_lock(pid_path: Path) -> None:
                 pid_path.unlink()
         except FileNotFoundError:
             pass
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
 
     atexit.register(cleanup)
 

@@ -22,8 +22,15 @@ mkdir -p "$AUTH_LIST/backup" "$LOG_DIR" "$SETTINGS_DIR"
 if [[ -f "$PID_FILE" ]]; then
   PID="$(<"$PID_FILE")"
   if [[ "$PID" =~ ^[0-9]+$ ]] && kill -0 "$PID" >/dev/null 2>&1; then
-    exit 0
+    if [[ ! -r "/proc/$PID/cmdline" ]]; then
+      exit 0
+    fi
+    CMDLINE="$(tr '\0' ' ' < "/proc/$PID/cmdline")"
+    if [[ "$CMDLINE" == *"codex_quota_sampler.py"* ]]; then
+      exit 0
+    fi
   fi
+  rm -f "$PID_FILE"
 fi
 
 ARGS=(
