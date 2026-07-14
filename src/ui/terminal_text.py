@@ -181,9 +181,15 @@ def adjust_hex_color(color: str, *, saturation: float = 1.0, value: float = 1.0)
     return f"#{round(red * 255):02x}{round(green * 255):02x}{round(blue * 255):02x}"
 
 
-def chart_series_color(label: str, value: Any, *, dimmed: bool = False) -> str:
+def chart_series_color(
+    label: str,
+    value: Any,
+    *,
+    dimmed: bool = False,
+    primary: bool = False,
+) -> str:
     color = percent_color(value)
-    if label == "5h":
+    if label == "5h" or primary:
         return adjust_hex_color(color, value=0.72) if dimmed else color
     if label == "7d":
         if dimmed:
@@ -210,12 +216,12 @@ def window_marker_text(key: str, curve_mode: str) -> str:
     return f"{key}({marker})"
 
 
-def window_marker_label(key: str, curve_mode: str) -> str:
-    if curve_mode == "braille" and key == "7d":
+def window_marker_label(key: str, curve_mode: str, *, primary: bool = False) -> str:
+    if curve_mode == "braille" and key == "7d" and not primary:
         return f"{key}({paint(BRAILLE_LEGEND_MARKER, 'dim')})"
-    if curve_mode == "box" and key == "7d":
+    if curve_mode == "box" and key == "7d" and not primary:
         return f"{key}({paint(BOX_LEGEND_MARKER, 'dim')})"
-    if curve_mode == "bar" and key == "7d":
+    if curve_mode == "bar" and key == "7d" and not primary:
         return f"{key}({paint(BAR_LEGEND_MARKER, 'dim')})"
     return window_marker_text(key, curve_mode)
 

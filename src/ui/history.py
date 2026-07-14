@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from core.constants import *
+from quota.windows import window_key_for_seconds
 from .models import MonitorState
 from core.paths import iter_snapshot_log_paths, recent_month_keys
 
@@ -18,6 +19,40 @@ UPWARD_CONFIRMATION_SECONDS = 30
 UPWARD_VALUE_TOLERANCE = 10.0
 UPWARD_RESET_TOLERANCE_SECONDS = 10
 RESET_DUE_GRACE_SECONDS = 5
+
+
+def normalize_snapshot_windows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remap legacy compact snapshots using each window's recorded duration."""
+    for record in records:
+        accounts = record.get("a")
+        if not isinstance(accounts, list):
+            continue
+        for account in accounts:
+            if not isinstance(account, dict):
+                continue
+            quota = account.get("q")
+            if not isinstance(quota, dict):
+                continue
+            normalized: dict[str, list[Any]] = {}
+            sources: dict[str, str] = {}
+            for fallback in ("5h", "7d"):
+                raw = quota.get(fallback)
+                if not isinstance(raw, list) or len(raw) < 4:
+                    continue
+                if not any(value is not None for value in raw):
+                    continue
+                key = window_key_for_seconds(raw[3], fallback)
+                if key is None:
+                    continue
+                previous_source = sources.get(key)
+                if previous_source is not None and not (
+                    fallback == key and previous_source != key
+                ):
+                    continue
+                normalized[key] = raw
+                sources[key] = fallback
+            account["q"] = normalized
+    return records
 
 
 def _candidate_matches(pending: dict[str, Any], value: float, reset_epoch: int | None) -> bool:
@@ -123,7 +158,7 @@ def read_snapshots(log_path: Path, period: str, tz_name: str) -> list[dict[str, 
                 if isinstance(timestamp, int) and isinstance(record.get("a"), list):
                     records_by_time[timestamp] = record
     records = [records_by_time[timestamp] for timestamp in sorted(records_by_time)]
-    return smooth_upward_spikes(records)
+    return smooth_upward_spikes(normalize_snapshot_windows(records))
 
 
 def account_at(record: dict[str, Any], index: int | str) -> dict[str, Any] | None:

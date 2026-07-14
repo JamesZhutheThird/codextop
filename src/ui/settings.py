@@ -25,7 +25,7 @@ def setting_items() -> list[tuple[str, str, list[tuple[str, Any]]]]:
         ("interval", "更新间隔", list(INTERVAL_CHOICES)),
         ("period", "历史长度", [(period, period) for period in PERIOD_CHOICES]),
         ("curve_mode", "曲线模式", list(CURVE_MODE_CHOICES)),
-        ("window_scope", "曲线窗口", list(WINDOW_SCOPE_CHOICES)),
+        ("window_scope", "额度窗口", list(WINDOW_SCOPE_CHOICES)),
         ("color_scheme", "配色方案", color_schemes.color_scheme_choices()),
         ("display_scope", "展示范围", list(DISPLAY_SCOPE_CHOICES)),
     ]

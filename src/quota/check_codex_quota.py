@@ -30,6 +30,7 @@ from core.paths import (
     ensure_runtime_layout,
     normalize_auth_keyword,
 )
+from quota.windows import window_key_for_seconds
 from ui import color_schemes
 
 
@@ -193,6 +194,30 @@ def normalize_window(name: str, raw: Any, tz: ZoneInfo) -> dict[str, Any]:
     }
 
 
+def normalize_rate_limit_windows(rate_limit: Any, tz: ZoneInfo) -> dict[str, dict[str, Any]]:
+    """Normalize API slots by duration instead of assuming primary means 5h."""
+    rate_limit = rate_limit if isinstance(rate_limit, dict) else {}
+    normalized = {
+        "5h": normalize_window("5h", None, tz),
+        "7d": normalize_window("7d", None, tz),
+    }
+    assigned: set[str] = set()
+    for api_key, fallback in (("primary_window", "5h"), ("secondary_window", "7d")):
+        raw = rate_limit.get(api_key)
+        if not isinstance(raw, dict) or not raw:
+            continue
+        key = window_key_for_seconds(raw.get("limit_window_seconds"), fallback)
+        if key is None:
+            continue
+        if key in assigned:
+            key = fallback if fallback not in assigned else None
+        if key is None:
+            continue
+        normalized[key] = normalize_window(key, raw, tz)
+        assigned.add(key)
+    return normalized
+
+
 def normalize_credit(raw: Any, tz: ZoneInfo) -> dict[str, Any]:
     raw = raw if isinstance(raw, dict) else {}
     granted_dt = parse_datetime_utc(raw.get("granted_at"))
@@ -245,14 +270,7 @@ def collect_quota(auth_path: Path, tz_name: str) -> dict[str, Any]:
         "limit_reached": rate_limit.get("limit_reached")
         if isinstance(rate_limit, dict)
         else None,
-        "quota": {
-            "5h": normalize_window(
-                "5h", rate_limit.get("primary_window"), tz
-            ),
-            "7d": normalize_window(
-                "7d", rate_limit.get("secondary_window"), tz
-            ),
-        },
+        "quota": normalize_rate_limit_windows(rate_limit, tz),
         "reset_credits": {
             "available_count": credits_payload.get("available_count")
             if isinstance(credits_payload, dict)
@@ -557,10 +575,11 @@ def border_style_for_account(account: dict[str, Any]) -> str:
         return "blue"
     if quota_window_is_full(five_hour):
         return "bright_cyan"
-    left = five_hour.get("remaining_percent") if isinstance(five_hour, dict) else None
-    if not isinstance(left, (int, float)):
-        return "dim"
-    return percent_gradient_style(left)
+    for window in (five_hour, seven_day):
+        left = window.get("remaining_percent") if isinstance(window, dict) else None
+        if isinstance(left, (int, float)):
+            return percent_gradient_style(left)
+    return "dim"
 
 
 def compact_reset_title(title: Any) -> str:

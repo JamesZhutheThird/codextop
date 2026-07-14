@@ -60,6 +60,7 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
             content_height,
             state.summary_offset,
             state.curve_mode,
+            state.window_scope,
             zones,
             1,
         )
@@ -78,11 +79,11 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
             history_body,
             right_width,
             content_height,
-            border_color(active, current),
+            border_color(active, current, state.window_scope),
         )
         left_lines = compose_columns([left_block, right_block], [left_width, right_width], content_height)
     elif state.display_scope == "merged":
-        color = merged_border_color(accounts)
+        color = merged_border_color(accounts, state.window_scope)
         if content_height >= 17:
             top_height = 9
         elif content_height >= 14:
@@ -95,7 +96,13 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
         top_left_width = main_width - top_right_width
         top_left_block = panel(
             "账号信息",
-            merged_account_reset_lines(accounts, current, top_left_width, top_height),
+            merged_account_reset_lines(
+                accounts,
+                current,
+                top_left_width,
+                top_height,
+                state.window_scope,
+            ),
             top_left_width,
             top_height,
             color,
@@ -108,6 +115,7 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
                 top_right_width,
                 top_height,
                 state.curve_mode,
+                state.window_scope,
             ),
             top_right_width,
             top_height,
@@ -165,7 +173,15 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
                     state.curve_mode,
                     state.window_scope,
                 )
-                blocks.append(panel(title, body, width, row_height, border_color(account, current)))
+                blocks.append(
+                    panel(
+                        title,
+                        body,
+                        width,
+                        row_height,
+                        border_color(account, current, state.window_scope),
+                    )
+                )
             while len(blocks) < columns:
                 blocks.append([" " * panel_width for _ in range(row_height)])
             left_lines.extend(compose_columns(blocks, widths, row_height))
@@ -270,7 +286,7 @@ def main() -> int:
         "--window-scope",
         choices=[value for _label, value in WINDOW_SCOPE_CHOICES],
         default=None,
-        help="历史窗口：both 同时显示 5h/7d，5h 只显示 5h，7d 只显示 7d。",
+        help="额度窗口：both 同时显示 5h/7d，5h 只显示 5h，7d 只显示 7d。",
     )
     parser.add_argument(
         "--color-scheme",

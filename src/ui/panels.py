@@ -50,7 +50,12 @@ def account_lines(
     for line in reset_rows(account, inner_width - 2):
         add_text(line)
     add_section("当前额度")
-    for line in quota_rows(account, inner_width - 2, curve_mode=curve_mode):
+    for line in quota_rows(
+        account,
+        inner_width - 2,
+        curve_mode=curve_mode,
+        window_scope=window_scope,
+    ):
         if line:
             add_text(line)
         else:
@@ -74,6 +79,7 @@ def account_summary_body(
     account: dict[str, Any],
     inner_width: int,
     curve_mode: str = DEFAULT_CURVE_MODE,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> list[str]:
     lines: list[str] = []
 
@@ -97,6 +103,7 @@ def account_summary_body(
             inner_width - 2,
             compact=True,
             curve_mode=curve_mode,
+            window_scope=window_scope,
         ):
             add_text(line)
 
@@ -108,10 +115,11 @@ def account_summary_lines(
     panel_width: int,
     panel_height: int,
     curve_mode: str = DEFAULT_CURVE_MODE,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> list[str]:
     inner_width = max(10, panel_width - 2)
     inner_height = max(4, panel_height - 2)
-    lines = account_summary_body(account, inner_width, curve_mode)
+    lines = account_summary_body(account, inner_width, curve_mode, window_scope)
 
     if len(lines) < inner_height:
         lines.extend([""] * (inner_height - len(lines)))
@@ -145,6 +153,7 @@ def merged_account_reset_body(
     accounts: list[dict[str, Any]],
     current: int | str | None,
     inner_width: int,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> list[str]:
     lines: list[str] = []
 
@@ -152,7 +161,10 @@ def merged_account_reset_body(
         lines.append(" " + fit_ansi(line, max(1, inner_width - 2)).rstrip())
 
     add_text(f"{paint('账号类型', 'dim')} {plain_fit(merged_plan_text(accounts), inner_width - 10)}")
-    add_text(f"{paint('当前账号', 'dim')} {current_account_quota_summary(accounts, current)}")
+    add_text(
+        f"{paint('当前账号', 'dim')} "
+        f"{current_account_quota_summary(accounts, current, window_scope)}"
+    )
     lines.append(section_rule("额度重置", inner_width))
     available = merged_available_resets(accounts)
     add_text(f"{paint('重置次数', 'dim')} 合计 {available if isinstance(available, int) else '-'} 次可用")
@@ -180,10 +192,11 @@ def merged_account_reset_lines(
     current: int | str | None,
     panel_width: int,
     panel_height: int,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> list[str]:
     inner_width = max(10, panel_width - 2)
     inner_height = max(4, panel_height - 2)
-    lines = merged_account_reset_body(accounts, current, inner_width)
+    lines = merged_account_reset_body(accounts, current, inner_width, window_scope)
     if len(lines) < inner_height:
         lines.extend([""] * (inner_height - len(lines)))
     return [fit_ansi(line, inner_width) for line in lines[:inner_height]]
@@ -195,6 +208,7 @@ def merged_quota_summary_lines(
     panel_width: int,
     panel_height: int,
     curve_mode: str = DEFAULT_CURVE_MODE,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> list[str]:
     inner_width = max(10, panel_width - 2)
     inner_height = max(4, panel_height - 2)
@@ -209,6 +223,7 @@ def merged_quota_summary_lines(
         inner_width - 2,
         compact=True,
         curve_mode=curve_mode,
+        window_scope=window_scope,
     )
     lines.append("")
     for line in quota_lines[:2]:
@@ -306,17 +321,30 @@ def merged_history_lines(
     return [fit_ansi(line, inner_width) for line in lines[:inner_height]]
 
 
-def border_color(account: dict[str, Any], current: int | str | None) -> str:
+def border_color(
+    account: dict[str, Any],
+    current: int | str | None,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
+) -> str:
     if account_error(account):
         return "dim"
-    left = window_info(account, "5h").get("left")
-    return percent_color(left) if isinstance(left, (int, float)) else "dim"
+    for key in window_keys(window_scope):
+        left = window_info(account, key).get("left")
+        if isinstance(left, (int, float)):
+            return percent_color(left)
+    return "dim"
 
 
-def merged_border_color(accounts: list[dict[str, Any]]) -> str:
-    info = merged_window_info(accounts, "5h")
-    ratio = merged_ratio_percent(info.get("left"), info.get("max_left"))
-    return percent_color(ratio) if ratio is not None else "dim"
+def merged_border_color(
+    accounts: list[dict[str, Any]],
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
+) -> str:
+    for key in window_keys(window_scope):
+        info = merged_window_info(accounts, key)
+        ratio = merged_ratio_percent(info.get("left"), info.get("max_left"))
+        if ratio is not None:
+            return percent_color(ratio)
+    return "dim"
 
 
 def panel(title: str, body: list[str], width: int, height: int, color: str) -> list[str]:
@@ -376,6 +404,7 @@ def stacked_summary_panels(
     height: int,
     offset: int,
     curve_mode: str,
+    window_scope: str,
     zones: list[ClickZone],
     x_origin: int,
 ) -> list[str]:
@@ -385,7 +414,7 @@ def stacked_summary_panels(
     inner_width = max(10, width - 2)
 
     panel_heights = [
-        max(4, len(account_summary_body(account, inner_width, curve_mode)) + 2)
+        max(4, len(account_summary_body(account, inner_width, curve_mode, window_scope)) + 2)
         for account in accounts
     ]
     overflow = sum(panel_heights) > height
@@ -400,12 +429,27 @@ def stacked_summary_panels(
     start = offset % len(accounts)
     ordered = accounts[start:] + accounts[:start]
     for account in ordered:
-        panel_height = max(4, len(account_summary_body(account, inner_width, curve_mode)) + 2)
+        panel_height = max(
+            4,
+            len(account_summary_body(account, inner_width, curve_mode, window_scope)) + 2,
+        )
         title = provider_name(account)
         if current is not None and account_index(account) == current:
             title = f"【{title}】"
-        body = account_summary_lines(account, width, panel_height, curve_mode)
-        rendered = panel(title, body, width, panel_height, border_color(account, current))
+        body = account_summary_lines(
+            account,
+            width,
+            panel_height,
+            curve_mode,
+            window_scope,
+        )
+        rendered = panel(
+            title,
+            body,
+            width,
+            panel_height,
+            border_color(account, current, window_scope),
+        )
         rows.extend(rendered[:remaining])
         remaining -= min(panel_height, remaining)
         if remaining <= 0:

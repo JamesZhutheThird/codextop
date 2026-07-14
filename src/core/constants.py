@@ -31,10 +31,10 @@ INTERVAL_CHOICES = [
 PERIOD_CHOICES = ["5m", "15m", "30m", "1h", "5h", "12h", "1d", "3d", "7d", "30d", "all"]
 CURVE_MODE_CHOICES = [
     ("连续", "connected"),
+    ("间断", "points"),
+    ("精细", "braille"),
     ("线条", "box"),
     ("柱状", "bar"),
-    ("精细", "braille"),
-    ("间断", "points"),
 ]
 DISPLAY_SCOPE_CHOICES = [
     ("看板模式", "all"),

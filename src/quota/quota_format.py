@@ -120,19 +120,25 @@ def quota_rows(
     *,
     compact: bool = False,
     curve_mode: str = DEFAULT_CURVE_MODE,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> list[str]:
     rows: list[str] = []
-    for key in WINDOW_KEYS:
-        info = window_info(account, key)
+    keys = window_keys(window_scope)
+    infos = {key: window_info(account, key) for key in keys}
+    primary_color = len(keys) == 1 or sum(
+        isinstance(info.get("left"), (int, float)) for info in infos.values()
+    ) == 1
+    for key in keys:
+        info = infos[key]
         left = info["left"]
-        label_text = window_marker_label(key, curve_mode)
+        label_text = window_marker_label(key, curve_mode, primary=primary_color)
         label = paint(label_text, bold=True)
         pct = paint(percent_text(left).rjust(4), percent_color(left))
         bar_width = max(8, width - visible_width(label_text) - 1 - 1 - 4)
         rows.append(f"{label} {progress_bar(left, bar_width)} {pct}")
         reset_line = f"于 {countdown(info['reset_after'])} 后在 {info['reset_at']} 重置"
         rows.append(right_ansi(paint_style(reset_line, quota.reset_after_style(info["reset_after"])), width))
-        if key != WINDOW_KEYS[-1] and not compact:
+        if key != keys[-1] and not compact:
             rows.append("")
     return rows
 
@@ -214,13 +220,14 @@ def current_account_obj(accounts: list[dict[str, Any]], current: int | str | Non
 def current_account_quota_summary(
     accounts: list[dict[str, Any]],
     current: int | str | None,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> str:
     account = current_account_obj(accounts, current)
     account_id = current_account_id(accounts, current)
     if not account or account_error(account):
         return account_id
     parts = []
-    for key in WINDOW_KEYS:
+    for key in window_keys(window_scope):
         left = window_info(account, key).get("left")
         parts.append(f"{key} {paint(percent_text(left), percent_color(left))}")
     return f"{account_id} ({' '.join(parts)})"
@@ -342,13 +349,19 @@ def merged_quota_rows(
     *,
     compact: bool = False,
     curve_mode: str = DEFAULT_CURVE_MODE,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> list[str]:
     rows: list[str] = []
-    for key in WINDOW_KEYS:
-        info = merged_window_info(accounts, key)
+    keys = window_keys(window_scope)
+    infos = {key: merged_window_info(accounts, key) for key in keys}
+    primary_color = len(keys) == 1 or sum(
+        isinstance(info.get("left"), (int, float)) for info in infos.values()
+    ) == 1
+    for key in keys:
+        info = infos[key]
         left = info["left"]
         max_left = info["max_left"] if isinstance(info["max_left"], (int, float)) else 100
-        label_text = window_marker_label(key, curve_mode)
+        label_text = window_marker_label(key, curve_mode, primary=primary_color)
         label = paint(label_text, bold=True)
         pct_raw = percent_sum_text(left)
         pct_width = max(4, visible_width(pct_raw))
@@ -357,6 +370,6 @@ def merged_quota_rows(
         bar_width = max(8, width - visible_width(label_text) - 1 - 1 - pct_width)
         rows.append(f"{label} {progress_bar(left, bar_width, float(max_left))} {pct}")
         rows.append(merged_quota_detail_reset_line(accounts, current, key, info, width))
-        if key != WINDOW_KEYS[-1] and not compact:
+        if key != keys[-1] and not compact:
             rows.append("")
     return rows

@@ -39,6 +39,10 @@ def chart_series_priority(
     return WINDOW_PRIORITIES.get(label, 0)
 
 
+def has_single_active_series(points: dict[str, Any]) -> bool:
+    return sum(bool(series) for series in points.values()) == 1
+
+
 def braille_char(mask: int) -> str:
     return chr(0x2800 + mask) if mask else " "
 
@@ -69,6 +73,7 @@ def braille_series_chart_lines(
     chart_height = max(1, height - 3)
     dot_width = plot_width * 2
     dot_height = chart_height * 4
+    primary_color = has_single_active_series(points)
 
     grid: list[list[tuple[int, str, int]]] = [
         [(0, "dim", 0) for _ in range(plot_width)]
@@ -109,7 +114,12 @@ def braille_series_chart_lines(
             interpolated = previous_value + (value - previous_value) * ratio
             normalized = max(0.0, min(100.0, interpolated / max_value * 100))
             priority = chart_series_priority(points, label, ts, interpolated, max_value, value_getter)
-            put_dot(dot_row, dot_column, chart_series_color(label, normalized), priority)
+            put_dot(
+                dot_row,
+                dot_column,
+                chart_series_color(label, normalized, primary=primary_color),
+                priority,
+            )
 
     for label, series in points.items():
         if not series:
@@ -126,7 +136,12 @@ def braille_series_chart_lines(
             if previous_column is None or previous_row is None or previous_value is None:
                 normalized = max(0.0, min(100.0, value / max_value * 100))
                 priority = chart_series_priority(points, label, ts, float(value), max_value, value_getter)
-                put_dot(row, dot_column, chart_series_color(label, normalized), priority)
+                put_dot(
+                    row,
+                    dot_column,
+                    chart_series_color(label, normalized, primary=primary_color),
+                    priority,
+                )
             else:
                 draw_segment(
                     label,
@@ -183,6 +198,7 @@ def bar_series_chart_lines(
     chart_height = max(2, height - 3)
     sub_width = plot_width * 2
     sub_height = chart_height * 2
+    primary_color = has_single_active_series(points)
 
     grid: list[list[tuple[int, str, int, int]]] = [
         [(0, "dim", 0, sub_height) for _ in range(plot_width)]
@@ -215,7 +231,17 @@ def bar_series_chart_lines(
             start_sub_row = sub_height - filled_units
             for sub_row in range(start_sub_row, sub_height):
                 row_normalized = chart_row_percent(sub_row, sub_height)
-                put_subcell(sub_row, sub_column, chart_series_color(label, row_normalized, dimmed=True), priority)
+                put_subcell(
+                    sub_row,
+                    sub_column,
+                    chart_series_color(
+                        label,
+                        row_normalized,
+                        dimmed=True,
+                        primary=primary_color,
+                    ),
+                    priority,
+                )
 
     tick_rows = {
         round((max_value - value) / max_value * (chart_height - 1)): value
@@ -261,6 +287,7 @@ def series_chart_lines(
     plot_width = max(2, box_width - 4)
     chart_width = plot_width + 2
     chart_height = max(2, height - 3)
+    primary_color = has_single_active_series(points)
 
     grid: list[list[tuple[str, str, int]]] = [
         [(" ", "dim", 0) for _ in range(plot_width)]
@@ -303,7 +330,13 @@ def series_chart_lines(
                 row_span = abs(row - previous_row)
                 if row_span == 0:
                     priority = chart_series_priority(points, label, ts, float(value), max_value, value_getter)
-                    put_cell(row, column, "─", chart_series_color(label, normalized), priority)
+                    put_cell(
+                        row,
+                        column,
+                        "─",
+                        chart_series_color(label, normalized, primary=primary_color),
+                        priority,
+                    )
                 else:
                     step = 1 if row > previous_row else -1
                     for filled_row in range(previous_row, row + step, step):
@@ -322,14 +355,24 @@ def series_chart_lines(
                             filled_row,
                             column,
                             box_segment_char(previous_row, row, filled_row),
-                            chart_series_color(label, interpolated_normalized),
+                            chart_series_color(
+                                label,
+                                interpolated_normalized,
+                                primary=primary_color,
+                            ),
                             priority,
                         )
             elif curve_mode == "connected" and previous_row is not None and previous_value is not None:
                 row_span = abs(row - previous_row)
                 if row_span == 0:
                     priority = chart_series_priority(points, label, ts, float(value), max_value, value_getter)
-                    put_cell(row, column, char, chart_series_color(label, normalized), priority)
+                    put_cell(
+                        row,
+                        column,
+                        char,
+                        chart_series_color(label, normalized, primary=primary_color),
+                        priority,
+                    )
                 else:
                     step = 1 if row > previous_row else -1
                     for filled_row in range(previous_row + step, row + step, step):
@@ -348,13 +391,23 @@ def series_chart_lines(
                             filled_row,
                             column,
                             char,
-                            chart_series_color(label, interpolated_normalized),
+                            chart_series_color(
+                                label,
+                                interpolated_normalized,
+                                primary=primary_color,
+                            ),
                             priority,
                         )
             else:
                 point_char = "─" if curve_mode == "box" else char
                 priority = chart_series_priority(points, label, ts, float(value), max_value, value_getter)
-                put_cell(row, column, point_char, chart_series_color(label, normalized), priority)
+                put_cell(
+                    row,
+                    column,
+                    point_char,
+                    chart_series_color(label, normalized, primary=primary_color),
+                    priority,
+                )
             previous_row = row
             previous_value = float(value)
 
