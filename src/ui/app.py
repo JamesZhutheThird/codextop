@@ -33,16 +33,17 @@ from core.update_check import start_daily_update_check, update_check_path
 from .terminal_io import TerminalSession, parse_input
 from .terminal_text import fit_ansi, paint
 
-def render_frame(state: MonitorState, term_width: int, term_height: int) -> tuple[list[str], list[ClickZone]]:
-    zones: list[ClickZone] = []
-    records = read_records_if_due(state)
-    accounts = current_accounts(state, records)
-    current = current_index(state, records)
-
+def _render_main_content(
+    state: MonitorState,
+    records: list[dict],
+    accounts: list[dict],
+    current: int | str | None,
+    term_width: int,
+    term_height: int,
+    zones: list[ClickZone],
+) -> tuple[list[str], int, int]:
     sidebar_width = 21
     main_width = max(40, term_width - sidebar_width)
-    lines: list[str] = []
-
     content_height = max(6, term_height - 1)
     if not accounts:
         left_lines = [paint("正在加载 quota 数据...", "yellow")]
@@ -188,7 +189,55 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
         if len(left_lines) < content_height:
             left_lines.extend([" " * main_width] * (content_height - len(left_lines)))
         left_lines = left_lines[:content_height]
+    return left_lines, main_width, content_height
 
+
+def render_frame(state: MonitorState, term_width: int, term_height: int) -> tuple[list[str], list[ClickZone]]:
+    records = read_records_if_due(state)
+    accounts = current_accounts(state, records)
+    current = current_index(state, records)
+    last_timestamp = records[-1].get("t") if records else None
+    cache_key = (
+        state.records_version,
+        len(records),
+        last_timestamp,
+        term_width,
+        term_height,
+        state.period,
+        state.curve_mode,
+        state.display_scope,
+        state.window_scope,
+        state.color_scheme,
+        state.summary_offset,
+    )
+    if (
+        state.main_cache_key == cache_key
+        and state.main_cache_lines is not None
+        and state.main_cache_zones is not None
+    ):
+        left_lines = state.main_cache_lines
+        main_zones = list(state.main_cache_zones)
+        sidebar_width = 21
+        main_width = max(40, term_width - sidebar_width)
+        content_height = max(6, term_height - 1)
+    else:
+        main_zones = []
+        left_lines, main_width, content_height = _render_main_content(
+            state,
+            records,
+            accounts,
+            current,
+            term_width,
+            term_height,
+            main_zones,
+        )
+        sidebar_width = 21
+        state.main_cache_key = cache_key
+        state.main_cache_lines = left_lines
+        state.main_cache_zones = list(main_zones)
+
+    zones = main_zones
+    lines: list[str] = []
     sidebar = render_sidebar(state, sidebar_width, content_height, main_width + 1, zones)
     for left, right in zip(left_lines, sidebar):
         lines.append(fit_ansi(left, main_width) + fit_ansi(right, sidebar_width))
@@ -242,6 +291,7 @@ def run_tui(state: MonitorState) -> int:
                     if not keep_running:
                         running = False
                         break
+                    interacted = bool(keys or clicks)
                     for key in keys:
                         running = handle_setting_key(state, key)
                         if not running:
@@ -253,6 +303,8 @@ def run_tui(state: MonitorState) -> int:
                         if not running:
                             break
                     if not running:
+                        break
+                    if interacted:
                         break
                     time.sleep(0.03)
     finally:

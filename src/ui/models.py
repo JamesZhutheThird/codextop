@@ -46,3 +46,8 @@ class MonitorState:
     update_error: str | None = None
     update_confirming: bool = False
     update_requested: bool = False
+    history_cache: Any = None
+    records_version: int = 0
+    main_cache_key: tuple[Any, ...] | None = None
+    main_cache_lines: list[str] | None = None
+    main_cache_zones: list[ClickZone] | None = None

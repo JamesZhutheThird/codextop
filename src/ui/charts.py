@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from core.constants import *
-from .history import records_for_period, value_at, window_points
+from .history import period_bounds, period_context_timestamp, records_for_period, value_at, window_points
 from .terminal_text import *
 
 def axis_value_text(value: float) -> str:
@@ -441,11 +441,20 @@ def chart_lines(
 ) -> list[str]:
     if not records:
         return [paint("暂无历史数据", "dim")]
-    relevant, start_ts, end_ts = records_for_period(records, period)
-    points = {
-        key: window_points(relevant, index, key)
-        for key in window_keys(window_scope)
-    }
+    series_index = getattr(records, "series_index", None)
+    if series_index is not None:
+        start_ts, end_ts = period_bounds(records, period)
+        context_timestamp = period_context_timestamp(records, period, start_ts)
+        points = {
+            key: series_index.account_window(index, key, context_timestamp)
+            for key in window_keys(window_scope)
+        }
+    else:
+        relevant, start_ts, end_ts = records_for_period(records, period)
+        points = {
+            key: window_points(relevant, index, key)
+            for key in window_keys(window_scope)
+        }
     return series_chart_lines(points, start_ts, end_ts, width, height, curve_mode, 100.0)
 
 

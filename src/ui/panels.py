@@ -242,19 +242,25 @@ def merged_account_window_points(records: list[dict[str, Any]], window: str) -> 
     for record in records:
         timestamp = record.get("t")
         accounts = record.get("a", [])
-        if not isinstance(timestamp, int) or not isinstance(accounts, list):
+        if not isinstance(timestamp, int) or not isinstance(accounts, (list, tuple)):
             continue
         for account in accounts:
-            if not isinstance(account, dict) or account_error(account):
+            if not hasattr(account, "get") or account_error(account):
                 continue
             index = account_index(account)
             if index is None:
                 continue
-            info = window_info(account, window)
-            left = info.get("left")
+            raw = account.get("q", {}).get(window)
+            if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+                left = raw[0]
+                reset_epoch = raw[1]
+            else:
+                full_window = account.get("quota", {}).get(window, {})
+                left = full_window.get("remaining_percent") if isinstance(full_window, dict) else None
+                reset_after = full_window.get("reset_after_seconds") if isinstance(full_window, dict) else None
+                reset_epoch = timestamp + int(reset_after) if isinstance(reset_after, (int, float)) else None
             if not isinstance(left, (int, float)):
                 continue
-            reset_epoch = info.get("reset_epoch")
             account_points.setdefault(str(index), []).append(
                 {
                     "t": timestamp,
@@ -270,7 +276,15 @@ def merged_value_at(account_points: dict[str, list[dict[str, Any]]], ts: int, _m
     found = False
     predicted = False
     for points in account_points.values():
-        if not points or ts < points[0]["t"]:
+        if not points:
+            continue
+        if hasattr(points, "first_timestamp"):
+            first_timestamp = points.first_timestamp
+        elif hasattr(points, "times"):
+            first_timestamp = int(points.times[0])
+        else:
+            first_timestamp = points[0]["t"]
+        if ts < first_timestamp:
             continue
         value, account_predicted = value_at(points, ts, 100.0)
         total += value
@@ -294,11 +308,20 @@ def merged_chart_lines(
 ) -> list[str]:
     if not records:
         return [paint("暂无历史数据", "dim")]
-    relevant, start_ts, end_ts = records_for_period(records, period)
-    points = {
-        key: merged_account_window_points(relevant, key)
-        for key in window_keys(window_scope)
-    }
+    series_index = getattr(records, "series_index", None)
+    if series_index is not None:
+        start_ts, end_ts = period_bounds(records, period)
+        context_timestamp = period_context_timestamp(records, period, start_ts)
+        points = {
+            key: series_index.merged_window(key, context_timestamp)
+            for key in window_keys(window_scope)
+        }
+    else:
+        relevant, start_ts, end_ts = records_for_period(records, period)
+        points = {
+            key: merged_account_window_points(relevant, key)
+            for key in window_keys(window_scope)
+        }
     max_value = merged_max_value(points)
     return series_chart_lines(points, start_ts, end_ts, width, height, curve_mode, max_value, merged_value_at)
 

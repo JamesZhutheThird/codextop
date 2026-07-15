@@ -275,7 +275,6 @@ def apply_setting_value(state: MonitorState, key: str, value: Any) -> None:
         period = str(value)
         if state.period != period:
             state.period = period
-            state.records = None
             state.next_read = 0.0
     elif key == "curve_mode":
         state.curve_mode = str(value)
@@ -287,8 +286,6 @@ def apply_setting_value(state: MonitorState, key: str, value: Any) -> None:
         scope = str(value)
         if state.display_scope != scope:
             state.display_scope = scope
-            state.records = None
-            state.next_read = 0.0
             if scope in {"all", "merged"}:
                 try:
                     send_sampler_interval(state, state.interval, sample_now=True, all_auth=True)
@@ -379,7 +376,7 @@ def handle_click(state: MonitorState, zones: list[ClickZone], x: int, y: int) ->
             elif zone.kind in {"period", "curve_mode", "window_scope", "color_scheme", "display_scope", "interval"}:
                 apply_setting_value(state, zone.kind, zone.value)
             elif zone.kind == "summary_scroll":
-                records = list(state.records or [])
+                records = state.records or []
                 accounts = current_accounts(state, records)
                 if accounts:
                     state.summary_offset = (state.summary_offset + int(zone.value)) % len(accounts)
