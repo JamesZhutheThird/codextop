@@ -15,7 +15,11 @@ from .history import current_accounts, current_index, read_records_if_due
 from .models import ClickZone, MonitorState
 from .panels import *
 from core.paths import ensure_runtime_layout
+from quota.token_usage_cache import DailyTokenUsageCacheReader, TOKEN_USAGE_CACHE_FILE
 from .settings import handle_click, handle_setting_key, render_sidebar
+from .session_tokens import TrustedDirectoryTokenUsageMonitor
+from .token_charts import token_usage_chart_lines
+from .trusted_directories import TOKEN_USAGE_DIRECTORIES_FILE
 from core.state import (
     parse_interval,
     read_codextop_state,
@@ -25,6 +29,8 @@ from core.state import (
     saved_display_scope,
     saved_interval,
     saved_period,
+    saved_usage_directory_scope,
+    saved_usage_panel_layout,
     saved_window_scope,
     save_codextop_state,
     send_sampler_interval,
@@ -42,10 +48,31 @@ def _render_main_content(
     term_height: int,
     zones: list[ClickZone],
 ) -> tuple[list[str], int, int]:
+    token_monitor = state.token_monitor
+    token_usage = getattr(token_monitor, "latest", None)
+    token_series = getattr(token_monitor, "rate_series", {})
     sidebar_width = 21
     main_width = max(40, term_width - sidebar_width)
     content_height = max(6, term_height - 1)
-    if not accounts:
+    if state.display_scope == "usage":
+        chart_lines = token_usage_chart_lines(
+            token_series,
+            token_usage,
+            state.period,
+            main_width - 2,
+            content_height - 2,
+            state.curve_mode,
+            state.color_scheme,
+            state.usage_panel_layout,
+        )
+        left_lines = panel(
+            "Token 用量",
+            chart_lines,
+            main_width,
+            content_height,
+            "cyan",
+        )
+    elif not accounts:
         left_lines = [paint("正在加载 quota 数据...", "yellow")]
         left_lines.extend([""] * (content_height - 1))
         left_lines = [fit_ansi(line, main_width) for line in left_lines[:content_height]]
@@ -86,9 +113,9 @@ def _render_main_content(
     elif state.display_scope == "merged":
         color = merged_border_color(accounts, state.window_scope)
         if content_height >= 17:
-            top_height = 9
+            top_height = 10
         elif content_height >= 14:
-            top_height = 8
+            top_height = 9
         else:
             top_height = max(4, content_height // 2)
         history_height = max(4, content_height - top_height)
@@ -194,11 +221,39 @@ def _render_main_content(
 
 def render_frame(state: MonitorState, term_width: int, term_height: int) -> tuple[list[str], list[ClickZone]]:
     records = read_records_if_due(state)
+    token_monitor = state.token_monitor
+    if isinstance(token_monitor, TrustedDirectoryTokenUsageMonitor):
+        token_monitor.set_scope(state.usage_directory_scope)
+        if state.display_scope != "usage":
+            token_monitor.sync_directories()
+    if state.display_scope == "usage" and isinstance(token_monitor, TrustedDirectoryTokenUsageMonitor):
+        if token_monitor.poll():
+            state.token_version = token_monitor.version
+            state.main_cache_key = None
     accounts = current_accounts(state, records)
+    token_total_reader = state.token_total_reader
+    if isinstance(token_total_reader, DailyTokenUsageCacheReader):
+        if token_total_reader.poll():
+            state.token_total_version = token_total_reader.version
+            state.main_cache_key = None
+        enriched_accounts = []
+        for account in accounts:
+            index = account_index(account)
+            cached = token_total_reader.totals.get(str(index)) if index is not None else None
+            if cached is None:
+                enriched_accounts.append(account)
+                continue
+            total, checked_at = cached
+            enriched = dict(account)
+            enriched["u"] = [total, checked_at]
+            enriched_accounts.append(enriched)
+        accounts = enriched_accounts
     current = current_index(state, records)
     last_timestamp = records[-1].get("t") if records else None
     cache_key = (
         state.records_version,
+        state.token_version,
+        state.token_total_version,
         len(records),
         last_timestamp,
         term_width,
@@ -207,6 +262,8 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
         state.curve_mode,
         state.display_scope,
         state.window_scope,
+        state.usage_directory_scope,
+        state.usage_panel_layout,
         state.color_scheme,
         state.summary_offset,
     )
@@ -348,14 +405,27 @@ def main() -> int:
     )
     parser.add_argument(
         "--display-scope",
-        choices=["all", "current", "merged"],
+        choices=["all", "current", "merged", "usage"],
         default=None,
-        help="展示范围：all 全部账号，current 启用账号，merged 合并账号。",
+        help="展示范围：all 全部账号，current 启用账号，merged 合并账号，usage 当前项目 Token 用量。",
+    )
+    parser.add_argument(
+        "--usage-directory-scope",
+        choices=[value for _label, value in USAGE_DIRECTORY_SCOPE_CHOICES],
+        default=None,
+        help="Token 用量目录范围：current 当前信任目录，all 全部未禁用信任目录。",
+    )
+    parser.add_argument(
+        "--usage-panel-layout",
+        choices=[value for _label, value in USAGE_PANEL_LAYOUT_CHOICES],
+        default=None,
+        help="Token 用量面板布局：combined 合并图，split 四图拆分。",
     )
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR, help="quota 历史日志目录。")
     parser.add_argument("--log-file", default=DEFAULT_LOG_FILE, help="quota 历史日志基础文件名，用于匹配月度日志。")
     parser.add_argument("--control-file", default=DEFAULT_CONTROL_FILE, help="后台 sampler 控制文件名。")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help="CodexTOP 状态文件名。")
+    parser.add_argument("--project-dir", type=Path, default=Path.cwd(), help="用于选择当前 Codex 线程的项目目录。")
     parser.add_argument("--tz", default="Asia/Shanghai", help="本地时区。")
     parser.add_argument("--once", action="store_true", help="渲染一帧后退出，用于调试。")
     args = parser.parse_args()
@@ -368,6 +438,16 @@ def main() -> int:
     selected_color_scheme = color_schemes.set_active_color_scheme(
         args.color_scheme or saved_color_scheme(saved_state) or DEFAULT_COLOR_SCHEME
     )
+    selected_usage_directory_scope = (
+        args.usage_directory_scope
+        or saved_usage_directory_scope(saved_state)
+        or DEFAULT_USAGE_DIRECTORY_SCOPE
+    )
+    selected_usage_panel_layout = (
+        args.usage_panel_layout
+        or saved_usage_panel_layout(saved_state)
+        or DEFAULT_USAGE_PANEL_LAYOUT
+    )
     state = MonitorState(
         period=args.period or saved_period(saved_state) or DEFAULT_PERIOD,
         interval=args.interval if args.interval is not None else (saved_interval(saved_state) or restore_interval),
@@ -379,8 +459,20 @@ def main() -> int:
         display_scope=args.display_scope or saved_display_scope(saved_state) or DEFAULT_DISPLAY_SCOPE,
         window_scope=args.window_scope or saved_window_scope(saved_state) or DEFAULT_WINDOW_SCOPE,
         color_scheme=selected_color_scheme,
+        usage_directory_scope=selected_usage_directory_scope,
+        usage_panel_layout=selected_usage_panel_layout,
         control_path=control_path,
         update_check_path=update_check_path(runtime_paths.settings_dir),
+        token_monitor=TrustedDirectoryTokenUsageMonitor(
+            runtime_paths.codex_dir / "sessions",
+            args.project_dir,
+            runtime_paths.codex_dir / "config.toml",
+            runtime_paths.settings_dir / TOKEN_USAGE_DIRECTORIES_FILE,
+            selected_usage_directory_scope,
+        ),
+        token_total_reader=DailyTokenUsageCacheReader(
+            runtime_paths.settings_dir / TOKEN_USAGE_CACHE_FILE
+        ),
     )
     if args.once:
         return run_once(state)

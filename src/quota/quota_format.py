@@ -31,6 +31,48 @@ def account_plan(account: dict[str, Any]) -> str:
     return str(account.get("plan_type") or account.get("plan") or "-")
 
 
+def account_lifetime_tokens(account: dict[str, Any]) -> int | None:
+    raw = account.get("u")
+    value = raw[0] if isinstance(raw, (list, tuple)) and raw else None
+    if value is None:
+        token_usage = account.get("token_usage")
+        value = token_usage.get("lifetime_tokens") if isinstance(token_usage, dict) else None
+    return int(value) if isinstance(value, (int, float)) and value >= 0 else None
+
+
+def merged_lifetime_tokens(accounts: list[dict[str, Any]]) -> int | None:
+    totals = [
+        total
+        for account in accounts
+        if isinstance(account, dict)
+        for total in [account_lifetime_tokens(account)]
+        if total is not None
+    ]
+    return sum(totals) if totals else None
+
+
+def format_token_count(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "-"
+    return f"{int(value):,} Tokens"
+
+
+def compact_token_count(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "-"
+    number = max(0.0, float(value))
+    for divisor, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if number >= divisor:
+            scaled = number / divisor
+            precision = 0 if scaled >= 100 else 1
+            return f"{scaled:.{precision}f}{suffix}"
+    return str(int(number))
+
+
+def token_usage_rows(total: Any, _width: int) -> list[str]:
+    return [f"{paint('使用总量', 'dim')} {format_token_count(total)}"]
+
+
 def window_info(account: dict[str, Any], key: str) -> dict[str, Any]:
     if "quota" in account:
         window = account.get("quota", {}).get(key, {})

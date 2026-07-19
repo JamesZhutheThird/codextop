@@ -13,6 +13,8 @@ COLOR_SCHEME_DIR_ENV = "CODEXTOP_COLOR_SCHEME_DIR"
 COLOR_SCHEME_FILE_ENV = "CODEXTOP_COLOR_SCHEME_FILE"
 DEFAULT_COLOR_SCHEME_DIR = Path(__file__).with_name("styles")
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+# TODO: Remove the redblue -> icefire compatibility alias when the minimum supported version is >= 2.5.0.
+COLOR_SCHEME_ALIASES = {"redblue": "icefire"}
 
 _ACTIVE_SCHEME_KEY: str | None = None
 _ACTIVE_SCHEME_SOURCE: Path | None = None
@@ -113,16 +115,23 @@ def default_color_scheme_key(path: Path | str | None = None) -> str:
     return next(iter(payload))
 
 
+def _resolve_color_scheme_key(key: str, payload: dict[str, Any]) -> str:
+    if key in payload:
+        return key
+    alias = COLOR_SCHEME_ALIASES.get(key)
+    return alias if alias in payload else key
+
+
 def color_scheme_exists(key: str, path: Path | str | None = None) -> bool:
     payload = _read_payload(color_scheme_source(path))
-    return key in payload
+    return _resolve_color_scheme_key(key, payload) in payload
 
 
 def set_active_color_scheme(key: str | None = None, path: Path | str | None = None) -> str:
     global _ACTIVE_SCHEME_SOURCE, _ACTIVE_SCHEME_KEY
     scheme_source = color_scheme_source(path).resolve()
     payload = _read_payload(scheme_source)
-    selected = key or default_color_scheme_key(scheme_source)
+    selected = _resolve_color_scheme_key(key or default_color_scheme_key(scheme_source), payload)
     if selected not in payload:
         raise RuntimeError(f"color scheme not found: {selected}")
     _ACTIVE_SCHEME_SOURCE = scheme_source
@@ -144,6 +153,7 @@ def _active_scheme(path: Path | str | None = None, key: str | None = None) -> di
         else:
             key = _ACTIVE_SCHEME_KEY
     payload = _read_payload(scheme_source)
+    key = _resolve_color_scheme_key(key, payload)
     if key not in payload:
         raise RuntimeError(f"color scheme not found: {key}")
     return payload[key]
@@ -189,3 +199,17 @@ def percent_gradient_style(value: Any, *, key: str | None = None, path: Path | s
         return "dim"
     percent = max(0.0, min(100.0, float(value)))
     return _interpolated_percent_color(_active_scheme(path, key)["_percent_stops"], percent)
+
+
+def token_series_colors(*, key: str | None = None, path: Path | str | None = None) -> dict[str, str]:
+    """Return four fixed colors sampled from the selected scheme."""
+    stops = {
+        "input": 15,
+        "cached": 40,
+        "output": 70,
+        "total": 100,
+    }
+    return {
+        label: percent_gradient_style(percent, key=key, path=path)
+        for label, percent in stops.items()
+    }

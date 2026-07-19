@@ -39,8 +39,10 @@ def account_lines(
         add_blank()
 
     add_blank()
-    add_text(f"{paint('邮箱', 'dim')}    {plain_fit(account_email(account), inner_width - 8)}")
-    add_text(f"{paint('类型', 'dim')}    {plain_fit(account_plan(account), inner_width - 8)}")
+    add_text(f"{paint('账号邮箱', 'dim')} {plain_fit(account_email(account), inner_width - 11)}")
+    add_text(f"{paint('账号类型', 'dim')} {plain_fit(account_plan(account), inner_width - 11)}")
+    for line in token_usage_rows(account_lifetime_tokens(account), inner_width - 2):
+        add_text(line)
     if error:
         add_section("错误")
         add_text(paint(plain_fit(error, inner_width - 2), "red"))
@@ -65,7 +67,15 @@ def account_lines(
     chart_height = max(4, inner_height - len(lines))
     chart_width = max(8, inner_width - 2)
     if index is not None:
-        chart = chart_lines(records, index, period, chart_width, chart_height, curve_mode, window_scope)
+        chart = chart_lines(
+            records,
+            index,
+            period,
+            chart_width,
+            chart_height,
+            curve_mode,
+            window_scope,
+        )
     else:
         chart = chart_box([paint("暂无历史数据", "dim")], chart_width, chart_height)
     lines.extend(" " + fit_ansi(line, chart_width) for line in chart)
@@ -86,8 +96,10 @@ def account_summary_body(
     def add_text(line: str) -> None:
         lines.append(" " + fit_ansi(line, max(1, inner_width - 2)).rstrip())
 
-    add_text(f"{paint('邮箱', 'dim')}    {plain_fit(account_email(account), inner_width - 8)}")
-    add_text(f"{paint('类型', 'dim')}    {plain_fit(account_plan(account), inner_width - 8)}")
+    add_text(f"{paint('账号邮箱', 'dim')} {plain_fit(account_email(account), inner_width - 11)}")
+    add_text(f"{paint('账号类型', 'dim')} {plain_fit(account_plan(account), inner_width - 11)}")
+    for line in token_usage_rows(account_lifetime_tokens(account), inner_width - 2):
+        add_text(line)
 
     error = account_error(account)
     if error:
@@ -142,7 +154,15 @@ def account_history_lines(
     if index is None:
         chart = chart_box([paint("暂无历史数据", "dim")], chart_width, inner_height)
     else:
-        chart = chart_lines(records, index, period, chart_width, inner_height, curve_mode, window_scope)
+        chart = chart_lines(
+            records,
+            index,
+            period,
+            chart_width,
+            inner_height,
+            curve_mode,
+            window_scope,
+        )
     lines = [" " + fit_ansi(line, chart_width) for line in chart]
     if len(lines) < inner_height:
         lines.extend([""] * (inner_height - len(lines)))
@@ -161,6 +181,8 @@ def merged_account_reset_body(
         lines.append(" " + fit_ansi(line, max(1, inner_width - 2)).rstrip())
 
     add_text(f"{paint('账号类型', 'dim')} {plain_fit(merged_plan_text(accounts), inner_width - 10)}")
+    for line in token_usage_rows(merged_lifetime_tokens(accounts), inner_width - 2):
+        add_text(line)
     add_text(
         f"{paint('当前账号', 'dim')} "
         f"{current_account_quota_summary(accounts, current, window_scope)}"
@@ -323,7 +345,16 @@ def merged_chart_lines(
             for key in window_keys(window_scope)
         }
     max_value = merged_max_value(points)
-    return series_chart_lines(points, start_ts, end_ts, width, height, curve_mode, max_value, merged_value_at)
+    return series_chart_lines(
+        points,
+        start_ts,
+        end_ts,
+        width,
+        height,
+        curve_mode,
+        max_value,
+        merged_value_at,
+    )
 
 
 def merged_history_lines(
@@ -337,7 +368,14 @@ def merged_history_lines(
     inner_width = max(10, panel_width - 2)
     inner_height = max(4, panel_height - 2)
     chart_width = max(8, inner_width - 2)
-    chart = merged_chart_lines(records, period, chart_width, inner_height, curve_mode, window_scope)
+    chart = merged_chart_lines(
+        records,
+        period,
+        chart_width,
+        inner_height,
+        curve_mode,
+        window_scope,
+    )
     lines = [" " + fit_ansi(line, chart_width) for line in chart]
     if len(lines) < inner_height:
         lines.extend([""] * (inner_height - len(lines)))

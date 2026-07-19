@@ -34,14 +34,14 @@
 
 | 状态   | 功能         | 说明                                            |
 |------|------------|-----------------------------------------------|
-| ✅已支持 | 彩色可交互终端界面  | 使用 Rich 呈现账号、额度、重置时间和后台采样状态，支持看板、专注、合并模式      |
-| ✅已支持 | 命令行额度查询    | `CHECK_CODEX_QUOTA` 单次输出当前账号或全部账号额度           |
-| ✅已支持 | 后台采样服务     | 自动采样并写入本地 JSONL，供 CodexTOP 看板读取               |
+| ✅已支持 | 彩色可交互终端界面  | 支持看板、专注、合并和用量模式；额度与 Token 曲线分开展示             |
+| ✅已支持 | 命令行用量查询    | `CHECK_CODEX_QUOTA` 输出账号额度和每日缓存的联网使用总量      |
+| ✅已支持 | 后台采样服务     | 并发查询额度与重置次数，以统一时间戳写入本地 JSONL              |
 | ✅已支持 | 多账号切换      | `CODEXAUTH` 管理 `auth-openai-*` 账号并切换 provider |
 | ✅已支持 | 版本更新       | 从 GitHub remote 检测版本/分支更新并自动快进同步              |
 | ⏩规划中 | 新账号注册      | 后续补充新账号接入和初始化流程                               |
 | ⏩规划中 | 额度重置通知     | 额度恢复后通过系统通知提醒                                 |
-| ⏩规划中 | Token 用量统计 | 汇总本地会话 Token 使用趋势                             |
+| ✅已支持 | Token 用量统计 | 用量模式增量读取可信目录根线程日志；支持四类曲线、堆叠柱状和精细柱状 |
 
 ## 安装
 
@@ -96,6 +96,7 @@ export CODEXTOP_CODEX_DIR=/path/to/.codex
 ~/.codex/codextop/log/quota_snapshots_YYYY-MM.jsonl
 ~/.codex/codextop/settings/current_provider.json
 ~/.codex/codextop/settings/auth_registry.json
+~/.codex/codextop/settings/token_usage_daily.json
 ```
 
 同步一次配置：
@@ -185,7 +186,7 @@ export CODEXTOP_UPDATE_BRANCH=main
 
 ```text
 src/ui/styles/classic.json
-src/ui/styles/redblue.json
+src/ui/styles/icefire.json
 src/ui/styles/bright.json
 ```
 
@@ -205,6 +206,24 @@ src/ui/styles/bright.json
 ### 后台采样服务
 
 后台采样服务会在加载终端后自动启动，手动启动或停止后台采样：
+
+额度和重置次数会在同一轮采样中并发查询，共用一个快照更新时间。账号“使用总量”
+通过账号统计接口查询，并按账号持久化缓存 24 小时；查询失败也会等待下一周期，避免
+刷新风暴。CodexTOP 首次启动时会读取 `~/.codex/config.toml` 中的可信项目，并同步到
+`~/.codex/codextop/settings/token_usage_directories.json`。可手动将目录条目的 `disable`
+改为 `true`，使其不参与总量统计；“用量范围”支持仅统计当前可信目录或全部未禁用目录。
+
+用量模式会聚合相应目录下根线程的本地 `token_count` 事件。程序先比较日志的修改时间和
+大小，只有变化时才读取追加内容，约每 200 毫秒检查活跃日志；没有新事件时当前速率记为
+0。输入、缓存输入、输出和总量速率经过轻量平滑后绘制为四条固定配色曲线；图例实时显示
+当前速率，并在括号内显示对应累计总量。“用量布局”
+可选择合并或拆分；拆分时根据绘图区自适应使用 1×4、2×2 或 4×1，每个子图独立缩放；
+高度足够时显示完整六档纵轴，空间不足时只标 0 和最高值，纵向子图之间不留空行。只有
+合并柱状和精细柱状模式将前三项累计堆叠；精细柱状使用 2×4 子字符填充。所有
+非柱状模式均将四条曲线分别独立绘制。合并图纵轴按数据范围自动选用
+`0/.5/1/1.5/2/2.5`、`0/1/2/3/4/5` 或 `0/2/4/6/8/10` 六档标签；绘图区每列覆盖时间
+严格大于 15 分钟时使用 `tok/h`，否则使用 `tok/min`。其余展示模式不扫描日志，只保留
+原有额度曲线和坐标轴。旧版 JSONL 中已有的 Token 字段可继续兼容，无需迁移。
 
 ```bash
 ./scripts/start_codextop_backend.sh

@@ -30,6 +30,15 @@ from core.paths import (
     ensure_runtime_layout,
     normalize_auth_keyword,
 )
+from quota.token_usage_cache import (
+    TOKEN_USAGE_CACHE_TTL_SECONDS,
+    cached_token_usage,
+    compatible_cache_entry,
+    read_token_usage_cache,
+    token_usage_cache_path,
+    token_usage_query_due,
+    write_token_usage_cache,
+)
 from quota.windows import window_key_for_seconds
 from ui import color_schemes
 
@@ -37,14 +46,15 @@ from ui import color_schemes
 CHATGPT_BACKEND = "https://chatgpt.com/backend-api"
 USAGE_URL = f"{CHATGPT_BACKEND}/wham/usage"
 RESET_CREDITS_URL = f"{CHATGPT_BACKEND}/wham/rate-limit-reset-credits"
+TOKEN_USAGE_URL = f"{CHATGPT_BACKEND}/wham/profiles/me"
 AUTH_FILE_RE = re.compile(r"auth-([A-Za-z0-9][A-Za-z0-9_.-]*)\.json$")
-MAX_QUERY_WORKERS = 4
+MAX_QUERY_WORKERS = 8
 DEFAULT_PATHS = default_paths()
 DEFAULT_AUTH_FILE = DEFAULT_PATHS.active_auth_file
 DEFAULT_AUTH_LIST = DEFAULT_PATHS.auth_list_dir
 
 
-def load_access_token(auth_path: Path) -> str:
+def load_auth_credentials(auth_path: Path) -> tuple[str, str | None]:
     try:
         data = json.loads(auth_path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
@@ -52,20 +62,34 @@ def load_access_token(auth_path: Path) -> str:
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"auth file is not valid JSON: {auth_path}") from exc
 
-    token = data.get("tokens", {}).get("access_token")
+    tokens = data.get("tokens", {})
+    token = tokens.get("access_token") if isinstance(tokens, dict) else None
     if not isinstance(token, str) or not token:
         raise RuntimeError(f"tokens.access_token not found in {auth_path}")
-    return token
+    account_id = tokens.get("account_id") if isinstance(tokens, dict) else None
+    return token, account_id if isinstance(account_id, str) and account_id else None
 
 
-def get_json(url: str, access_token: str, timeout: int = 30) -> Any:
+def load_access_token(auth_path: Path) -> str:
+    return load_auth_credentials(auth_path)[0]
+
+
+def get_json(
+    url: str,
+    access_token: str,
+    timeout: int = 30,
+    extra_headers: dict[str, str] | None = None,
+) -> Any:
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "User-Agent": "Codex local quota checker",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
     req = Request(
         url,
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json",
-            "User-Agent": "Codex local quota checker",
-        },
+        headers=headers,
         method="GET",
     )
     try:
@@ -248,12 +272,26 @@ def normalize_credit(raw: Any, tz: ZoneInfo) -> dict[str, Any]:
     }
 
 
-def collect_quota(auth_path: Path, tz_name: str) -> dict[str, Any]:
-    tz = ZoneInfo(tz_name)
-    access_token = load_access_token(auth_path)
-    usage = get_json(USAGE_URL, access_token)
-    credits_payload = get_json(RESET_CREDITS_URL, access_token)
+def normalize_token_usage(payload: Any) -> dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    stats = payload.get("stats")
+    metadata = payload.get("metadata")
+    stats = stats if isinstance(stats, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    lifetime_tokens = stats.get("lifetime_tokens")
+    if not isinstance(lifetime_tokens, (int, float)) or lifetime_tokens < 0:
+        raise RuntimeError("token usage response has no stats.lifetime_tokens")
+    generated_at = metadata.get("generated_at") or payload.get("stats_as_of")
+    generated_dt = parse_datetime_utc(generated_at)
+    return {
+        "lifetime_tokens": int(lifetime_tokens),
+        "generated_at": generated_at if isinstance(generated_at, str) else None,
+        "generated_at_epoch": int(generated_dt.timestamp()) if generated_dt is not None else None,
+    }
 
+
+def normalize_quota_report(usage: Any, credits_payload: Any, tz_name: str) -> dict[str, Any]:
+    tz = ZoneInfo(tz_name)
     rate_limit = usage.get("rate_limit", {}) if isinstance(usage, dict) else {}
     credits = (
         credits_payload.get("credits", [])
@@ -282,6 +320,18 @@ def collect_quota(auth_path: Path, tz_name: str) -> dict[str, Any]:
             "credits": [normalize_credit(item, tz) for item in credits],
         },
     }
+
+
+def collect_quota(auth_path: Path, tz_name: str) -> dict[str, Any]:
+    access_token, _account_id = load_auth_credentials(auth_path)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        usage_future = executor.submit(get_json, USAGE_URL, access_token)
+        credits_future = executor.submit(get_json, RESET_CREDITS_URL, access_token)
+        return normalize_quota_report(
+            usage_future.result(),
+            credits_future.result(),
+            tz_name,
+        )
 
 
 def count_by_status(credits: list[Any]) -> dict[str, int]:
@@ -413,26 +463,110 @@ def collect_accounts(
     configs: list[tuple[str, Path]],
     current_index: str | None,
     tz_name: str,
+    token_cache_path: Path | None = None,
+    observed_epoch: int | None = None,
+    token_cache_ttl_seconds: int = TOKEN_USAGE_CACHE_TTL_SECONDS,
 ) -> dict[str, Any]:
-    if len(configs) <= 1:
-        accounts = [
-            collect_account(index, path, current_index, tz_name)
-            for index, path in configs
-        ]
-    else:
-        max_workers = min(MAX_QUERY_WORKERS, len(configs))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            accounts = list(
-                executor.map(
-                    lambda item: collect_account(
-                        item[0],
-                        item[1],
-                        current_index,
-                        tz_name,
-                    ),
-                    configs,
-                )
+    entries: list[dict[str, Any]] = []
+    observed_epoch = int(datetime.now(timezone.utc).timestamp()) if observed_epoch is None else int(observed_epoch)
+    token_cache = read_token_usage_cache(token_cache_path) if token_cache_path is not None else None
+    cache_accounts = token_cache.get("accounts") if isinstance(token_cache, dict) else None
+    request_count = max(1, len(configs) * 3)
+    cache_changed = False
+    with ThreadPoolExecutor(max_workers=min(MAX_QUERY_WORKERS, request_count)) as executor:
+        for index, path in configs:
+            report: dict[str, Any] = {
+                "index": index,
+                "label": index,
+                "current": index == current_index,
+            }
+            try:
+                access_token, account_id = load_auth_credentials(path)
+            except Exception as exc:
+                report["error"] = str(exc)
+                entries.append({"report": report})
+                continue
+            cache_entry = (
+                compatible_cache_entry(token_cache, index, account_id)
+                if token_cache is not None
+                else None
             )
+            cached_usage = cached_token_usage(cache_entry)
+            if cached_usage is not None:
+                report["token_usage"] = cached_usage
+            token_future = None
+            if token_cache is not None and token_usage_query_due(
+                cache_entry,
+                observed_epoch,
+                token_cache_ttl_seconds,
+            ):
+                headers = {"ChatGPT-Account-Id": account_id} if account_id else None
+                token_future = executor.submit(
+                    get_json,
+                    TOKEN_USAGE_URL,
+                    access_token,
+                    30,
+                    headers,
+                )
+            entries.append(
+                {
+                    "report": report,
+                    "index": index,
+                    "account_id": account_id,
+                    "cache_entry": cache_entry,
+                    "usage": executor.submit(get_json, USAGE_URL, access_token),
+                    "credits": executor.submit(get_json, RESET_CREDITS_URL, access_token),
+                    "tokens": token_future,
+                }
+            )
+
+        for entry in entries:
+            report = entry["report"]
+            token_future = entry.get("tokens")
+            if token_future is not None and isinstance(cache_accounts, dict):
+                cache_changed = True
+                cache_entry = entry.get("cache_entry")
+                updated_entry: dict[str, Any] = {
+                    "account_id": entry.get("account_id"),
+                    "checked_at_epoch": observed_epoch,
+                }
+                existing_usage = cached_token_usage(cache_entry)
+                if existing_usage is not None:
+                    updated_entry["token_usage"] = existing_usage
+                try:
+                    fresh_usage = normalize_token_usage(token_future.result())
+                    fresh_usage["checked_at_epoch"] = observed_epoch
+                    report["token_usage"] = fresh_usage
+                    updated_entry["token_usage"] = fresh_usage
+                except Exception as exc:
+                    message = str(exc)
+                    report["token_usage_error"] = message
+                    updated_entry["error"] = message
+                cache_accounts[str(entry["index"])] = updated_entry
+            usage_future = entry.get("usage")
+            credits_future = entry.get("credits")
+            if usage_future is None or credits_future is None:
+                continue
+            try:
+                report.update(
+                    normalize_quota_report(
+                        usage_future.result(),
+                        credits_future.result(),
+                        tz_name,
+                    )
+                )
+            except Exception as exc:
+                report["error"] = str(exc)
+
+    if cache_changed and token_cache_path is not None and token_cache is not None:
+        try:
+            write_token_usage_cache(token_cache_path, token_cache)
+        except Exception as exc:
+            for entry in entries:
+                report = entry["report"]
+                report.setdefault("token_usage_error", f"cannot write daily token cache: {exc}")
+
+    accounts = [entry["report"] for entry in entries]
     return {
         "current_index": current_index,
         "accounts": accounts,
@@ -443,6 +577,7 @@ def print_text(report: dict[str, Any]) -> None:
     print("Codex quota")
     print(f"email: {report.get('email')}")
     print(f"plan_type: {report.get('plan_type')}")
+    print(f"total_usage: {lifetime_token_text(report)}")
     print(f"allowed: {report.get('allowed')}")
     print(f"limit_reached: {report.get('limit_reached')}")
     print()
@@ -601,18 +736,24 @@ def truncate_text(value: Any, max_width: int) -> str:
     return f"{text[:head]}...{text[-tail:]}"
 
 
+def lifetime_token_text(account: dict[str, Any]) -> str:
+    token_usage = account.get("token_usage")
+    value = token_usage.get("lifetime_tokens") if isinstance(token_usage, dict) else None
+    return f"{int(value):,} Tokens" if isinstance(value, (int, float)) and value >= 0 else "-"
+
+
 def make_identity_section(account: dict[str, Any], panel_width: int) -> "Table":
     from rich.table import Table
 
     table = Table.grid(expand=True)
-    table.add_column(justify="left", style="dim", no_wrap=True, width=6)
+    table.add_column(justify="left", style="dim", no_wrap=True, width=8)
     table.add_column(justify="left")
+    email_width = max(8, panel_width - 14)
+    table.add_row("账号邮箱", truncate_text(account.get("email"), email_width))
+    table.add_row("账号类型", str(account.get("plan_type") or "-"))
+    table.add_row("使用总量", lifetime_token_text(account))
     if account.get("error"):
         table.add_row("错误", f"[red]{truncate_text(account['error'], panel_width - 10)}[/red]")
-        return table
-    email_width = max(8, panel_width - 12)
-    table.add_row("邮箱", truncate_text(account.get("email"), email_width))
-    table.add_row("类型", str(account.get("plan_type") or "-"))
     return table
 
 
@@ -863,7 +1004,12 @@ def main() -> int:
             args.all_auth,
             args.auth_list is not None,
         )
-        bundle = collect_accounts(configs, current_index, args.tz)
+        bundle = collect_accounts(
+            configs,
+            current_index,
+            args.tz,
+            token_usage_cache_path(auth_list),
+        )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

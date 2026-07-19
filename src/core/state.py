@@ -84,6 +84,18 @@ def saved_window_scope(payload: dict[str, Any]) -> str | None:
     return scope if isinstance(scope, str) and scope in valid_scopes else None
 
 
+def saved_usage_directory_scope(payload: dict[str, Any]) -> str | None:
+    scope = payload.get("usage_directory_scope")
+    valid_scopes = {value for _label, value in USAGE_DIRECTORY_SCOPE_CHOICES}
+    return scope if isinstance(scope, str) and scope in valid_scopes else None
+
+
+def saved_usage_panel_layout(payload: dict[str, Any]) -> str | None:
+    layout = payload.get("usage_panel_layout")
+    valid_layouts = {value for _label, value in USAGE_PANEL_LAYOUT_CHOICES}
+    return layout if isinstance(layout, str) and layout in valid_layouts else None
+
+
 def saved_color_scheme(payload: dict[str, Any]) -> str | None:
     scheme = payload.get("color_scheme")
     return scheme if isinstance(scheme, str) and color_schemes.color_scheme_exists(scheme) else None
@@ -98,6 +110,8 @@ def save_codextop_state(state: MonitorState) -> None:
         "curve_mode": state.curve_mode,
         "display_scope": state.display_scope,
         "window_scope": state.window_scope,
+        "usage_directory_scope": state.usage_directory_scope,
+        "usage_panel_layout": state.usage_panel_layout,
         "color_scheme": state.color_scheme,
     }
     tmp_path = state.state_path.with_name(f".{state.state_path.name}.{os.getpid()}.tmp")

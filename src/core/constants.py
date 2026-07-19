@@ -18,6 +18,8 @@ DEFAULT_PERIOD = "5h"
 DEFAULT_CURVE_MODE = "connected"
 DEFAULT_DISPLAY_SCOPE = "all"
 DEFAULT_WINDOW_SCOPE = "both"
+DEFAULT_USAGE_DIRECTORY_SCOPE = "current"
+DEFAULT_USAGE_PANEL_LAYOUT = "combined"
 DEFAULT_COLOR_SCHEME = color_schemes.default_color_scheme_key()
 INTERVAL_CHOICES = [
     ("5s", 5),
@@ -35,11 +37,21 @@ CURVE_MODE_CHOICES = [
     ("精细", "braille"),
     ("线条", "box"),
     ("柱状", "bar"),
+    ("精细柱状", "fine_bar"),
 ]
 DISPLAY_SCOPE_CHOICES = [
     ("看板模式", "all"),
     ("专注模式", "current"),
     ("合并模式", "merged"),
+    ("用量模式", "usage"),
+]
+USAGE_DIRECTORY_SCOPE_CHOICES = [
+    ("当前目录", "current"),
+    ("全部目录", "all"),
+]
+USAGE_PANEL_LAYOUT_CHOICES = [
+    ("合并", "combined"),
+    ("拆分", "split"),
 ]
 WINDOW_SCOPE_CHOICES = [
     ("同时", "both"),
@@ -71,6 +83,8 @@ WINDOW_PRIORITIES = {
     "5h": 2,
     "7d": 1,
 }
+TOKEN_RATE_HOURLY_THRESHOLD_SECONDS = 15 * 60
+TOKEN_RATE_SMOOTHING_ALPHA = 0.35
 RESET_CREDIT_TITLE_WIDTH = 6
 RESET_CREDIT_MIN_BAR_WIDTH = 6
 GAP_SECONDS = 3 * 60

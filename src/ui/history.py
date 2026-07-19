@@ -254,6 +254,57 @@ class HistorySeriesView:
         return self.series.value_at(timestamp, reset_value, self.start)
 
 
+@dataclass(slots=True)
+class MetricSeries:
+    """Compact step series for non-quota metrics such as tokens/second."""
+
+    times: array
+    values: array
+
+    @classmethod
+    def empty(cls) -> "MetricSeries":
+        return cls(array("q"), array("d"))
+
+    def __len__(self) -> int:
+        return len(self.times)
+
+    @property
+    def first_timestamp(self) -> int:
+        return int(self.times[0])
+
+    def append(self, timestamp: int, value: float) -> None:
+        self.times.append(timestamp)
+        self.values.append(value)
+
+    def remove_timestamp(self, timestamp: int) -> None:
+        while self.times and self.times[-1] == timestamp:
+            self.times.pop()
+            self.values.pop()
+
+    def value_at(self, timestamp: int, start: int = 0) -> tuple[float, bool]:
+        position = bisect.bisect_right(self.times, timestamp, lo=start) - 1
+        if position < start:
+            return 0.0, True
+        sample_timestamp = int(self.times[position])
+        return float(self.values[position]), timestamp - sample_timestamp > GAP_SECONDS
+
+
+@dataclass(slots=True)
+class MetricSeriesView:
+    series: MetricSeries
+    start: int
+
+    def __len__(self) -> int:
+        return len(self.series) - self.start
+
+    @property
+    def first_timestamp(self) -> int:
+        return int(self.series.times[self.start])
+
+    def value_at(self, timestamp: int) -> tuple[float, bool]:
+        return self.series.value_at(timestamp, self.start)
+
+
 class HistorySeriesIndex:
     def __init__(self) -> None:
         self._accounts: dict[int | str, dict[str, HistorySeries]] = {}
@@ -264,11 +315,15 @@ class HistorySeriesIndex:
         if not isinstance(timestamp, int) or not isinstance(accounts, list):
             return
         for account in accounts:
-            if not isinstance(account, dict) or account.get("err"):
+            if not isinstance(account, dict):
                 continue
             index = account.get("i")
+            if not isinstance(index, (int, str)):
+                continue
+            if account.get("err"):
+                continue
             quota = account.get("q")
-            if not isinstance(index, (int, str)) or not isinstance(quota, dict):
+            if not isinstance(quota, dict):
                 continue
             windows = self._accounts.setdefault(index, {})
             for window in ("5h", "7d"):
@@ -318,7 +373,6 @@ class HistorySeriesIndex:
             if bounded:
                 merged[str(index)] = bounded
         return merged
-
 
 class HistoryRecordList(Sequence):
     __slots__ = ("series_index", "timestamps", "_latest")
@@ -661,6 +715,19 @@ def window_points(records: list[dict[str, Any]], index: int | str, window: str) 
             }
         )
     return points
+
+
+def metric_value_at(points: Any, ts: int, _max_value: float = 0.0) -> tuple[float, bool]:
+    if isinstance(points, (MetricSeries, MetricSeriesView)):
+        return points.value_at(ts)
+    if not points:
+        return 0.0, True
+    pos = bisect.bisect_right(points, ts, key=lambda point: point["t"]) - 1
+    if pos < 0:
+        return 0.0, True
+    point = points[pos]
+    timestamp = point["t"]
+    return float(point["value"]), ts - timestamp > GAP_SECONDS
 
 
 def reset_in_gap(prev: dict[str, Any], next_point: dict[str, Any] | None, start_ts: int, end_ts: int) -> int | None:

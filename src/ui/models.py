@@ -27,6 +27,8 @@ class MonitorState:
     display_scope: str
     window_scope: str
     color_scheme: str
+    usage_directory_scope: str = "current"
+    usage_panel_layout: str = "combined"
     last_update: float | None = None
     next_read: float = 0.0
     status: str = "启动中"
@@ -46,6 +48,10 @@ class MonitorState:
     update_error: str | None = None
     update_confirming: bool = False
     update_requested: bool = False
+    token_monitor: Any = None
+    token_version: int = 0
+    token_total_reader: Any = None
+    token_total_version: int = 0
     history_cache: Any = None
     records_version: int = 0
     main_cache_key: tuple[Any, ...] | None = None

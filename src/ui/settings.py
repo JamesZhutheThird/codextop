@@ -20,15 +20,24 @@ def interval_label(seconds: int) -> str:
     return f"{seconds}s"
 
 
-def setting_items() -> list[tuple[str, str, list[tuple[str, Any]]]]:
-    return [
+def setting_items(state: MonitorState) -> list[tuple[str, str, list[tuple[str, Any]]]]:
+    items = [
         ("interval", "更新间隔", list(INTERVAL_CHOICES)),
         ("period", "历史长度", [(period, period) for period in PERIOD_CHOICES]),
-        ("curve_mode", "曲线模式", list(CURVE_MODE_CHOICES)),
-        ("window_scope", "额度窗口", list(WINDOW_SCOPE_CHOICES)),
-        ("color_scheme", "配色方案", color_schemes.color_scheme_choices()),
         ("display_scope", "展示范围", list(DISPLAY_SCOPE_CHOICES)),
+        ("curve_mode", "曲线风格", list(CURVE_MODE_CHOICES)),
+        ("color_scheme", "配色方案", color_schemes.color_scheme_choices()),
     ]
+    if state.display_scope == "usage":
+        items.extend(
+            [
+                ("usage_directory_scope", "用量范围", list(USAGE_DIRECTORY_SCOPE_CHOICES)),
+                ("usage_panel_layout", "用量布局", list(USAGE_PANEL_LAYOUT_CHOICES)),
+            ]
+        )
+    else:
+        items.append(("window_scope", "额度窗口", list(WINDOW_SCOPE_CHOICES)))
+    return items
 
 
 def setting_current_value(state: MonitorState, key: str) -> Any:
@@ -36,6 +45,10 @@ def setting_current_value(state: MonitorState, key: str) -> Any:
         return state.interval
     if key == "period":
         return state.period
+    if key == "usage_directory_scope":
+        return state.usage_directory_scope
+    if key == "usage_panel_layout":
+        return state.usage_panel_layout
     if key == "curve_mode":
         return state.curve_mode
     if key == "window_scope":
@@ -47,8 +60,8 @@ def setting_current_value(state: MonitorState, key: str) -> Any:
     return None
 
 
-def setting_index_for_key(key: str) -> int:
-    for index, (item_key, _title, _choices) in enumerate(setting_items()):
+def setting_index_for_key(state: MonitorState, key: str) -> int:
+    for index, (item_key, _title, _choices) in enumerate(setting_items(state)):
         if item_key == key:
             return index
     return 0
@@ -56,7 +69,7 @@ def setting_index_for_key(key: str) -> int:
 
 def setting_current_option_index(state: MonitorState, key: str) -> int:
     current = setting_current_value(state, key)
-    items = setting_items()
+    items = setting_items(state)
     for item_key, _title, choices in items:
         if item_key != key:
             continue
@@ -68,7 +81,7 @@ def setting_current_option_index(state: MonitorState, key: str) -> int:
 
 def setting_current_label(state: MonitorState, key: str) -> str:
     current = setting_current_value(state, key)
-    for item_key, _title, choices in setting_items():
+    for item_key, _title, choices in setting_items(state):
         if item_key != key:
             continue
         for label, value in choices:
@@ -78,7 +91,7 @@ def setting_current_label(state: MonitorState, key: str) -> str:
 
 
 def normalize_settings_state(state: MonitorState) -> list[tuple[str, str, list[tuple[str, Any]]]]:
-    items = setting_items()
+    items = setting_items(state)
     if state.settings_mode not in {"normal", "select", "options"}:
         state.settings_mode = "normal"
     if not items:
@@ -276,6 +289,20 @@ def apply_setting_value(state: MonitorState, key: str, value: Any) -> None:
         if state.period != period:
             state.period = period
             state.next_read = 0.0
+    elif key == "usage_directory_scope":
+        scope = str(value)
+        if state.usage_directory_scope != scope:
+            state.usage_directory_scope = scope
+            monitor = state.token_monitor
+            if hasattr(monitor, "set_scope"):
+                monitor.set_scope(scope)
+            state.token_version += 1
+            state.main_cache_key = None
+    elif key == "usage_panel_layout":
+        layout = str(value)
+        if state.usage_panel_layout != layout:
+            state.usage_panel_layout = layout
+            state.main_cache_key = None
     elif key == "curve_mode":
         state.curve_mode = str(value)
     elif key == "window_scope":
@@ -369,11 +396,20 @@ def handle_click(state: MonitorState, zones: list[ClickZone], x: int, y: int) ->
                 open_focused_setting(state)
             elif zone.kind == "settings_option":
                 item_key, value = zone.value
-                state.settings_focus = setting_index_for_key(str(item_key))
+                state.settings_focus = setting_index_for_key(state, str(item_key))
                 apply_setting_value(state, str(item_key), value)
                 state.settings_option_focus = setting_current_option_index(state, str(item_key))
                 state.settings_mode = "normal"
-            elif zone.kind in {"period", "curve_mode", "window_scope", "color_scheme", "display_scope", "interval"}:
+            elif zone.kind in {
+                "period",
+                "usage_directory_scope",
+                "usage_panel_layout",
+                "curve_mode",
+                "window_scope",
+                "color_scheme",
+                "display_scope",
+                "interval",
+            }:
                 apply_setting_value(state, zone.kind, zone.value)
             elif zone.kind == "summary_scroll":
                 records = state.records or []

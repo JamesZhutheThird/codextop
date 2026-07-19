@@ -211,6 +211,8 @@ def window_marker_text(key: str, curve_mode: str) -> str:
         marker = BOX_LEGEND_MARKER
     elif curve_mode == "bar":
         marker = BAR_LEGEND_MARKER
+    elif curve_mode == "fine_bar":
+        marker = BRAILLE_LEGEND_MARKER
     else:
         marker = WINDOW_MARKERS[key]
     return f"{key}({marker})"
@@ -223,6 +225,8 @@ def window_marker_label(key: str, curve_mode: str, *, primary: bool = False) -> 
         return f"{key}({paint(BOX_LEGEND_MARKER, 'dim')})"
     if curve_mode == "bar" and key == "7d" and not primary:
         return f"{key}({paint(BAR_LEGEND_MARKER, 'dim')})"
+    if curve_mode == "fine_bar" and key == "7d" and not primary:
+        return f"{key}({paint(BRAILLE_LEGEND_MARKER, 'dim')})"
     return window_marker_text(key, curve_mode)
 
 

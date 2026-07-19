@@ -21,6 +21,7 @@ if __package__ in {None, ""}:
 
 from quota import check_codex_quota as quota
 from core.paths import default_paths, ensure_runtime_layout, monthly_log_path
+from quota.token_usage_cache import token_usage_cache_path
 
 
 DEFAULT_PATHS = default_paths()
@@ -62,6 +63,14 @@ def compact_account(account: dict[str, Any], observed_ts: int) -> dict[str, Any]
     }
     if account.get("label"):
         item["label"] = account.get("label")
+    token_usage = account.get("token_usage")
+    lifetime_tokens = token_usage.get("lifetime_tokens") if isinstance(token_usage, dict) else None
+    if isinstance(lifetime_tokens, (int, float)) and lifetime_tokens >= 0:
+        source_epoch = token_usage.get("checked_at_epoch") or token_usage.get("generated_at_epoch")
+        item["u"] = [
+            int(lifetime_tokens),
+            int(source_epoch) if isinstance(source_epoch, (int, float)) else None,
+        ]
     if account.get("error"):
         item["err"] = account.get("error")
         return item
@@ -108,7 +117,13 @@ def make_snapshot(auth_file: Path, auth_list: Path, all_auth: bool, tz_name: str
         all_auth,
         False,
     )
-    bundle = quota.collect_accounts(configs, current_index, tz_name)
+    bundle = quota.collect_accounts(
+        configs,
+        current_index,
+        tz_name,
+        token_usage_cache_path(auth_list),
+        observed_ts,
+    )
     return {
         "t": observed_ts,
         "current": bundle.get("current_index"),
