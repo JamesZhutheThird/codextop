@@ -81,6 +81,31 @@ def plain_fit(text: Any, width: int) -> str:
     return strip_ansi(fit_ansi(str(text or "-"), width)).rstrip()
 
 
+def plain_wrap(text: Any, width: int) -> list[str]:
+    """Wrap plain terminal text by display width without dropping content."""
+    width = max(1, width)
+    source = strip_ansi(str(text or "-"))
+    rows: list[str] = []
+    for logical_line in source.split("\n"):
+        if not logical_line:
+            rows.append("")
+            continue
+        current: list[str] = []
+        used = 0
+        for char in logical_line:
+            char_w = char_width(char)
+            if current and used + char_w > width:
+                rows.append("".join(current).rstrip())
+                current = []
+                used = 0
+                if char.isspace():
+                    continue
+            current.append(char)
+            used += char_w
+        rows.append("".join(current).rstrip())
+    return rows or [""]
+
+
 def ansi_ellipsis(text: str, width: int) -> str:
     if width <= 0:
         return ""

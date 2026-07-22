@@ -26,6 +26,35 @@ UPWARD_RESET_TOLERANCE_SECONDS = 10
 RESET_DUE_GRACE_SECONDS = 5
 
 
+def inherit_snapshot_account_identity(
+    record: dict[str, Any],
+    previous_record: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Keep the last known email and plan when a snapshot omits identity data."""
+    accounts = record.get("a")
+    previous_accounts = previous_record.get("a") if isinstance(previous_record, dict) else None
+    if not isinstance(accounts, list) or not isinstance(previous_accounts, list):
+        return record
+    previous_by_index = {
+        account.get("i"): account
+        for account in previous_accounts
+        if isinstance(account, dict) and isinstance(account.get("i"), (int, str))
+    }
+    for account in accounts:
+        if not isinstance(account, dict):
+            continue
+        previous = previous_by_index.get(account.get("i"))
+        if not isinstance(previous, dict):
+            continue
+        if not account.get("email") and previous.get("email"):
+            account["email"] = previous["email"]
+        if not (account.get("plan") or account.get("plan_type")):
+            previous_plan = previous.get("plan") or previous.get("plan_type")
+            if previous_plan:
+                account["plan"] = previous_plan
+    return record
+
+
 def normalize_snapshot_record(record: dict[str, Any]) -> dict[str, Any]:
     """Remap one legacy compact snapshot using each window's duration."""
     accounts = record.get("a")
@@ -441,9 +470,11 @@ class _OutOfOrderSnapshot(RuntimeError):
 class IncrementalHistoryCache:
     """Append-aware history cache that preserves legacy JSONL read semantics."""
 
-    def __init__(self, log_path: Path, tz_name: str) -> None:
+    def __init__(self, log_path: Path, tz_name: str, *, cooperative_yield_seconds: float = 0.0) -> None:
         self.log_path = log_path.expanduser()
         self.tz_name = tz_name
+        self._cooperative_yield_seconds = max(0.0, float(cooperative_yield_seconds))
+        self._batch_size = 256 if self._cooperative_yield_seconds else 1024
         self._series_index = HistorySeriesIndex()
         self.records: HistoryRecordList = HistoryRecordList(self._series_index)
         self.version = 0
@@ -456,6 +487,10 @@ class IncrementalHistoryCache:
         self._smooth_states: dict[tuple[str, str], dict[str, Any]] = {}
         self._state_before_last: dict[tuple[str, str], dict[str, Any]] = {}
         self._initialized = False
+
+    def _yield_to_foreground(self) -> None:
+        if self._cooperative_yield_seconds:
+            time.sleep(self._cooperative_yield_seconds)
 
     def compatible_with(self, log_path: Path, tz_name: str) -> bool:
         return self.log_path == log_path.expanduser() and self.tz_name == tz_name
@@ -495,6 +530,7 @@ class IncrementalHistoryCache:
             if first_timestamp == cached_timestamp:
                 replacement = deduplicated.pop(0)
                 states = copy.deepcopy(self._state_before_last)
+                inherit_snapshot_account_identity(replacement, self.records[-1])
                 normalize_snapshot_record(replacement)
                 smooth_snapshot_record(replacement, states)
                 self.records[-1] = replacement
@@ -502,6 +538,8 @@ class IncrementalHistoryCache:
                 self._series_index.replace_timestamp(first_timestamp, replacement)
 
         for index, record in enumerate(deduplicated):
+            previous_record = self.records[-1] if self.records else None
+            inherit_snapshot_account_identity(record, previous_record)
             normalize_snapshot_record(record)
             if index == len(deduplicated) - 1:
                 self._state_before_last = copy.deepcopy(self._smooth_states)
@@ -551,9 +589,10 @@ class IncrementalHistoryCache:
         batch: list[dict[str, Any]] = []
         for record in self._read_complete_tail(path, cursor):
             batch.append(record)
-            if len(batch) >= 1024:
+            if len(batch) >= self._batch_size:
                 changed = self._process_batch(batch) or changed
                 batch = []
+                self._yield_to_foreground()
         return self._process_batch(batch) or changed
 
     def _new_cursor(self, path: Path) -> _LogCursor:
@@ -567,6 +606,7 @@ class IncrementalHistoryCache:
         for path in paths:
             cursor = self._new_cursor(path)
             self._cursors[path] = cursor
+            scanned = 0
             with path.open("rb") as handle:
                 while True:
                     offset = handle.tell()
@@ -578,6 +618,9 @@ class IncrementalHistoryCache:
                     record = self._parse_line(raw_line)
                     if record is not None:
                         locations[record["t"]] = (path, offset, len(raw_line))
+                    scanned += 1
+                    if scanned % self._batch_size == 0:
+                        self._yield_to_foreground()
                 boundary_length = min(64, cursor.offset)
                 handle.seek(cursor.offset - boundary_length)
                 cursor.boundary = handle.read(boundary_length)
@@ -596,9 +639,10 @@ class IncrementalHistoryCache:
                 if record is None:
                     continue
                 batch.append(record)
-                if len(batch) >= 1024:
+                if len(batch) >= self._batch_size:
                     self._process_batch(batch)
                     batch = []
+                    self._yield_to_foreground()
             self._process_batch(batch)
         finally:
             for handle in handles.values():
@@ -683,6 +727,8 @@ def read_snapshots(log_path: Path, period: str, tz_name: str) -> list[dict[str, 
                 if isinstance(timestamp, int) and isinstance(record.get("a"), list):
                     records_by_time[timestamp] = record
     records = [records_by_time[timestamp] for timestamp in sorted(records_by_time)]
+    for index, record in enumerate(records):
+        inherit_snapshot_account_identity(record, records[index - 1] if index else None)
     return smooth_upward_spikes(normalize_snapshot_windows(records))
 
 

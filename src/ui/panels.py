@@ -45,7 +45,8 @@ def account_lines(
         add_text(line)
     if error:
         add_section("错误")
-        add_text(paint(plain_fit(error, inner_width - 2), "red"))
+        for error_line in plain_wrap(error, inner_width - 2):
+            add_text(paint(error_line, "red"))
         return [fit_ansi(line, inner_width) for line in lines[:inner_height]]
 
     add_section("重置次数")
@@ -104,7 +105,8 @@ def account_summary_body(
     error = account_error(account)
     if error:
         lines.append(section_rule("错误", inner_width))
-        add_text(paint(plain_fit(error, inner_width - 2), "red"))
+        for error_line in plain_wrap(error, inner_width - 2):
+            add_text(paint(error_line, "red"))
     else:
         lines.append(section_rule("重置次数", inner_width))
         for line in reset_rows(account, inner_width - 2):

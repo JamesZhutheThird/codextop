@@ -52,6 +52,10 @@ class MonitorState:
     token_version: int = 0
     token_total_reader: Any = None
     token_total_version: int = 0
+    preloader: Any = None
+    background_preload_started: bool = False
+    history_preload_waiting: bool = False
+    token_preload_waiting: bool = False
     history_cache: Any = None
     records_version: int = 0
     main_cache_key: tuple[Any, ...] | None = None

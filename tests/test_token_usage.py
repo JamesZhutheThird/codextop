@@ -26,14 +26,15 @@ from core.version import APP_VERSION, PACKAGE_VERSION
 from ui import color_schemes
 from ui.app import _render_main_content
 from ui.charts import series_chart_lines
-from ui.history import HistorySeriesIndex, metric_value_at
+from ui.history import HistorySeriesIndex, inherit_snapshot_account_identity, metric_value_at
 from ui.session_tokens import (
     ProjectTokenUsageMonitor,
     TokenUsageBreakdown,
     TrustedDirectoryTokenUsageMonitor,
 )
 from ui.settings import setting_items
-from ui.terminal_text import strip_ansi, visible_width
+from ui.panels import account_summary_body
+from ui.terminal_text import plain_wrap, strip_ansi, visible_width
 from ui.token_charts import (
     _single_token_chart_lines,
     _visible_max,
@@ -73,6 +74,25 @@ class CollectionTests(unittest.TestCase):
         with redirect_stdout(output):
             quota.print_text({"token_usage": {"lifetime_tokens": 1_234_567}})
         self.assertIn("total_usage: 1,234,567 Tokens", output.getvalue())
+
+    def test_plain_error_output_keeps_identity_above_error(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output):
+            quota.print_plain_bundle(
+                {
+                    "accounts": [
+                        {
+                            "index": "openai-1",
+                            "email": "codex@example.com",
+                            "plan_type": "plus",
+                            "error": "quota unavailable",
+                        }
+                    ]
+                }
+            )
+        rendered = output.getvalue()
+        self.assertLess(rendered.index("email: codex@example.com"), rendered.index("error: quota unavailable"))
+        self.assertLess(rendered.index("plan_type: plus"), rendered.index("error: quota unavailable"))
 
     def test_two_quota_endpoints_are_bounded_and_concurrent(self) -> None:
         active = 0
@@ -213,6 +233,8 @@ class CollectionTests(unittest.TestCase):
                 "index": "openai-1",
                 "current": True,
                 "error": "quota failed",
+                "email": "codex@example.com",
+                "plan_type": "plus",
                 "token_usage": {
                     "lifetime_tokens": 987_654_321,
                     "generated_at_epoch": 1_700_000_000,
@@ -222,6 +244,94 @@ class CollectionTests(unittest.TestCase):
         )
         self.assertEqual(item["u"], [987_654_321, 1_700_000_000])
         self.assertEqual(item["err"], "quota failed")
+        self.assertEqual(item["email"], "codex@example.com")
+        self.assertEqual(item["plan"], "plus")
+
+    def test_quota_failure_reuses_cached_email_and_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "token_usage_daily.json"
+
+            def success(url: str, _token: str, *_args) -> dict:
+                if url == quota.USAGE_URL:
+                    return quota_payload()
+                if url == quota.RESET_CREDITS_URL:
+                    return {"available_count": 0, "credits": []}
+                return {
+                    "stats": {"lifetime_tokens": 123},
+                    "metadata": {"generated_at": "2026-07-20T00:00:00Z"},
+                }
+
+            with (
+                patch.object(quota, "load_auth_credentials", return_value=("secret", "account")),
+                patch.object(quota, "get_json", side_effect=success),
+            ):
+                quota.collect_accounts(
+                    [("openai-1", Path("one"))],
+                    "openai-1",
+                    "Asia/Shanghai",
+                    cache_path,
+                    observed_epoch=1_000,
+                )
+
+            with (
+                patch.object(quota, "load_auth_credentials", return_value=("secret", "account")),
+                patch.object(quota, "get_json", side_effect=RuntimeError("quota unavailable")),
+            ):
+                failed = quota.collect_accounts(
+                    [("openai-1", Path("one"))],
+                    "openai-1",
+                    "Asia/Shanghai",
+                    cache_path,
+                    observed_epoch=1_001,
+                )["accounts"][0]
+
+            self.assertEqual(failed["email"], "codex@example.com")
+            self.assertEqual(failed["plan_type"], "plus")
+            self.assertIn("quota unavailable", failed["error"])
+
+            with patch.object(quota, "load_auth_credentials", side_effect=RuntimeError("auth unavailable")):
+                auth_failed = quota.collect_accounts(
+                    [("openai-1", Path("one"))],
+                    "openai-1",
+                    "Asia/Shanghai",
+                    cache_path,
+                    observed_epoch=1_002,
+                )["accounts"][0]
+
+            self.assertEqual(auth_failed["email"], "codex@example.com")
+            self.assertEqual(auth_failed["plan_type"], "plus")
+            self.assertIn("auth unavailable", auth_failed["error"])
+
+    def test_snapshot_identity_falls_back_to_previous_values(self) -> None:
+        previous = {
+            "t": 1,
+            "a": [{"i": "openai-1", "email": "codex@example.com", "plan": "plus"}],
+        }
+        current = {"t": 2, "a": [{"i": "openai-1", "err": "temporarily unavailable"}]}
+
+        inherit_snapshot_account_identity(current, previous)
+
+        self.assertEqual(current["a"][0]["email"], "codex@example.com")
+        self.assertEqual(current["a"][0]["plan"], "plus")
+
+    def test_account_error_wraps_without_truncation(self) -> None:
+        error = "network unavailable while reading account metadata"
+        wrapped = plain_wrap(error, 12)
+        self.assertGreater(len(wrapped), 1)
+        self.assertEqual("".join(wrapped).replace(" ", ""), error.replace(" ", ""))
+        self.assertTrue(all(visible_width(line) <= 12 for line in wrapped))
+
+        body = account_summary_body(
+            {
+                "i": "openai-1",
+                "email": "codex@example.com",
+                "plan": "plus",
+                "err": error,
+            },
+            24,
+        )
+        rendered = "".join(strip_ansi(line).strip() for line in body)
+        self.assertIn(error.replace(" ", ""), rendered.replace(" ", ""))
 
 
 def session_meta(cwd: Path, thread_id: str, source: object = "cli") -> dict:
@@ -642,7 +752,7 @@ class SettingsTests(unittest.TestCase):
             choices for key, _title, choices in setting_items(state) if key == "curve_mode"
         )
         self.assertIn(("精细柱状", "fine_bar"), curve_choices)
-        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("2.3.0", "v2.3.0"))
+        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("2.3.1", "v2.3.1"))
 
 
 class TokenChartTests(unittest.TestCase):

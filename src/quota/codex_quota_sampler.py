@@ -71,12 +71,14 @@ def compact_account(account: dict[str, Any], observed_ts: int) -> dict[str, Any]
             int(lifetime_tokens),
             int(source_epoch) if isinstance(source_epoch, (int, float)) else None,
         ]
+    if account.get("email"):
+        item["email"] = account.get("email")
+    if account.get("plan_type"):
+        item["plan"] = account.get("plan_type")
     if account.get("error"):
         item["err"] = account.get("error")
         return item
 
-    item["email"] = account.get("email")
-    item["plan"] = account.get("plan_type")
     item["ok"] = account.get("allowed")
 
     q: dict[str, list[Any]] = {}

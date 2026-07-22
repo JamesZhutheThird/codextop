@@ -18,6 +18,8 @@ COLOR_SCHEME_ALIASES = {"redblue": "icefire"}
 
 _ACTIVE_SCHEME_KEY: str | None = None
 _ACTIVE_SCHEME_SOURCE: Path | None = None
+_ACTIVE_SCHEME: dict[str, Any] | None = None
+_ACTIVE_IMPLICIT_SOURCE: tuple[str | None, str | None] | None = None
 _SCHEME_CACHE: dict[Path, dict[str, Any]] = {}
 
 
@@ -31,6 +33,10 @@ def color_scheme_source(path: Path | str | None = None) -> Path:
     if env_path:
         return Path(env_path).expanduser()
     return DEFAULT_COLOR_SCHEME_DIR
+
+
+def _implicit_source_signature() -> tuple[str | None, str | None]:
+    return os.environ.get(COLOR_SCHEME_DIR_ENV), os.environ.get(COLOR_SCHEME_FILE_ENV)
 
 
 def _read_json(path: Path) -> Any:
@@ -128,7 +134,7 @@ def color_scheme_exists(key: str, path: Path | str | None = None) -> bool:
 
 
 def set_active_color_scheme(key: str | None = None, path: Path | str | None = None) -> str:
-    global _ACTIVE_SCHEME_SOURCE, _ACTIVE_SCHEME_KEY
+    global _ACTIVE_IMPLICIT_SOURCE, _ACTIVE_SCHEME, _ACTIVE_SCHEME_SOURCE, _ACTIVE_SCHEME_KEY
     scheme_source = color_scheme_source(path).resolve()
     payload = _read_payload(scheme_source)
     selected = _resolve_color_scheme_key(key or default_color_scheme_key(scheme_source), payload)
@@ -136,6 +142,8 @@ def set_active_color_scheme(key: str | None = None, path: Path | str | None = No
         raise RuntimeError(f"color scheme not found: {selected}")
     _ACTIVE_SCHEME_SOURCE = scheme_source
     _ACTIVE_SCHEME_KEY = selected
+    _ACTIVE_SCHEME = payload[selected]
+    _ACTIVE_IMPLICIT_SOURCE = _implicit_source_signature() if path is None else None
     return selected
 
 
@@ -146,17 +154,31 @@ def active_color_scheme_key() -> str:
 
 
 def _active_scheme(path: Path | str | None = None, key: str | None = None) -> dict[str, Any]:
+    global _ACTIVE_IMPLICIT_SOURCE, _ACTIVE_SCHEME, _ACTIVE_SCHEME_SOURCE, _ACTIVE_SCHEME_KEY
+    implicit_active_request = path is None and key is None
+    if (
+        implicit_active_request
+        and _ACTIVE_SCHEME is not None
+        and _ACTIVE_IMPLICIT_SOURCE == _implicit_source_signature()
+    ):
+        return _ACTIVE_SCHEME
     scheme_source = color_scheme_source(path).resolve()
     if key is None:
         if _ACTIVE_SCHEME_KEY is None or _ACTIVE_SCHEME_SOURCE != scheme_source:
-            key = set_active_color_scheme(path=scheme_source)
+            key = set_active_color_scheme(path=path)
         else:
             key = _ACTIVE_SCHEME_KEY
     payload = _read_payload(scheme_source)
     key = _resolve_color_scheme_key(key, payload)
     if key not in payload:
         raise RuntimeError(f"color scheme not found: {key}")
-    return payload[key]
+    scheme = payload[key]
+    if implicit_active_request:
+        _ACTIVE_SCHEME_SOURCE = scheme_source
+        _ACTIVE_SCHEME_KEY = key
+        _ACTIVE_SCHEME = scheme
+        _ACTIVE_IMPLICIT_SOURCE = _implicit_source_signature()
+    return scheme
 
 
 def _hex_to_rgb(color: str) -> tuple[int, int, int]:

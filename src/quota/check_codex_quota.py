@@ -480,9 +480,18 @@ def collect_accounts(
                 "label": index,
                 "current": index == current_index,
             }
+            raw_cache_entry = (
+                cache_accounts.get(str(index))
+                if isinstance(cache_accounts, dict)
+                else None
+            )
             try:
                 access_token, account_id = load_auth_credentials(path)
             except Exception as exc:
+                if isinstance(raw_cache_entry, dict):
+                    for key in ("email", "plan_type"):
+                        if raw_cache_entry.get(key):
+                            report[key] = raw_cache_entry[key]
                 report["error"] = str(exc)
                 entries.append({"report": report})
                 continue
@@ -491,6 +500,10 @@ def collect_accounts(
                 if token_cache is not None
                 else None
             )
+            if isinstance(cache_entry, dict):
+                for key in ("email", "plan_type"):
+                    if cache_entry.get(key):
+                        report[key] = cache_entry[key]
             cached_usage = cached_token_usage(cache_entry)
             if cached_usage is not None:
                 report["token_usage"] = cached_usage
@@ -533,6 +546,9 @@ def collect_accounts(
                 existing_usage = cached_token_usage(cache_entry)
                 if existing_usage is not None:
                     updated_entry["token_usage"] = existing_usage
+                for key in ("email", "plan_type"):
+                    if report.get(key):
+                        updated_entry[key] = report[key]
                 try:
                     fresh_usage = normalize_token_usage(token_future.result())
                     fresh_usage["checked_at_epoch"] = observed_epoch
@@ -548,15 +564,31 @@ def collect_accounts(
             if usage_future is None or credits_future is None:
                 continue
             try:
-                report.update(
-                    normalize_quota_report(
-                        usage_future.result(),
-                        credits_future.result(),
-                        tz_name,
-                    )
+                normalized = normalize_quota_report(
+                    usage_future.result(),
+                    credits_future.result(),
+                    tz_name,
                 )
+                for key in ("email", "plan_type"):
+                    if not normalized.get(key) and report.get(key):
+                        normalized[key] = report[key]
+                report.update(normalized)
             except Exception as exc:
                 report["error"] = str(exc)
+
+            if isinstance(cache_accounts, dict):
+                stored_entry = cache_accounts.get(str(entry["index"]))
+                if not isinstance(stored_entry, dict):
+                    stored_entry = entry.get("cache_entry")
+                updated_entry = dict(stored_entry) if isinstance(stored_entry, dict) else {}
+                if entry.get("account_id"):
+                    updated_entry["account_id"] = entry["account_id"]
+                for key in ("email", "plan_type"):
+                    if report.get(key):
+                        updated_entry[key] = report[key]
+                if updated_entry != stored_entry:
+                    cache_accounts[str(entry["index"])] = updated_entry
+                    cache_changed = True
 
     if cache_changed and token_cache_path is not None and token_cache is not None:
         try:
@@ -752,8 +784,6 @@ def make_identity_section(account: dict[str, Any], panel_width: int) -> "Table":
     table.add_row("账号邮箱", truncate_text(account.get("email"), email_width))
     table.add_row("账号类型", str(account.get("plan_type") or "-"))
     table.add_row("使用总量", lifetime_token_text(account))
-    if account.get("error"):
-        table.add_row("错误", f"[red]{truncate_text(account['error'], panel_width - 10)}[/red]")
     return table
 
 
@@ -843,19 +873,31 @@ def make_account_panel(account: dict[str, Any], width: int) -> "Panel":
     from rich.console import Group
     from rich.panel import Panel
     from rich.rule import Rule
+    from rich.text import Text
 
     index = account.get("index")
     title = str(account.get("label") or index or "-")
     if account.get("current"):
         title = f"【{title}】"
 
-    body = Group(
-        make_identity_section(account, width),
-        Rule(style="dim"),
-        make_quota_section(account, width),
-        Rule(style="dim"),
-        make_resets_section(account, width),
-    )
+    sections: list[Any] = [make_identity_section(account, width)]
+    if account.get("error"):
+        sections.extend(
+            [
+                Rule("错误", style="red"),
+                Text(str(account["error"]), style="red", overflow="fold", no_wrap=False),
+            ]
+        )
+    else:
+        sections.extend(
+            [
+                Rule(style="dim"),
+                make_quota_section(account, width),
+                Rule(style="dim"),
+                make_resets_section(account, width),
+            ]
+        )
+    body = Group(*sections)
     return Panel(
         body,
         title=title,
@@ -921,6 +963,9 @@ def print_plain_bundle(bundle: dict[str, Any]) -> None:
         if account.get("current"):
             print("current: True")
         if account.get("error"):
+            print(f"email: {account.get('email')}")
+            print(f"plan_type: {account.get('plan_type')}")
+            print(f"total_usage: {lifetime_token_text(account)}")
             print(f"error: {account.get('error')}")
         else:
             print_text(account)

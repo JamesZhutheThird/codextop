@@ -14,6 +14,7 @@ from core.constants import *
 from .history import current_accounts, current_index, read_records_if_due
 from .models import ClickZone, MonitorState
 from .panels import *
+from .preload import BackgroundDataPreloader
 from core.paths import ensure_runtime_layout
 from quota.token_usage_cache import DailyTokenUsageCacheReader, TOKEN_USAGE_CACHE_FILE
 from .settings import handle_click, handle_setting_key, render_sidebar
@@ -55,16 +56,20 @@ def _render_main_content(
     main_width = max(40, term_width - sidebar_width)
     content_height = max(6, term_height - 1)
     if state.display_scope == "usage":
-        chart_lines = token_usage_chart_lines(
-            token_series,
-            token_usage,
-            state.period,
-            main_width - 2,
-            content_height - 2,
-            state.curve_mode,
-            state.color_scheme,
-            state.usage_panel_layout,
-        )
+        if getattr(state, "token_preload_waiting", False):
+            chart_lines = [paint("正在后台预加载 Token 数据...", "yellow")]
+            chart_lines.extend([""] * max(0, content_height - 3))
+        else:
+            chart_lines = token_usage_chart_lines(
+                token_series,
+                token_usage,
+                state.period,
+                main_width - 2,
+                content_height - 2,
+                state.curve_mode,
+                state.color_scheme,
+                state.usage_panel_layout,
+            )
         left_lines = panel(
             "Token 用量",
             chart_lines,
@@ -73,7 +78,12 @@ def _render_main_content(
             "cyan",
         )
     elif not accounts:
-        left_lines = [paint("正在加载 quota 数据...", "yellow")]
+        loading_text = (
+            "正在后台预加载 quota 数据..."
+            if getattr(state, "history_preload_waiting", False)
+            else "正在加载 quota 数据..."
+        )
+        left_lines = [paint(loading_text, "yellow")]
         left_lines.extend([""] * (content_height - 1))
         left_lines = [fit_ansi(line, main_width) for line in left_lines[:content_height]]
     elif state.display_scope == "current":
@@ -219,17 +229,106 @@ def _render_main_content(
     return left_lines, main_width, content_height
 
 
+def start_background_preload(state: MonitorState) -> bool:
+    preloader = state.preloader
+    if state.background_preload_started or not isinstance(preloader, BackgroundDataPreloader):
+        return False
+    state.background_preload_started = True
+    return preloader.start(state.display_scope, state.usage_directory_scope)
+
+
+def _adopt_history_preload(state: MonitorState) -> bool:
+    preloader = state.preloader
+    if not isinstance(preloader, BackgroundDataPreloader) or not preloader.history_scheduled:
+        return False
+    try:
+        result = preloader.take_history_if_ready()
+    except Exception as exc:
+        state.status = "quota 预加载失败，正在前台加载"
+        state.error = str(exc)
+        return False
+    if result is None:
+        return False
+    state.history_cache = result.cache
+    state.records = result.records
+    state.records_version = result.cache.version
+    state.last_records_read = result.completed_at
+    state.next_read = 0.0
+    state.main_cache_key = None
+    return True
+
+
+def _token_preload_needed(state: MonitorState, monitor: object) -> bool:
+    if not isinstance(monitor, TrustedDirectoryTokenUsageMonitor) or monitor.version == 0:
+        return True
+    return state.usage_directory_scope == "all" and monitor.scope != "all"
+
+
+def _adopt_token_preload(state: MonitorState) -> bool:
+    preloader = state.preloader
+    if not isinstance(preloader, BackgroundDataPreloader) or not preloader.token_scheduled:
+        return False
+    try:
+        monitor = preloader.take_token_if_ready()
+    except Exception as exc:
+        state.status = "Token 预加载失败，正在前台加载"
+        state.error = str(exc)
+        return False
+    if monitor is None:
+        return False
+    state.token_monitor = monitor
+    state.token_version = monitor.version
+    state.main_cache_key = None
+    return True
+
+
 def render_frame(state: MonitorState, term_width: int, term_height: int) -> tuple[list[str], list[ClickZone]]:
-    records = read_records_if_due(state)
+    state.history_preload_waiting = False
+    state.token_preload_waiting = False
+    preloader = state.preloader
+    if state.display_scope == "usage":
+        records = state.records or []
+    else:
+        _adopt_history_preload(state)
+        if (
+            state.records is None
+            and isinstance(preloader, BackgroundDataPreloader)
+            and preloader.history_scheduled
+        ):
+            state.history_preload_waiting = True
+            state.status = "正在后台预加载 quota 数据"
+            records = []
+        else:
+            records = read_records_if_due(state)
     token_monitor = state.token_monitor
-    if isinstance(token_monitor, TrustedDirectoryTokenUsageMonitor):
-        token_monitor.set_scope(state.usage_directory_scope)
-        if state.display_scope != "usage":
-            token_monitor.sync_directories()
-    if state.display_scope == "usage" and isinstance(token_monitor, TrustedDirectoryTokenUsageMonitor):
-        if token_monitor.poll():
-            state.token_version = token_monitor.version
-            state.main_cache_key = None
+    if state.display_scope != "usage" and isinstance(token_monitor, TrustedDirectoryTokenUsageMonitor):
+        token_monitor.sync_directories()
+    if state.display_scope == "usage":
+        if _token_preload_needed(state, token_monitor):
+            _adopt_token_preload(state)
+            token_monitor = state.token_monitor
+        if (
+            _token_preload_needed(state, token_monitor)
+            and isinstance(preloader, BackgroundDataPreloader)
+            and preloader.token_scheduled
+        ):
+            state.token_preload_waiting = True
+            state.status = "正在后台预加载 Token 数据"
+        elif isinstance(token_monitor, TrustedDirectoryTokenUsageMonitor):
+            token_monitor.set_scope(state.usage_directory_scope)
+            if token_monitor.poll():
+                state.token_version = token_monitor.version
+                state.main_cache_key = None
+            if token_monitor.error:
+                state.status = "Token 读取失败"
+                state.error = token_monitor.error
+            elif state.status in {
+                "启动中",
+                "正在后台预加载 Token 数据",
+                "Token 预加载失败，正在前台加载",
+            }:
+                state.status = "Token 数据已加载" if token_monitor.latest is not None else "等待 Token 数据"
+                state.error = None
     accounts = current_accounts(state, records)
     token_total_reader = state.token_total_reader
     if isinstance(token_total_reader, DailyTokenUsageCacheReader):
@@ -266,6 +365,8 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
         state.usage_panel_layout,
         state.color_scheme,
         state.summary_offset,
+        state.history_preload_waiting,
+        state.token_preload_waiting,
     )
     if (
         state.main_cache_key == cache_key
@@ -304,7 +405,6 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
 
 
 def run_once(state: MonitorState) -> int:
-    read_records_if_due(state, force=True)
     width, height = shutil.get_terminal_size((160, 48))
     lines, _zones = render_frame(state, width, height)
     print("\n".join(lines))
@@ -341,6 +441,7 @@ def run_tui(state: MonitorState) -> int:
                 lines, zones = render_frame(state, width, height)
                 sys.stdout.write("\x1b[H" + "\n".join(lines))
                 sys.stdout.flush()
+                start_background_preload(state)
 
                 deadline = time.monotonic() + 0.2
                 while time.monotonic() < deadline:
@@ -472,6 +573,14 @@ def main() -> int:
         ),
         token_total_reader=DailyTokenUsageCacheReader(
             runtime_paths.settings_dir / TOKEN_USAGE_CACHE_FILE
+        ),
+        preloader=BackgroundDataPreloader(
+            args.log_dir.expanduser() / args.log_file,
+            args.tz,
+            runtime_paths.codex_dir / "sessions",
+            args.project_dir,
+            runtime_paths.codex_dir / "config.toml",
+            runtime_paths.settings_dir / TOKEN_USAGE_DIRECTORIES_FILE,
         ),
     )
     if args.once:
