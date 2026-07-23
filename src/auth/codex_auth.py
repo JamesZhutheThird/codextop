@@ -429,10 +429,21 @@ def running_codex_processes() -> list[dict[str, Any]]:
     if not proc.exists():
         return []
     current_pid = os.getpid()
+    current_uid = os.getuid()
+
     processes: list[dict[str, Any]] = []
     for entry in proc.iterdir():
         if not entry.name.isdigit():
             continue
+
+        # Only inspect processes owned by the current Linux user.
+        try:
+            if entry.stat().st_uid != current_uid:
+                continue
+        except OSError:
+            # The process may have exited during iteration.
+            continue
+
         pid = int(entry.name)
         if pid == current_pid:
             continue
