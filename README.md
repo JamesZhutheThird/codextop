@@ -14,7 +14,7 @@
 </tr>
 </table>
 
-<strong>CodexTOP：本地 Codex 账号额度查看和多账号切换工具</strong>
+<strong>CodexTOP：本地 Codex 多账号额度用量监控工具</strong>
 
 基于 Rich 的可点击交互终端界面。
 </div>
@@ -26,6 +26,8 @@
   <p>看板模式</p>
   <img src="./assets/demo3.png" alt="CodexTOP merged mode" width="820">
   <p>合并模式</p>
+  <img src="./assets/demo4.png" alt="CodexTOP merged mode" width="820">
+  <p>用量模式</p>
   <img src="./assets/demo-check.png" alt="CodexTOP single check" width="820">
   <p>命令行单次查询</p>
 </div>
@@ -39,15 +41,36 @@
 | ✅已支持 | 后台采样服务     | 并发查询额度与重置次数，以统一时间戳写入本地 JSONL              |
 | ✅已支持 | 多账号切换      | `CODEXAUTH` 管理 `auth-openai-*` 账号并切换 provider |
 | ✅已支持 | 版本更新       | 从 GitHub remote 检测版本/分支更新并自动快进同步              |
+| ✅已支持 | Token 用量统计 | 用量模式增量读取可信目录根线程日志；支持四类曲线、堆叠柱状和精细柱状 |
 | ⏩规划中 | 新账号注册      | 后续补充新账号接入和初始化流程                               |
 | ⏩规划中 | 额度重置通知     | 额度恢复后通过系统通知提醒                                 |
-| ✅已支持 | Token 用量统计 | 用量模式增量读取可信目录根线程日志；支持四类曲线、堆叠柱状和精细柱状 |
 
 ## 安装
 
-在仓库根目录执行：
+### 方式 A：让 Codex 自动安装（推荐）
+
+把下面的安装说明链接直接发给 Codex，它会自动选择用户级安装目录、检查依赖、备份已有安装、完成安装与验证，并在命令行输出后续使用指引：
+
+- GitHub 页面：<https://github.com/JamesZhutheThird/codextop/blob/main/AI_AGENT_INSTALL.md>
+- Raw Markdown：<https://raw.githubusercontent.com/JamesZhutheThird/codextop/main/AI_AGENT_INSTALL.md>
+
+可以直接发送：
+
+```text
+请按照这个说明自动安装 CodexTOP：
+https://github.com/JamesZhutheThird/codextop/blob/main/AI_AGENT_INSTALL.md
+```
+
+在已能正常使用 Codex CLI 的 Linux/WSL + zsh 环境中，不需要手工选择安装目录、编辑 shell 配置或准备账号文件；已有的 `~/.codex/auth.json` 会在首次运行时自动导入。安装流程不会无备份覆盖已有源码目录或 `.zshrc`。
+
+### 方式 B：手动安装
+
+克隆仓库并在仓库根目录执行：
 
 ```bash
+git clone https://github.com/JamesZhutheThird/codextop.git
+cd codextop
+python3 -m pip install --user 'rich>=13.0.0'
 ./scripts/install_zshrc.sh
 source ~/.zshrc
 rehash
@@ -56,10 +79,10 @@ rehash
 安装后可直接使用这些命令：
 
 ```bash
-CODEXTOP                % 打开 CodexTOP 主界面
-CHECK_CODEX_QUOTA       % 单次查看账号额度信息
-CODEXAUTH               % 查看当前账号信息/切换账号
-CODEXTOP_UPDATE         % 检测 GitHub 更新并自动同步
+CODEXTOP                # 打开 CodexTOP 主界面
+CHECK_CODEX_QUOTA       # 单次查看账号额度信息
+CODEXAUTH               # 查看当前账号信息/切换账号
+CODEXTOP_UPDATE         # 检测 GitHub 更新并自动同步
 ```
 
 ## 配置

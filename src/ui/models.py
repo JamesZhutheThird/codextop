@@ -29,6 +29,7 @@ class MonitorState:
     color_scheme: str
     usage_directory_scope: str = "current"
     usage_panel_layout: str = "combined"
+    usage_axis_scale: str = "default"
     last_update: float | None = None
     next_read: float = 0.0
     status: str = "启动中"

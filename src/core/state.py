@@ -96,6 +96,12 @@ def saved_usage_panel_layout(payload: dict[str, Any]) -> str | None:
     return layout if isinstance(layout, str) and layout in valid_layouts else None
 
 
+def saved_usage_axis_scale(payload: dict[str, Any]) -> str | None:
+    scale = payload.get("usage_axis_scale")
+    valid_scales = {value for _label, value in USAGE_AXIS_SCALE_CHOICES}
+    return scale if isinstance(scale, str) and scale in valid_scales else None
+
+
 def saved_color_scheme(payload: dict[str, Any]) -> str | None:
     scheme = payload.get("color_scheme")
     return scheme if isinstance(scheme, str) and color_schemes.color_scheme_exists(scheme) else None
@@ -112,6 +118,7 @@ def save_codextop_state(state: MonitorState) -> None:
         "window_scope": state.window_scope,
         "usage_directory_scope": state.usage_directory_scope,
         "usage_panel_layout": state.usage_panel_layout,
+        "usage_axis_scale": state.usage_axis_scale,
         "color_scheme": state.color_scheme,
     }
     tmp_path = state.state_path.with_name(f".{state.state_path.name}.{os.getpid()}.tmp")

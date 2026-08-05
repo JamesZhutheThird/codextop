@@ -33,6 +33,7 @@ def setting_items(state: MonitorState) -> list[tuple[str, str, list[tuple[str, A
             [
                 ("usage_directory_scope", "用量范围", list(USAGE_DIRECTORY_SCOPE_CHOICES)),
                 ("usage_panel_layout", "用量布局", list(USAGE_PANEL_LAYOUT_CHOICES)),
+                ("usage_axis_scale", "坐标轴", list(USAGE_AXIS_SCALE_CHOICES)),
             ]
         )
     else:
@@ -49,6 +50,8 @@ def setting_current_value(state: MonitorState, key: str) -> Any:
         return state.usage_directory_scope
     if key == "usage_panel_layout":
         return state.usage_panel_layout
+    if key == "usage_axis_scale":
+        return state.usage_axis_scale
     if key == "curve_mode":
         return state.curve_mode
     if key == "window_scope":
@@ -204,10 +207,15 @@ def render_sidebar(state: MonitorState, width: int, height: int, x_origin: int, 
         _index, key, title, choices = focused_setting(state)
         add_setting_options(key, title, choices)
     else:
+        remaining_gaps = min(
+            max(0, len(items) - 1),
+            max(0, settings_limit - 3 - 2 * len(items)),
+        )
         for index, (key, title, _choices) in enumerate(items):
             add_setting_item(index, key, title)
-            if index != len(items) - 1:
+            if index != len(items) - 1 and remaining_gaps > 0:
                 add_plain("")
+                remaining_gaps -= 1
 
     lines = lines[:settings_limit]
     zones[:] = [
@@ -302,6 +310,11 @@ def apply_setting_value(state: MonitorState, key: str, value: Any) -> None:
         layout = str(value)
         if state.usage_panel_layout != layout:
             state.usage_panel_layout = layout
+            state.main_cache_key = None
+    elif key == "usage_axis_scale":
+        scale = str(value)
+        if state.usage_axis_scale != scale:
+            state.usage_axis_scale = scale
             state.main_cache_key = None
     elif key == "curve_mode":
         state.curve_mode = str(value)
@@ -404,6 +417,7 @@ def handle_click(state: MonitorState, zones: list[ClickZone], x: int, y: int) ->
                 "period",
                 "usage_directory_scope",
                 "usage_panel_layout",
+                "usage_axis_scale",
                 "curve_mode",
                 "window_scope",
                 "color_scheme",

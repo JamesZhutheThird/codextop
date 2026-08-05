@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import math
 import time
 from typing import Any
@@ -32,9 +33,11 @@ TOKEN_MARKERS = {
     "total": "■",
 }
 TOKEN_KEYS = tuple(TOKEN_LABELS)
-TOKEN_STACK_KEYS = ("input", "cached", "output")
-TOKEN_PRIORITIES = {key: index for index, key in enumerate(TOKEN_KEYS, 1)}
+TOKEN_PLOT_KEYS = ("output", "input", "cached", "total")
+TOKEN_STACK_KEYS = TOKEN_PLOT_KEYS[:-1]
+TOKEN_PRIORITIES = {key: index for index, key in enumerate(TOKEN_PLOT_KEYS, 1)}
 SPLIT_FULL_AXIS_MIN_HEIGHT = 11
+LOG_AXIS_MIN_EXPONENT = 6
 
 
 def token_rate_unit(seconds_per_column: float) -> tuple[int, str]:
@@ -59,6 +62,51 @@ def scientific_tick_label(value: float) -> str:
     if value < 1:
         return f"{value:g}".lstrip("0")
     return f"{value:g}"
+
+
+def logarithmic_axis_exponent(value: float) -> int:
+    """Return the smallest power-of-ten ceiling, with a 10^6 minimum."""
+
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 1:
+        return LOG_AXIS_MIN_EXPONENT
+    return max(LOG_AXIS_MIN_EXPONENT, math.ceil(math.log10(value)))
+
+
+def _logarithmic_axis_width(exponent: int) -> int:
+    return max(4, len(f"10^{exponent}") + 1)
+
+
+def _axis_ratio(value: float, axis_max: float, log_exponent: int | None = None) -> float:
+    if log_exponent is not None:
+        if value <= 1:
+            return 0.0
+        return min(1.0, max(0.0, math.log10(value) / log_exponent))
+    if axis_max <= 0:
+        return 0.0
+    return min(1.0, max(0.0, value / axis_max))
+
+
+def _logarithmic_tick_exponents(exponent: int, chart_height: int) -> tuple[int, ...]:
+    tick_count = min(exponent + 1, max(2, chart_height))
+    values = {
+        round(index * exponent / max(1, tick_count - 1))
+        for index in range(tick_count)
+    }
+    values.update((0, exponent))
+    return tuple(sorted(values))
+
+
+def _logarithmic_tick_rows(
+    chart_height: int,
+    exponent: int,
+    tick_exponents: tuple[int, ...] | None = None,
+) -> dict[int, str]:
+    if tick_exponents is None:
+        tick_exponents = _logarithmic_tick_exponents(exponent, chart_height)
+    return {
+        round((exponent - tick_exponent) / exponent * (chart_height - 1)): f"10^{tick_exponent}"
+        for tick_exponent in tick_exponents
+    }
 
 
 def token_chart_bounds(rate_series: dict[str, list[dict[str, float]]], period: str) -> tuple[int, int]:
@@ -135,6 +183,47 @@ def _visible_max(
     return maximum
 
 
+def _visible_series_max(
+    points: list[dict[str, float]],
+    start_ts: int,
+    end_ts: int,
+    factor: int,
+) -> float:
+    maximum = _series_value(points, start_ts, factor)
+    first = bisect.bisect_left(points, start_ts, key=lambda point: point["t"])
+    last = bisect.bisect_right(points, end_ts, key=lambda point: point["t"])
+    for point in points[first:last]:
+        maximum = max(maximum, max(0.0, float(point["value"]) * factor))
+    return maximum
+
+
+def _shared_logarithmic_axis(
+    rate_series: dict[str, list[dict[str, float]]],
+    start_ts: int,
+    end_ts: int,
+    widths: list[int],
+) -> tuple[int, int, str]:
+    exponent = LOG_AXIS_MIN_EXPONENT
+    factor, unit = 60, "tok/min"
+    for _attempt in range(4):
+        axis_width = _logarithmic_axis_width(exponent)
+        plot_widths = [max(2, width - axis_width - 4) for width in widths]
+        reference_width = min(plot_widths)
+        seconds_per_column = max(0, end_ts - start_ts) / max(1, reference_width)
+        factor, unit = token_rate_unit(seconds_per_column)
+        maximum = _visible_series_max(
+            rate_series.get("total", []),
+            start_ts,
+            end_ts,
+            factor,
+        )
+        next_exponent = logarithmic_axis_exponent(maximum)
+        if next_exponent == exponent:
+            break
+        exponent = next_exponent
+    return exponent, factor, unit
+
+
 def _box_segment_char(previous_row: int, row: int, filled_row: int) -> str:
     if row == previous_row:
         return "─"
@@ -155,6 +244,7 @@ def _independent_grid(
     factor: int,
     curve_mode: str,
     colors: dict[str, str],
+    log_exponent: int | None = None,
 ) -> list[str]:
     grid: list[list[tuple[str, str, int]]] = [
         [(" ", "dim", 0) for _ in range(plot_width)]
@@ -168,7 +258,7 @@ def _independent_grid(
         if old_char == " " or priority >= old_priority:
             grid[row][column] = (char, color, priority)
 
-    for key in TOKEN_KEYS:
+    for key in TOKEN_PLOT_KEYS:
         points = rate_series.get(key, [])
         if not points:
             continue
@@ -176,8 +266,8 @@ def _independent_grid(
         for column in range(plot_width):
             ratio = column / max(1, plot_width - 1)
             timestamp = int(start_ts + (end_ts - start_ts) * ratio)
-            value = min(axis_max, _series_value(points, timestamp, factor))
-            row = round((axis_max - value) / axis_max * (chart_height - 1))
+            value = _series_value(points, timestamp, factor)
+            row = round((1.0 - _axis_ratio(value, axis_max, log_exponent)) * (chart_height - 1))
             priority = TOKEN_PRIORITIES[key]
             if curve_mode == "points":
                 put(row, column, TOKEN_MARKERS[key], colors[key], priority)
@@ -210,6 +300,7 @@ def _braille_grid(
     axis_max: float,
     factor: int,
     colors: dict[str, str],
+    log_exponent: int | None = None,
 ) -> list[str]:
     dot_width = plot_width * 2
     dot_height = chart_height * 4
@@ -231,7 +322,7 @@ def _braille_grid(
             max(priority, old_priority),
         )
 
-    for key in TOKEN_KEYS:
+    for key in TOKEN_PLOT_KEYS:
         points = rate_series.get(key, [])
         if not points:
             continue
@@ -239,8 +330,8 @@ def _braille_grid(
         for dot_column in range(dot_width):
             ratio = dot_column / max(1, dot_width - 1)
             timestamp = int(start_ts + (end_ts - start_ts) * ratio)
-            value = min(axis_max, _series_value(points, timestamp, factor))
-            dot_row = round((axis_max - value) / axis_max * (dot_height - 1))
+            value = _series_value(points, timestamp, factor)
+            dot_row = round((1.0 - _axis_ratio(value, axis_max, log_exponent)) * (dot_height - 1))
             if previous is None:
                 put(dot_row, dot_column, colors[key], TOKEN_PRIORITIES[key])
             else:
@@ -271,6 +362,7 @@ def _bar_grid(
     factor: int,
     colors: dict[str, str],
     keys: tuple[str, ...],
+    log_exponent: int | None = None,
 ) -> list[str]:
     grid: list[list[tuple[str, str]]] = [
         [(" ", "dim") for _ in range(plot_width)]
@@ -289,8 +381,12 @@ def _bar_grid(
             cumulative += values[key]
             if cumulative <= start:
                 continue
-            top_row = round((axis_max - min(axis_max, cumulative)) / axis_max * (chart_height - 1))
-            bottom_row = round((axis_max - min(axis_max, start)) / axis_max * (chart_height - 1))
+            top_row = round(
+                (1.0 - _axis_ratio(cumulative, axis_max, log_exponent)) * (chart_height - 1)
+            )
+            bottom_row = round(
+                (1.0 - _axis_ratio(start, axis_max, log_exponent)) * (chart_height - 1)
+            )
             for row in range(top_row, bottom_row + 1):
                 grid[row][column] = ("█", colors[key])
     return [
@@ -309,6 +405,7 @@ def _fine_bar_grid(
     factor: int,
     colors: dict[str, str],
     keys: tuple[str, ...],
+    log_exponent: int | None = None,
 ) -> list[str]:
     dot_width = plot_width * 2
     dot_height = chart_height * 4
@@ -336,9 +433,9 @@ def _fine_bar_grid(
         cumulative = 0.0
         for key in keys:
             value = _series_value(rate_series.get(key, []), timestamp, factor)
-            start_units = round(min(axis_max, cumulative) / axis_max * dot_height)
+            start_units = round(_axis_ratio(cumulative, axis_max, log_exponent) * dot_height)
             cumulative += value
-            end_units = round(min(axis_max, cumulative) / axis_max * dot_height)
+            end_units = round(_axis_ratio(cumulative, axis_max, log_exponent) * dot_height)
             if value > 0 and end_units <= start_units:
                 end_units = min(dot_height, start_units + 1)
             top_row = dot_height - end_units
@@ -392,28 +489,52 @@ def _single_token_chart_lines(
     height: int,
     curve_mode: str,
     colors: dict[str, str],
+    usage_axis_scale: str = "default",
+    shared_log_exponent: int | None = None,
+    shared_rate_scale: tuple[int, str] | None = None,
+    shared_log_ticks: tuple[int, ...] | None = None,
 ) -> list[str]:
     if width <= 14 or height <= 6:
         return [fit_ansi(paint(f"{TOKEN_LABELS[key]}：空间不足", "dim"), width)] + [
             " " * width for _ in range(max(0, height - 1))
         ]
 
-    axis_width = 4
+    log_exponent: int | None = None
+    if usage_axis_scale == "log":
+        if shared_log_exponent is None or shared_rate_scale is None:
+            shared_log_exponent, factor, unit = _shared_logarithmic_axis(
+                rate_series,
+                start_ts,
+                end_ts,
+                [width],
+            )
+        else:
+            factor, unit = shared_rate_scale
+        log_exponent = shared_log_exponent
+        axis_width = _logarithmic_axis_width(log_exponent)
+    else:
+        axis_width = 4
     plot_width = max(2, width - axis_width - 4)
     chart_width = plot_width + 2
     chart_height = max(2, height - 4)
-    seconds_per_column = max(0, end_ts - start_ts) / max(1, plot_width)
-    factor, unit = token_rate_unit(seconds_per_column)
+    if usage_axis_scale != "log":
+        seconds_per_column = max(0, end_ts - start_ts) / max(1, plot_width)
+        factor, unit = token_rate_unit(seconds_per_column)
     single_series = {key: rate_series.get(key, [])}
-    visible_max = _visible_max(
-        single_series,
-        start_ts,
-        end_ts,
-        plot_width,
-        factor,
-        False,
-    )
-    axis_max, exponent, tick_max = scientific_axis_max(visible_max)
+    if log_exponent is not None:
+        axis_max = float(10 ** log_exponent)
+        exponent = log_exponent
+        tick_max = axis_max
+    else:
+        visible_max = _visible_max(
+            single_series,
+            start_ts,
+            end_ts,
+            plot_width,
+            factor,
+            False,
+        )
+        axis_max, exponent, tick_max = scientific_axis_max(visible_max)
 
     if curve_mode == "bar":
         grid = _bar_grid(
@@ -426,6 +547,7 @@ def _single_token_chart_lines(
             factor,
             colors,
             (key,),
+            log_exponent,
         )
     elif curve_mode == "fine_bar":
         grid = _fine_bar_grid(
@@ -438,10 +560,19 @@ def _single_token_chart_lines(
             factor,
             colors,
             (key,),
+            log_exponent,
         )
     elif curve_mode == "braille":
         grid = _braille_grid(
-            single_series, start_ts, end_ts, plot_width, chart_height, axis_max, factor, colors
+            single_series,
+            start_ts,
+            end_ts,
+            plot_width,
+            chart_height,
+            axis_max,
+            factor,
+            colors,
+            log_exponent,
         )
     else:
         grid = _independent_grid(
@@ -454,6 +585,7 @@ def _single_token_chart_lines(
             factor,
             curve_mode,
             colors,
+            log_exponent,
         )
 
     totals = _usage_values(latest)
@@ -469,7 +601,7 @@ def _single_token_chart_lines(
         + f" {compact_token_count(current)} ({compact_token_count(totals[key])})"
     )
     header_width = chart_width + 2
-    scale_text = f"{unit} ×10^{exponent}"
+    scale_text = f"{unit} 对数" if log_exponent is not None else f"{unit} ×10^{exponent}"
     legend_width = max(0, header_width - visible_width(scale_text) - 1)
     legend_text = compact_ansi(legend_text, legend_width)
     header_gap = max(1, header_width - visible_width(scale_text) - visible_width(legend_text))
@@ -478,7 +610,9 @@ def _single_token_chart_lines(
         + fit_ansi(scale_text + " " * header_gap + legend_text, header_width),
         (" " * axis_width) + paint("┌" + "─" * chart_width + "┐", "dim"),
     ]
-    if chart_height >= SPLIT_FULL_AXIS_MIN_HEIGHT:
+    if log_exponent is not None:
+        tick_rows = _logarithmic_tick_rows(chart_height, log_exponent, shared_log_ticks)
+    elif chart_height >= SPLIT_FULL_AXIS_MIN_HEIGHT:
         tick_ratios = (1.0, 0.8, 0.6, 0.4, 0.2, 0.0)
         tick_rows = {
             round((1.0 - ratio) * (chart_height - 1)): scientific_tick_label(tick_max * ratio)
@@ -512,6 +646,7 @@ def split_token_usage_chart_lines(
     height: int,
     curve_mode: str,
     color_scheme: str | None = None,
+    usage_axis_scale: str = "default",
 ) -> list[str]:
     if width <= 14 or height <= 7:
         return [paint("终端空间不足", "dim")]
@@ -520,6 +655,21 @@ def split_token_usage_chart_lines(
     rows, columns = token_split_shape(width, height)
     widths = _partition_size(width - (columns - 1), columns)
     heights = _partition_size(height, rows)
+    shared_log_exponent: int | None = None
+    shared_rate_scale: tuple[int, str] | None = None
+    shared_log_ticks: tuple[int, ...] | None = None
+    if usage_axis_scale == "log":
+        shared_log_exponent, factor, unit = _shared_logarithmic_axis(
+            rate_series,
+            start_ts,
+            end_ts,
+            widths,
+        )
+        shared_rate_scale = factor, unit
+        shared_log_ticks = _logarithmic_tick_exponents(
+            shared_log_exponent,
+            min(max(2, cell_height - 4) for cell_height in heights),
+        )
     result: list[str] = []
     for row_index in range(rows):
         row_keys = TOKEN_KEYS[row_index * columns:(row_index + 1) * columns]
@@ -534,6 +684,10 @@ def split_token_usage_chart_lines(
                 heights[row_index],
                 curve_mode,
                 colors,
+                usage_axis_scale,
+                shared_log_exponent,
+                shared_rate_scale,
+                shared_log_ticks,
             )
             for column_index, key in enumerate(row_keys)
         ]
@@ -556,6 +710,7 @@ def token_usage_chart_lines(
     curve_mode: str,
     color_scheme: str | None = None,
     usage_panel_layout: str = "combined",
+    usage_axis_scale: str = "default",
 ) -> list[str]:
     if usage_panel_layout == "split":
         return split_token_usage_chart_lines(
@@ -566,26 +721,42 @@ def token_usage_chart_lines(
             height,
             curve_mode,
             color_scheme,
+            usage_axis_scale,
         )
     if width <= 14 or height <= 7:
         return [paint("终端空间不足", "dim")]
     colors = color_schemes.token_series_colors(key=color_scheme)
     start_ts, end_ts = token_chart_bounds(rate_series, period)
-    axis_width = 4
+    log_exponent: int | None = None
+    if usage_axis_scale == "log":
+        log_exponent, factor, unit = _shared_logarithmic_axis(
+            rate_series,
+            start_ts,
+            end_ts,
+            [width],
+        )
+        axis_width = _logarithmic_axis_width(log_exponent)
+    else:
+        axis_width = 4
     plot_width = max(2, width - axis_width - 4)
     chart_width = plot_width + 2
     chart_height = max(2, height - 5)
-    seconds_per_column = max(0, end_ts - start_ts) / max(1, plot_width)
-    factor, unit = token_rate_unit(seconds_per_column)
-    visible_max = _visible_max(
-        rate_series,
-        start_ts,
-        end_ts,
-        plot_width,
-        factor,
-        curve_mode in {"bar", "fine_bar"},
-    )
-    axis_max, exponent, tick_max = scientific_axis_max(visible_max)
+    if log_exponent is not None:
+        axis_max = float(10 ** log_exponent)
+        exponent = log_exponent
+        tick_max = axis_max
+    else:
+        seconds_per_column = max(0, end_ts - start_ts) / max(1, plot_width)
+        factor, unit = token_rate_unit(seconds_per_column)
+        visible_max = _visible_max(
+            rate_series,
+            start_ts,
+            end_ts,
+            plot_width,
+            factor,
+            curve_mode in {"bar", "fine_bar"},
+        )
+        axis_max, exponent, tick_max = scientific_axis_max(visible_max)
 
     if curve_mode == "bar":
         grid = _bar_grid(
@@ -598,6 +769,7 @@ def token_usage_chart_lines(
             factor,
             colors,
             TOKEN_STACK_KEYS,
+            log_exponent,
         )
     elif curve_mode == "fine_bar":
         grid = _fine_bar_grid(
@@ -610,10 +782,19 @@ def token_usage_chart_lines(
             factor,
             colors,
             TOKEN_STACK_KEYS,
+            log_exponent,
         )
     elif curve_mode == "braille":
         grid = _braille_grid(
-            rate_series, start_ts, end_ts, plot_width, chart_height, axis_max, factor, colors
+            rate_series,
+            start_ts,
+            end_ts,
+            plot_width,
+            chart_height,
+            axis_max,
+            factor,
+            colors,
+            log_exponent,
         )
     else:
         # Non-bar modes draw the four raw series independently.  Stacking is
@@ -628,15 +809,27 @@ def token_usage_chart_lines(
             factor,
             curve_mode,
             colors,
+            log_exponent,
         )
 
-    tick_ratios = (1.0, 0.8, 0.6, 0.4, 0.2, 0.0)
-    tick_rows = {
-        round((1.0 - ratio) * (chart_height - 1)): ratio
-        for ratio in tick_ratios
-    }
+    if log_exponent is not None:
+        tick_labels = _logarithmic_tick_rows(chart_height, log_exponent)
+    else:
+        tick_ratios = (1.0, 0.8, 0.6, 0.4, 0.2, 0.0)
+        tick_rows = {
+            round((1.0 - ratio) * (chart_height - 1)): ratio
+            for ratio in tick_ratios
+        }
+        ratio_labels = {
+            ratio: scientific_tick_label(tick_max * ratio)
+            for ratio in tick_ratios
+        }
+        tick_labels = {
+            row: ratio_labels[ratio]
+            for row, ratio in tick_rows.items()
+        }
     header_width = chart_width + 2
-    scale_text = f"{unit} ×10^{exponent}"
+    scale_text = f"{unit} 对数" if log_exponent is not None else f"{unit} ×10^{exponent}"
     legend_width = max(0, header_width - visible_width(scale_text) - 1)
     legend_text = compact_ansi(
         token_legend(
@@ -657,13 +850,8 @@ def token_usage_chart_lines(
         + fit_ansi(scale_text + " " * header_gap + legend_text, header_width)
     )
     lines.append((" " * axis_width) + paint("┌" + "─" * chart_width + "┐", "dim"))
-    ratio_labels = {
-        ratio: scientific_tick_label(tick_max * ratio)
-        for ratio in tick_ratios
-    }
     for row_index, plot in enumerate(grid):
-        ratio = tick_rows.get(row_index)
-        label = ratio_labels[ratio] if ratio is not None else ""
+        label = tick_labels.get(row_index, "")
         lines.append(
             paint(f"{label:>{axis_width - 1}} ", "dim")
             + paint("│", "dim")

@@ -21,23 +21,32 @@ from quota import check_codex_quota as quota
 from quota.codex_quota_sampler import compact_account
 from quota.quota_format import format_token_count, token_usage_rows
 from quota.token_usage_cache import DailyTokenUsageCacheReader
-from core.state import saved_usage_directory_scope, saved_usage_panel_layout
+from core.state import saved_usage_axis_scale, saved_usage_directory_scope, saved_usage_panel_layout
 from core.version import APP_VERSION, PACKAGE_VERSION
 from ui import color_schemes
 from ui.app import _render_main_content
 from ui.charts import series_chart_lines
 from ui.history import HistorySeriesIndex, inherit_snapshot_account_identity, metric_value_at
+from ui.models import MonitorState
 from ui.session_tokens import (
     ProjectTokenUsageMonitor,
     TokenUsageBreakdown,
     TrustedDirectoryTokenUsageMonitor,
 )
-from ui.settings import setting_items
+from ui.settings import render_sidebar, setting_items
 from ui.panels import account_summary_body
 from ui.terminal_text import plain_wrap, strip_ansi, visible_width
 from ui.token_charts import (
+    TOKEN_KEYS,
+    TOKEN_MARKERS,
+    TOKEN_PLOT_KEYS,
+    TOKEN_PRIORITIES,
+    TOKEN_STACK_KEYS,
+    _bar_grid,
+    _independent_grid,
     _single_token_chart_lines,
     _visible_max,
+    logarithmic_axis_exponent,
     scientific_axis_max,
     token_split_shape,
     token_rate_unit,
@@ -692,6 +701,8 @@ class TrustedDirectoryMonitorTests(unittest.TestCase):
         self.assertIsNone(saved_usage_directory_scope({"usage_directory_scope": "invalid"}))
         self.assertEqual(saved_usage_panel_layout({"usage_panel_layout": "split"}), "split")
         self.assertIsNone(saved_usage_panel_layout({"usage_panel_layout": "invalid"}))
+        self.assertEqual(saved_usage_axis_scale({"usage_axis_scale": "log"}), "log")
+        self.assertIsNone(saved_usage_axis_scale({"usage_axis_scale": "invalid"}))
 
 
 class LegacyTokenHistoryTests(unittest.TestCase):
@@ -735,7 +746,10 @@ class SettingsTests(unittest.TestCase):
     def test_display_scope_is_third_and_mode_specific_items_are_last(self) -> None:
         usage = self.keys("usage")
         self.assertEqual(usage[:3], ["interval", "period", "display_scope"])
-        self.assertEqual(usage[-2:], ["usage_directory_scope", "usage_panel_layout"])
+        self.assertEqual(
+            usage[-3:],
+            ["usage_directory_scope", "usage_panel_layout", "usage_axis_scale"],
+        )
         self.assertNotIn("window_scope", usage)
 
         for display_scope in ("all", "current", "merged"):
@@ -745,6 +759,31 @@ class SettingsTests(unittest.TestCase):
                 self.assertEqual(quota[-1], "window_scope")
                 self.assertNotIn("usage_directory_scope", quota)
                 self.assertNotIn("usage_panel_layout", quota)
+                self.assertNotIn("usage_axis_scale", quota)
+
+    def test_usage_axis_scale_choices_are_available(self) -> None:
+        state = SimpleNamespace(display_scope="usage")
+        choices = next(
+            choices for key, _title, choices in setting_items(state) if key == "usage_axis_scale"
+        )
+        self.assertEqual(choices, [("默认", "default"), ("对数坐标轴", "log")])
+
+    def test_usage_axis_scale_is_visible_in_a_standard_height_sidebar(self) -> None:
+        state = MonitorState(
+            period="5m",
+            interval=60,
+            tz="Asia/Shanghai",
+            log_path=Path("/tmp/codextop-test/quota.jsonl"),
+            restore_interval=60,
+            state_path=Path("/tmp/codextop-test/state.json"),
+            curve_mode="connected",
+            display_scope="usage",
+            window_scope="both",
+            color_scheme="classic",
+        )
+        plain = "\n".join(strip_ansi(line) for line in render_sidebar(state, 21, 35, 100, []))
+        self.assertIn("坐标轴", plain)
+        self.assertIn("默认", plain)
 
     def test_fine_bar_style_and_release_version_are_available(self) -> None:
         state = SimpleNamespace(display_scope="usage")
@@ -752,10 +791,61 @@ class SettingsTests(unittest.TestCase):
             choices for key, _title, choices in setting_items(state) if key == "curve_mode"
         )
         self.assertIn(("精细柱状", "fine_bar"), curve_choices)
-        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("2.3.1", "v2.3.1"))
+        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("2.3.2", "v2.3.2"))
 
 
 class TokenChartTests(unittest.TestCase):
+    def test_combined_plot_order_changes_without_reordering_labels(self) -> None:
+        self.assertEqual(TOKEN_KEYS, ("input", "cached", "output", "total"))
+        self.assertEqual(TOKEN_PLOT_KEYS, ("output", "input", "cached", "total"))
+        self.assertEqual(TOKEN_STACK_KEYS, ("output", "input", "cached"))
+        self.assertEqual(
+            [TOKEN_PRIORITIES[key] for key in TOKEN_PLOT_KEYS],
+            [1, 2, 3, 4],
+        )
+
+        colors = {key: key for key in TOKEN_KEYS}
+        for lower, upper in zip(TOKEN_PLOT_KEYS, TOKEN_PLOT_KEYS[1:]):
+            with self.subTest(lower=lower, upper=upper):
+                grid = _independent_grid(
+                    {
+                        lower: [{"t": 0, "value": 5.0}],
+                        upper: [{"t": 0, "value": 5.0}],
+                    },
+                    0,
+                    0,
+                    1,
+                    2,
+                    10.0,
+                    1,
+                    "points",
+                    colors,
+                )
+                self.assertIn(TOKEN_MARKERS[upper], "".join(strip_ansi(line) for line in grid))
+
+    def test_combined_bar_stack_places_output_at_the_bottom(self) -> None:
+        series = {
+            key: [{"t": 0, "value": 1.0}]
+            for key in TOKEN_STACK_KEYS
+        }
+        colors = {key: key for key in TOKEN_KEYS}
+        with patch(
+            "ui.token_charts.paint",
+            side_effect=lambda text, color, **_kwargs: f"{color}:{text}",
+        ):
+            grid = _bar_grid(
+                series,
+                0,
+                0,
+                1,
+                4,
+                3.0,
+                1,
+                colors,
+                TOKEN_STACK_KEYS,
+            )
+        self.assertEqual(grid, ["cached:█", "cached:█", "input:█", "output:█"])
+
     def test_usage_mode_restores_outer_panel_border(self) -> None:
         state = SimpleNamespace(
             token_monitor=SimpleNamespace(
@@ -767,6 +857,7 @@ class TokenChartTests(unittest.TestCase):
             curve_mode="connected",
             color_scheme="classic",
             usage_panel_layout="split",
+            usage_axis_scale="default",
         )
         with patch("ui.token_charts.time.time", return_value=1_120):
             lines, width, height = _render_main_content(
@@ -882,6 +973,105 @@ class TokenChartTests(unittest.TestCase):
         labels = [strip_ansi(line)[:4].strip() for line in lines]
         self.assertTrue({"2.5", "2", "1.5", "1", ".5", "0"}.issubset(set(labels)))
 
+    def test_logarithmic_axis_uses_a_power_of_ten_ceiling_with_six_minimum(self) -> None:
+        self.assertEqual(logarithmic_axis_exponent(0), 6)
+        self.assertEqual(logarithmic_axis_exponent(999_999), 6)
+        self.assertEqual(logarithmic_axis_exponent(1_000_000), 6)
+        self.assertEqual(logarithmic_axis_exponent(1_000_001), 7)
+        self.assertEqual(logarithmic_axis_exponent(100_000_000), 8)
+
+    def test_logarithmic_split_charts_share_total_series_axis_ticks(self) -> None:
+        series = {
+            "input": [{"t": 1_000, "value": 100.0}, {"t": 1_060, "value": 0.0}],
+            "cached": [{"t": 1_000, "value": 200.0}, {"t": 1_060, "value": 0.0}],
+            "output": [{"t": 1_000, "value": 50.0}, {"t": 1_060, "value": 0.0}],
+            "total": [{"t": 1_000, "value": 20_000.0}, {"t": 1_060, "value": 0.0}],
+        }
+        with patch("ui.token_charts.time.time", return_value=1_120):
+            lines = token_usage_chart_lines(
+                series,
+                TokenUsageBreakdown(30_000, 20_000, 5_000, 1_000, 35_000),
+                "5m",
+                100,
+                36,
+                "connected",
+                "classic",
+                "split",
+                "log",
+            )
+        plain = "\n".join(strip_ansi(line) for line in lines)
+        for exponent in range(8):
+            self.assertEqual(plain.count(f"10^{exponent}"), 4)
+        self.assertNotIn("10^8", plain)
+        self.assertEqual(plain.count("tok/min 对数"), 4)
+
+    def test_logarithmic_combined_chart_starts_at_ten_to_zero(self) -> None:
+        with patch("ui.token_charts.time.time", return_value=1_120):
+            lines = token_usage_chart_lines(
+                self.rate_series(),
+                TokenUsageBreakdown(3_000, 2_000, 500, 100, 3_500),
+                "5m",
+                100,
+                24,
+                "connected",
+                "classic",
+                "combined",
+                "log",
+            )
+        plain = [strip_ansi(line) for line in lines]
+        axis_lines = [line for line in plain if "│" in line]
+        self.assertTrue(axis_lines[0].lstrip().startswith("10^6 "))
+        self.assertTrue(axis_lines[-1].lstrip().startswith("10^0 "))
+        self.assertIn("tok/min 对数", "\n".join(plain))
+
+    def test_logarithmic_axis_uses_the_true_visible_total_maximum(self) -> None:
+        series = {
+            "input": [],
+            "cached": [],
+            "output": [],
+            "total": [
+                {"t": 1_001, "value": 20_000.0},
+                {"t": 1_002, "value": 0.0},
+            ],
+        }
+        with patch("ui.token_charts.time.time", return_value=1_120):
+            lines = token_usage_chart_lines(
+                series,
+                None,
+                "5m",
+                100,
+                24,
+                "connected",
+                "classic",
+                "combined",
+                "log",
+            )
+        plain = "\n".join(strip_ansi(line) for line in lines)
+        self.assertIn("10^7", plain)
+        self.assertNotIn("10^8", plain)
+
+    def test_all_usage_curve_modes_render_on_logarithmic_axes(self) -> None:
+        latest = TokenUsageBreakdown(3_000, 2_000, 500, 100, 3_500)
+        with patch("ui.token_charts.time.time", return_value=1_030):
+            for layout in ("combined", "split"):
+                for mode in ("connected", "points", "braille", "box", "bar", "fine_bar"):
+                    with self.subTest(layout=layout, mode=mode):
+                        lines = token_usage_chart_lines(
+                            self.rate_series(),
+                            latest,
+                            "5m",
+                            100,
+                            36,
+                            mode,
+                            "classic",
+                            layout,
+                            "log",
+                        )
+                        plain = "\n".join(strip_ansi(line) for line in lines)
+                        self.assertIn("10^6", plain)
+                        self.assertIn("10^0", plain)
+                        self.assertTrue(all(visible_width(line) <= 100 for line in lines))
+
     def test_token_header_places_scale_left_and_legend_right_one_row_lower(self) -> None:
         with patch("ui.token_charts.time.time", return_value=1_120):
             lines = token_usage_chart_lines(
@@ -915,6 +1105,9 @@ class TokenChartTests(unittest.TestCase):
         self.assertIn("▲ 输出 300 (500)", header)
         self.assertIn("■ 总量 2.1K (3.5K)", header)
         self.assertNotIn("●输入", header)
+        self.assertLess(header.index("输入"), header.index("缓存"))
+        self.assertLess(header.index("缓存"), header.index("输出"))
+        self.assertLess(header.index("输出"), header.index("总量"))
 
     def test_unit_boundary_is_strictly_greater_than_fifteen_minutes(self) -> None:
         self.assertEqual(token_rate_unit(899.9), (60, "tok/min"))

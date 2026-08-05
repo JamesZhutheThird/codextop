@@ -30,6 +30,7 @@ from core.state import (
     saved_display_scope,
     saved_interval,
     saved_period,
+    saved_usage_axis_scale,
     saved_usage_directory_scope,
     saved_usage_panel_layout,
     saved_window_scope,
@@ -69,6 +70,7 @@ def _render_main_content(
                 state.curve_mode,
                 state.color_scheme,
                 state.usage_panel_layout,
+                getattr(state, "usage_axis_scale", DEFAULT_USAGE_AXIS_SCALE),
             )
         left_lines = panel(
             "Token 用量",
@@ -363,6 +365,7 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
         state.window_scope,
         state.usage_directory_scope,
         state.usage_panel_layout,
+        getattr(state, "usage_axis_scale", DEFAULT_USAGE_AXIS_SCALE),
         state.color_scheme,
         state.summary_offset,
         state.history_preload_waiting,
@@ -522,6 +525,12 @@ def main() -> int:
         default=None,
         help="Token 用量面板布局：combined 合并图，split 四图拆分。",
     )
+    parser.add_argument(
+        "--usage-axis-scale",
+        choices=[value for _label, value in USAGE_AXIS_SCALE_CHOICES],
+        default=None,
+        help="Token 用量坐标轴：default 默认坐标轴，log 对数坐标轴。",
+    )
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR, help="quota 历史日志目录。")
     parser.add_argument("--log-file", default=DEFAULT_LOG_FILE, help="quota 历史日志基础文件名，用于匹配月度日志。")
     parser.add_argument("--control-file", default=DEFAULT_CONTROL_FILE, help="后台 sampler 控制文件名。")
@@ -549,6 +558,11 @@ def main() -> int:
         or saved_usage_panel_layout(saved_state)
         or DEFAULT_USAGE_PANEL_LAYOUT
     )
+    selected_usage_axis_scale = (
+        args.usage_axis_scale
+        or saved_usage_axis_scale(saved_state)
+        or DEFAULT_USAGE_AXIS_SCALE
+    )
     state = MonitorState(
         period=args.period or saved_period(saved_state) or DEFAULT_PERIOD,
         interval=args.interval if args.interval is not None else (saved_interval(saved_state) or restore_interval),
@@ -562,6 +576,7 @@ def main() -> int:
         color_scheme=selected_color_scheme,
         usage_directory_scope=selected_usage_directory_scope,
         usage_panel_layout=selected_usage_panel_layout,
+        usage_axis_scale=selected_usage_axis_scale,
         control_path=control_path,
         update_check_path=update_check_path(runtime_paths.settings_dir),
         token_monitor=TrustedDirectoryTokenUsageMonitor(

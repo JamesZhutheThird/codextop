@@ -20,6 +20,7 @@ DEFAULT_DISPLAY_SCOPE = "all"
 DEFAULT_WINDOW_SCOPE = "both"
 DEFAULT_USAGE_DIRECTORY_SCOPE = "current"
 DEFAULT_USAGE_PANEL_LAYOUT = "combined"
+DEFAULT_USAGE_AXIS_SCALE = "default"
 DEFAULT_COLOR_SCHEME = color_schemes.default_color_scheme_key()
 INTERVAL_CHOICES = [
     ("5s", 5),
@@ -52,6 +53,10 @@ USAGE_DIRECTORY_SCOPE_CHOICES = [
 USAGE_PANEL_LAYOUT_CHOICES = [
     ("合并", "combined"),
     ("拆分", "split"),
+]
+USAGE_AXIS_SCALE_CHOICES = [
+    ("默认", "default"),
+    ("对数坐标轴", "log"),
 ]
 WINDOW_SCOPE_CHOICES = [
     ("同时", "both"),
