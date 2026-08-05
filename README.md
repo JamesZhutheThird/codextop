@@ -14,7 +14,7 @@
 </tr>
 </table>
 
-<strong>CodexTOP：本地 Codex 多账号额度用量监控工具</strong>
+<strong>CodexTOP：本地 Codex 多账号额度用量监控与管理工具</strong>
 
 基于 Rich 的可点击交互终端界面。
 </div>

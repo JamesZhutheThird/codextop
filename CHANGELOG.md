@@ -1,5 +1,10 @@
 # 更新日志
 
+## v2.3.3 - 2026-08-05
+
+- 修复共享服务器多用户运行服务导致的账号无法切换问题，CodexAuth 只会检查当前用户的 Codex 进程。（[#1](https://github.com/JamesZhutheThird/codextop/pull/1) [@Peng-yuWang](https://github.com/Peng-yuWang)）
+- 把之前的两个测试脚本也一并上传了。
+
 ## v2.3.2 - 2026-08-05
 
 - 用量模式体验优化，新增对数坐标轴。
