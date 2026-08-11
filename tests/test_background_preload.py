@@ -179,6 +179,21 @@ class BackgroundPreloadTests(unittest.TestCase):
             self.assertFalse(state.history_preload_waiting)
             self.assertFalse(preloader.history_scheduled)
 
+    def test_ready_history_is_adopted_for_usage_border_color(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            result = empty_history_result(root)
+            preloader = preloader_for(root, history_loader=lambda: result)
+            preloader.start("usage", "all")
+            preloader.wait(2)
+            state = state_for_test(root, "usage", preloader=preloader)
+
+            render_frame(state, 120, 36)
+
+            self.assertIs(state.history_cache, result.cache)
+            self.assertIs(state.records, result.records)
+            self.assertFalse(preloader.history_scheduled)
+
     def test_ready_token_monitor_is_adopted_before_usage_render(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

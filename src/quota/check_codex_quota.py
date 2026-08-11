@@ -30,6 +30,15 @@ from core.paths import (
     ensure_runtime_layout,
     normalize_auth_keyword,
 )
+from core.constants import HTTP_401_CREDENTIAL_HINT, RESET_CREDITS_INTERVAL_SECONDS
+from quota.reset_credits_cache import (
+    cached_reset_credits_payload,
+    compatible_reset_credits_entry,
+    read_reset_credits_cache,
+    reset_credits_query_due,
+    sanitize_reset_credits_payload,
+    write_reset_credits_cache,
+)
 from quota.token_usage_cache import (
     TOKEN_USAGE_CACHE_TTL_SECONDS,
     cached_token_usage,
@@ -96,7 +105,11 @@ def get_json(
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except HTTPError as exc:
-        if exc.code in {401, 403}:
+        if exc.code == 401:
+            raise RuntimeError(
+                f"request denied with HTTP 401\n{HTTP_401_CREDENTIAL_HINT}"
+            ) from exc
+        if exc.code == 403:
             raise RuntimeError(
                 f"request denied with HTTP {exc.code}; run `codex login` or refresh the local Codex credential"
             ) from exc
@@ -327,11 +340,16 @@ def collect_quota(auth_path: Path, tz_name: str) -> dict[str, Any]:
     with ThreadPoolExecutor(max_workers=2) as executor:
         usage_future = executor.submit(get_json, USAGE_URL, access_token)
         credits_future = executor.submit(get_json, RESET_CREDITS_URL, access_token)
-        return normalize_quota_report(
-            usage_future.result(),
-            credits_future.result(),
-            tz_name,
-        )
+        reset_credits_error = None
+        try:
+            credits_payload = sanitize_reset_credits_payload(credits_future.result())
+        except Exception as exc:
+            credits_payload = {}
+            reset_credits_error = str(exc)
+        report = normalize_quota_report(usage_future.result(), credits_payload, tz_name)
+        if reset_credits_error:
+            report["reset_credits_error"] = reset_credits_error
+        return report
 
 
 def count_by_status(credits: list[Any]) -> dict[str, int]:
@@ -466,13 +484,23 @@ def collect_accounts(
     token_cache_path: Path | None = None,
     observed_epoch: int | None = None,
     token_cache_ttl_seconds: int = TOKEN_USAGE_CACHE_TTL_SECONDS,
+    reset_credits_cache_path: Path | None = None,
+    reset_credits_interval_seconds: int = RESET_CREDITS_INTERVAL_SECONDS,
+    query_reset_credits: bool = True,
 ) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     observed_epoch = int(datetime.now(timezone.utc).timestamp()) if observed_epoch is None else int(observed_epoch)
     token_cache = read_token_usage_cache(token_cache_path) if token_cache_path is not None else None
     cache_accounts = token_cache.get("accounts") if isinstance(token_cache, dict) else None
+    reset_cache = (
+        read_reset_credits_cache(reset_credits_cache_path)
+        if reset_credits_cache_path is not None
+        else None
+    )
+    reset_cache_accounts = reset_cache.get("accounts") if isinstance(reset_cache, dict) else None
     request_count = max(1, len(configs) * 3)
     cache_changed = False
+    reset_cache_changed = False
     with ThreadPoolExecutor(max_workers=min(MAX_QUERY_WORKERS, request_count)) as executor:
         for index, path in configs:
             report: dict[str, Any] = {
@@ -521,14 +549,32 @@ def collect_accounts(
                     30,
                     headers,
                 )
+            reset_cache_entry = (
+                compatible_reset_credits_entry(reset_cache, index, account_id)
+                if reset_cache is not None
+                else None
+            )
+            reset_payload = cached_reset_credits_payload(reset_cache_entry)
+            credits_future = None
+            if query_reset_credits and (
+                reset_cache is None
+                or reset_credits_query_due(
+                    reset_cache_entry,
+                    observed_epoch,
+                    reset_credits_interval_seconds,
+                )
+            ):
+                credits_future = executor.submit(get_json, RESET_CREDITS_URL, access_token)
             entries.append(
                 {
                     "report": report,
                     "index": index,
                     "account_id": account_id,
                     "cache_entry": cache_entry,
+                    "reset_cache_entry": reset_cache_entry,
+                    "reset_payload": reset_payload,
                     "usage": executor.submit(get_json, USAGE_URL, access_token),
-                    "credits": executor.submit(get_json, RESET_CREDITS_URL, access_token),
+                    "credits": credits_future,
                     "tokens": token_future,
                 }
             )
@@ -561,12 +607,31 @@ def collect_accounts(
                 cache_accounts[str(entry["index"])] = updated_entry
             usage_future = entry.get("usage")
             credits_future = entry.get("credits")
-            if usage_future is None or credits_future is None:
+            if usage_future is None:
                 continue
+            reset_payload = entry.get("reset_payload")
+            if credits_future is not None:
+                stored_reset = entry.get("reset_cache_entry")
+                updated_reset = dict(stored_reset) if isinstance(stored_reset, dict) else {}
+                if entry.get("account_id"):
+                    updated_reset["account_id"] = entry["account_id"]
+                updated_reset["attempted_at_epoch"] = observed_epoch
+                try:
+                    reset_payload = sanitize_reset_credits_payload(credits_future.result())
+                    updated_reset["checked_at_epoch"] = observed_epoch
+                    updated_reset["payload"] = reset_payload
+                    updated_reset.pop("error", None)
+                except Exception as exc:
+                    message = str(exc)
+                    report["reset_credits_error"] = message
+                    updated_reset["error"] = message
+                if isinstance(reset_cache_accounts, dict):
+                    reset_cache_accounts[str(entry["index"])] = updated_reset
+                    reset_cache_changed = True
             try:
                 normalized = normalize_quota_report(
                     usage_future.result(),
-                    credits_future.result(),
+                    reset_payload if isinstance(reset_payload, dict) else {},
                     tz_name,
                 )
                 for key in ("email", "plan_type"):
@@ -598,11 +663,73 @@ def collect_accounts(
                 report = entry["report"]
                 report.setdefault("token_usage_error", f"cannot write daily token cache: {exc}")
 
+    if (
+        reset_cache_changed
+        and reset_credits_cache_path is not None
+        and reset_cache is not None
+    ):
+        try:
+            write_reset_credits_cache(reset_credits_cache_path, reset_cache)
+        except Exception as exc:
+            for entry in entries:
+                report = entry["report"]
+                report.setdefault("reset_credits_error", f"cannot write reset credits cache: {exc}")
+
     accounts = [entry["report"] for entry in entries]
     return {
         "current_index": current_index,
         "accounts": accounts,
     }
+
+
+def refresh_reset_credits_cache(
+    configs: list[tuple[str, Path]],
+    cache_path: Path,
+    observed_epoch: int | None = None,
+) -> dict[str, str]:
+    """Refresh reset credits without blocking or invalidating quota usage samples."""
+    observed_epoch = int(datetime.now(timezone.utc).timestamp()) if observed_epoch is None else int(observed_epoch)
+    cache = read_reset_credits_cache(cache_path)
+    accounts = cache.get("accounts")
+    if not isinstance(accounts, dict):
+        accounts = {}
+        cache["accounts"] = accounts
+    errors: dict[str, str] = {}
+    pending: list[tuple[str, str | None, dict[str, Any] | None, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(MAX_QUERY_WORKERS, max(1, len(configs)))) as executor:
+        for index, path in configs:
+            raw_entry = accounts.get(str(index))
+            try:
+                access_token, account_id = load_auth_credentials(path)
+            except Exception as exc:
+                message = str(exc)
+                updated = dict(raw_entry) if isinstance(raw_entry, dict) else {}
+                updated["attempted_at_epoch"] = observed_epoch
+                updated["error"] = message
+                accounts[str(index)] = updated
+                errors[str(index)] = message
+                continue
+            cache_entry = compatible_reset_credits_entry(cache, index, account_id)
+            future = executor.submit(get_json, RESET_CREDITS_URL, access_token)
+            pending.append((index, account_id, cache_entry, future))
+
+        for index, account_id, cache_entry, future in pending:
+            updated = dict(cache_entry) if isinstance(cache_entry, dict) else {}
+            if account_id:
+                updated["account_id"] = account_id
+            updated["attempted_at_epoch"] = observed_epoch
+            try:
+                updated["payload"] = sanitize_reset_credits_payload(future.result())
+                updated["checked_at_epoch"] = observed_epoch
+                updated.pop("error", None)
+            except Exception as exc:
+                message = str(exc)
+                updated["error"] = message
+                errors[str(index)] = message
+            accounts[str(index)] = updated
+
+    write_reset_credits_cache(cache_path, cache)
+    return errors
 
 
 def print_text(report: dict[str, Any]) -> None:

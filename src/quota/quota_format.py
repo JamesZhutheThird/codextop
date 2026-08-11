@@ -20,7 +20,12 @@ def is_current(account: dict[str, Any]) -> bool:
 
 def account_error(account: dict[str, Any]) -> str | None:
     error = account.get("error", account.get("err"))
-    return str(error) if error else None
+    if not error:
+        return None
+    rendered = str(error)
+    if "HTTP 401" in rendered and HTTP_401_CREDENTIAL_HINT not in rendered:
+        rendered = f"{rendered}\n{HTTP_401_CREDENTIAL_HINT}"
+    return rendered
 
 
 def account_email(account: dict[str, Any]) -> str:
@@ -107,7 +112,8 @@ def reset_rows(account: dict[str, Any], width: int) -> list[str]:
         ]
         rows.append(center_ansi(f"剩余 {available if isinstance(available, int) else '-'} 次可用重置次数", width))
         if not credits:
-            rows.append(center_ansi(paint("无可用重置次数", "dim"), width))
+            detail = "无可用重置次数" if available == 0 else "额度详情暂无新数据"
+            rows.append(center_ansi(paint(detail, "dim"), width))
             return rows
         reset_items: list[tuple[str, Any, Any]] = []
         for credit in credits[:4]:
@@ -124,7 +130,8 @@ def reset_rows(account: dict[str, Any], width: int) -> list[str]:
     credits = account.get("r", [])
     rows.append(center_ansi(f"剩余 {available if isinstance(available, int) else '-'} 次可用重置次数", width))
     if not credits:
-        rows.append(center_ansi(paint("无可用重置次数", "dim"), width))
+        detail = "无可用重置次数" if available == 0 else "额度详情暂无新数据"
+        rows.append(center_ansi(paint(detail, "dim"), width))
         return rows
     now = int(time.time())
     reset_items: list[tuple[str, Any, Any]] = []

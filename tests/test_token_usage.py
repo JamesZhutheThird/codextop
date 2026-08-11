@@ -11,6 +11,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 
@@ -19,14 +20,21 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from quota import check_codex_quota as quota
 from quota.codex_quota_sampler import compact_account
-from quota.quota_format import format_token_count, token_usage_rows
+from quota.quota_format import account_error, format_token_count, merged_window_info, token_usage_rows
+from quota.reset_credits_cache import read_reset_credits_cache
 from quota.token_usage_cache import DailyTokenUsageCacheReader
+from core.constants import HTTP_401_CREDENTIAL_HINT, HTTP_429_FALLBACK_SECONDS
+from core.project_config import (
+    DEFAULT_HTTP_429_FALLBACK_SECONDS,
+    DEFAULT_RESET_CREDITS_INTERVAL_SECONDS,
+    load_project_config,
+)
 from core.state import saved_usage_axis_scale, saved_usage_directory_scope, saved_usage_panel_layout
 from core.version import APP_VERSION, PACKAGE_VERSION
 from ui import color_schemes
 from ui.app import _render_main_content
 from ui.charts import series_chart_lines
-from ui.history import HistorySeriesIndex, inherit_snapshot_account_identity, metric_value_at
+from ui.history import IncrementalHistoryCache, HistorySeriesIndex, inherit_snapshot_account_identity, metric_value_at
 from ui.models import MonitorState
 from ui.session_tokens import (
     ProjectTokenUsageMonitor,
@@ -34,7 +42,7 @@ from ui.session_tokens import (
     TrustedDirectoryTokenUsageMonitor,
 )
 from ui.settings import render_sidebar, setting_items
-from ui.panels import account_summary_body
+from ui.panels import account_summary_body, current_account_border_color, merged_account_reset_body
 from ui.terminal_text import plain_wrap, strip_ansi, visible_width
 from ui.token_charts import (
     TOKEN_KEYS,
@@ -103,6 +111,23 @@ class CollectionTests(unittest.TestCase):
         self.assertLess(rendered.index("email: codex@example.com"), rendered.index("error: quota unavailable"))
         self.assertLess(rendered.index("plan_type: plus"), rendered.index("error: quota unavailable"))
 
+    def test_http_401_error_adds_codexauth_refresh_hint_on_a_new_line(self) -> None:
+        denied = HTTPError(quota.USAGE_URL, 401, "Unauthorized", None, None)
+        with (
+            patch.object(quota, "urlopen", side_effect=denied),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            quota.get_json(quota.USAGE_URL, "secret")
+
+        self.assertEqual(
+            str(raised.exception).splitlines(),
+            ["request denied with HTTP 401", HTTP_401_CREDENTIAL_HINT],
+        )
+        self.assertEqual(
+            account_error({"err": "request denied with HTTP 401"}).splitlines(),
+            ["request denied with HTTP 401", HTTP_401_CREDENTIAL_HINT],
+        )
+
     def test_two_quota_endpoints_are_bounded_and_concurrent(self) -> None:
         active = 0
         peak = 0
@@ -156,6 +181,135 @@ class CollectionTests(unittest.TestCase):
         self.assertNotIn("error", account)
         self.assertEqual(set(urls), {quota.USAGE_URL, quota.RESET_CREDITS_URL})
         self.assertEqual(account["quota"]["7d"]["remaining_percent"], 60)
+
+    def test_reset_credit_failure_does_not_discard_fresh_usage(self) -> None:
+        def fake_get_json(url: str, _token: str, *_args) -> dict:
+            if url == quota.USAGE_URL:
+                return quota_payload()
+            raise RuntimeError("request failed with HTTP 429")
+
+        with (
+            patch.object(quota, "load_auth_credentials", return_value=("secret", "account")),
+            patch.object(quota, "get_json", side_effect=fake_get_json),
+        ):
+            account = quota.collect_accounts(
+                [("openai-1", Path("one"))],
+                "openai-1",
+                "Asia/Shanghai",
+            )["accounts"][0]
+
+        self.assertNotIn("error", account)
+        self.assertEqual(account["quota"]["5h"]["remaining_percent"], 80)
+        self.assertEqual(account["reset_credits"]["available_count"], None)
+        self.assertEqual(account["reset_credits_error"], "request failed with HTTP 429")
+        compact = compact_account(account, 1_000)
+        self.assertEqual(compact["q"]["5h"][0], 80)
+        self.assertNotIn("err", compact)
+
+    def test_reset_credits_refresh_is_cached_and_usage_queries_remain_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "reset_credits.json"
+            calls = {"usage": 0, "reset": 0}
+            reset_should_fail = False
+
+            def fake_get_json(url: str, _token: str, *_args) -> dict:
+                if url == quota.USAGE_URL:
+                    calls["usage"] += 1
+                    return quota_payload()
+                if url == quota.RESET_CREDITS_URL:
+                    calls["reset"] += 1
+                    if reset_should_fail:
+                        raise RuntimeError("request failed with HTTP 429")
+                    return {
+                        "available_count": 2,
+                        "total_earned_count": 3,
+                        "credits": [],
+                    }
+                raise AssertionError(url)
+
+            configs = [("openai-1", Path("one"))]
+            with (
+                patch.object(quota, "load_auth_credentials", return_value=("secret", "account")),
+                patch.object(quota, "get_json", side_effect=fake_get_json),
+            ):
+                self.assertEqual(
+                    quota.refresh_reset_credits_cache(configs, cache_path, observed_epoch=1_000),
+                    {},
+                )
+                first = quota.collect_accounts(
+                    configs,
+                    "openai-1",
+                    "Asia/Shanghai",
+                    observed_epoch=1_001,
+                    reset_credits_cache_path=cache_path,
+                    query_reset_credits=False,
+                )["accounts"][0]
+                second = quota.collect_accounts(
+                    configs,
+                    "openai-1",
+                    "Asia/Shanghai",
+                    observed_epoch=1_006,
+                    reset_credits_cache_path=cache_path,
+                    query_reset_credits=False,
+                )["accounts"][0]
+                reset_should_fail = True
+                errors = quota.refresh_reset_credits_cache(
+                    configs,
+                    cache_path,
+                    observed_epoch=1_060,
+                )
+                third = quota.collect_accounts(
+                    configs,
+                    "openai-1",
+                    "Asia/Shanghai",
+                    observed_epoch=1_061,
+                    reset_credits_cache_path=cache_path,
+                    query_reset_credits=False,
+                )["accounts"][0]
+
+            self.assertEqual(calls, {"usage": 3, "reset": 2})
+            self.assertEqual(first["reset_credits"]["available_count"], 2)
+            self.assertEqual(second["reset_credits"]["available_count"], 2)
+            self.assertEqual(third["reset_credits"]["available_count"], 2)
+            self.assertEqual(errors, {"openai-1": "request failed with HTTP 429"})
+            cached = read_reset_credits_cache(cache_path)["accounts"]["openai-1"]
+            self.assertEqual(cached["checked_at_epoch"], 1_000)
+            self.assertEqual(cached["attempted_at_epoch"], 1_060)
+            self.assertEqual(cached["payload"]["available_count"], 2)
+
+    def test_project_config_controls_reset_and_429_intervals(self) -> None:
+        configured = load_project_config(ROOT / "pyproject.toml")
+        self.assertEqual(configured.reset_credits_interval_seconds, 60)
+        self.assertEqual(configured.http_429_fallback_seconds, 600)
+        self.assertEqual(HTTP_429_FALLBACK_SECONDS, configured.http_429_fallback_seconds)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "pyproject.toml"
+            config_path.write_text(
+                "[tool.codextop]\n"
+                "reset_credits_interval_seconds = 90\n"
+                "http_429_fallback_seconds = 240\n",
+                encoding="utf-8",
+            )
+            custom = load_project_config(config_path)
+            self.assertEqual(custom.reset_credits_interval_seconds, 90)
+            self.assertEqual(custom.http_429_fallback_seconds, 240)
+
+            config_path.write_text(
+                "[tool.codextop]\n"
+                "reset_credits_interval_seconds = 0\n"
+                "http_429_fallback_seconds = false\n",
+                encoding="utf-8",
+            )
+            invalid = load_project_config(config_path)
+            self.assertEqual(
+                invalid.reset_credits_interval_seconds,
+                DEFAULT_RESET_CREDITS_INTERVAL_SECONDS,
+            )
+            self.assertEqual(
+                invalid.http_429_fallback_seconds,
+                DEFAULT_HTTP_429_FALLBACK_SECONDS,
+            )
 
     def test_daily_token_total_queries_once_per_24_hours(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -314,14 +468,196 @@ class CollectionTests(unittest.TestCase):
     def test_snapshot_identity_falls_back_to_previous_values(self) -> None:
         previous = {
             "t": 1,
-            "a": [{"i": "openai-1", "email": "codex@example.com", "plan": "plus"}],
+            "a": [
+                {
+                    "i": "openai-1",
+                    "email": "codex@example.com",
+                    "plan": "plus",
+                    "rc": 1,
+                    "r": [["Full reset", 2_000, 50]],
+                }
+            ],
         }
-        current = {"t": 2, "a": [{"i": "openai-1", "err": "temporarily unavailable"}]}
+        current = {
+            "t": 2,
+            "a": [{"i": "openai-1", "rc": None, "r": [], "err": "temporarily unavailable"}],
+        }
 
         inherit_snapshot_account_identity(current, previous)
 
         self.assertEqual(current["a"][0]["email"], "codex@example.com")
         self.assertEqual(current["a"][0]["plan"], "plus")
+        self.assertEqual(current["a"][0]["rc"], 1)
+        self.assertEqual(current["a"][0]["r"], [["Full reset", 2_000, 50]])
+
+        confirmed_empty = {"t": 3, "a": [{"i": "openai-1", "rc": 0, "r": []}]}
+        inherit_snapshot_account_identity(confirmed_empty, current)
+        self.assertEqual(confirmed_empty["a"][0]["rc"], 0)
+        self.assertEqual(confirmed_empty["a"][0]["r"], [])
+
+    def test_reset_credits_fallback_has_no_time_limit(self) -> None:
+        cache = IncrementalHistoryCache(Path("quota_snapshots.jsonl"), "Asia/Shanghai")
+        cache._process_batch(
+            [
+                {
+                    "t": 100,
+                    "a": [
+                        {
+                            "i": "openai-1",
+                            "q": {"7d": [80, 2_000, 1_900, 604_800]},
+                            "rc": 1,
+                            "r": [["Full reset", 2_000, 50]],
+                        }
+                    ],
+                },
+                {
+                    "t": 31_536_100,
+                    "a": [
+                        {
+                            "i": "openai-1",
+                            "q": {"7d": [70, 32_000_000, 463_900, 604_800]},
+                            "rc": None,
+                            "r": [],
+                        }
+                    ],
+                },
+            ]
+        )
+        self.assertEqual(cache.records[-1]["a"][0]["rc"], 1)
+
+        cache._process_batch(
+            [
+                {
+                    "t": 31_536_110,
+                    "a": [
+                        {
+                            "i": "openai-1",
+                            "q": {"7d": [70, 32_000_000, 463_890, 604_800]},
+                            "rc": 0,
+                            "r": [],
+                        }
+                    ],
+                }
+            ]
+        )
+        self.assertEqual(cache.records[-1]["a"][0]["rc"], 0)
+
+    def test_http_429_uses_last_success_for_ten_minutes_then_reports_staleness(self) -> None:
+        cache = IncrementalHistoryCache(Path("quota_snapshots.jsonl"), "Asia/Shanghai")
+        success = {
+            "t": 100,
+            "current": "openai-1",
+            "a": [
+                {
+                    "i": "openai-1",
+                    "cur": True,
+                    "email": "codex@example.com",
+                    "plan": "plus",
+                    "q": {"7d": [87, 2_000, 1_900, 604_800]},
+                    "rc": 2,
+                    "r": [],
+                }
+            ],
+        }
+        failed = {
+            "t": 200,
+            "current": "openai-1",
+            "a": [
+                {
+                    "i": "openai-1",
+                    "cur": True,
+                    "email": "codex@example.com",
+                    "plan": "plus",
+                    "err": "request failed with HTTP 429",
+                }
+            ],
+        }
+        cache._process_batch([success, failed])
+        raw_accounts = cache.records[-1]["a"]
+
+        fallback = cache.effective_accounts(
+            raw_accounts,
+            now=100 + HTTP_429_FALLBACK_SECONDS,
+        )[0]
+        self.assertIsNone(account_error(fallback))
+        self.assertEqual(fallback["q"]["7d"], [87, 2_000, 1_300, 604_800])
+        self.assertEqual(fallback["rc"], 2)
+        self.assertEqual(merged_window_info([fallback], "7d")["contributors"], 1)
+        self.assertEqual(raw_accounts[0]["err"], "request failed with HTTP 429")
+
+        stale = cache.effective_accounts(
+            raw_accounts,
+            now=101 + HTTP_429_FALLBACK_SECONDS,
+        )[0]
+        self.assertEqual(account_error(stale), "已持续 10分钟 未获取到新数据")
+        self.assertEqual(merged_window_info([stale], "7d")["contributors"], 0)
+        rendered = "\n".join(strip_ansi(line) for line in merged_account_reset_body([stale], "openai-1", 48, "7d"))
+        self.assertIn("openai-1: 已持续 10分钟 未获取到新数据", rendered)
+
+    def test_current_quota_and_429_fallback_do_not_reuse_smoothed_old_value(self) -> None:
+        cache = IncrementalHistoryCache(Path("quota_snapshots.jsonl"), "Asia/Shanghai")
+
+        def record(timestamp: int, remaining: int, reset_epoch: int) -> dict:
+            return {
+                "t": timestamp,
+                "a": [
+                    {
+                        "i": "openai-1",
+                        "q": {"7d": [remaining, reset_epoch, reset_epoch - timestamp, 604_800]},
+                    }
+                ],
+            }
+
+        cache._process_batch(
+            [
+                record(100, 31, 1_000),
+                record(110, 73, 2_000),
+                {
+                    "t": 120,
+                    "a": [{"i": "openai-1", "err": "request failed with HTTP 429"}],
+                },
+                record(140, 72, 2_000),
+                record(150, 71, 2_000),
+            ]
+        )
+
+        current = cache.records[-1]["a"][0]
+        self.assertEqual(current["q"]["7d"][0], 71)
+        series = cache._series_index.account_window("openai-1", "7d")
+        self.assertEqual(list(series.values), [31.0, 31.0, 31.0, 71.0])
+
+        cache._process_batch(
+            [
+                {
+                    "t": 160,
+                    "a": [{"i": "openai-1", "err": "request failed with HTTP 429"}],
+                }
+            ]
+        )
+        fallback = cache.effective_accounts(cache.records[-1]["a"], now=170)[0]
+        self.assertEqual(fallback["q"]["7d"][0], 71)
+
+    def test_http_401_does_not_use_quota_fallback(self) -> None:
+        cache = IncrementalHistoryCache(Path("quota_snapshots.jsonl"), "Asia/Shanghai")
+        cache._process_batch(
+            [
+                {
+                    "t": 100,
+                    "a": [{"i": "openai-1", "q": {"7d": [87, 2_000, 1_900, 604_800]}}],
+                },
+                {
+                    "t": 110,
+                    "a": [{"i": "openai-1", "err": "request denied with HTTP 401"}],
+                },
+            ]
+        )
+
+        account = cache.effective_accounts(cache.records[-1]["a"], now=120)[0]
+        self.assertNotIn("q", account)
+        self.assertEqual(
+            account_error(account).splitlines(),
+            ["request denied with HTTP 401", HTTP_401_CREDENTIAL_HINT],
+        )
 
     def test_account_error_wraps_without_truncation(self) -> None:
         error = "network unavailable while reading account metadata"
@@ -791,7 +1127,7 @@ class SettingsTests(unittest.TestCase):
             choices for key, _title, choices in setting_items(state) if key == "curve_mode"
         )
         self.assertIn(("精细柱状", "fine_bar"), curve_choices)
-        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("2.3.3", "v2.3.3"))
+        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("2.3.4", "v2.3.4"))
 
 
 class TokenChartTests(unittest.TestCase):
@@ -856,6 +1192,7 @@ class TokenChartTests(unittest.TestCase):
             period="5m",
             curve_mode="connected",
             color_scheme="classic",
+            window_scope="both",
             usage_panel_layout="split",
             usage_axis_scale="default",
         )
@@ -868,6 +1205,58 @@ class TokenChartTests(unittest.TestCase):
         self.assertIn("Token 用量", plain[0])
         self.assertTrue(plain[-1].startswith("╰"))
         self.assertEqual((len(lines), width, height), (35, 99, 35))
+
+    def test_current_account_controls_focus_merged_and_usage_border_colors(self) -> None:
+        accounts = [
+            {
+                "i": "openai-1",
+                "cur": False,
+                "q": {"5h": [90, 2_000, 1_000, 18_000]},
+            },
+            {
+                "i": "openai-2",
+                "cur": True,
+                "q": {"5h": [25, 2_000, 1_000, 18_000]},
+            },
+        ]
+        with patch("ui.panels.percent_color", side_effect=lambda value: f"quota-{value}"):
+            self.assertEqual(
+                current_account_border_color(accounts, "openai-2", "both"),
+                "quota-25",
+            )
+
+        token_monitor = SimpleNamespace(
+            latest=TokenUsageBreakdown(3_000, 2_000, 500, 100, 3_500),
+            rate_series=self.rate_series(),
+        )
+        for display_scope in ("current", "merged", "usage"):
+            with self.subTest(display_scope=display_scope):
+                state = SimpleNamespace(
+                    token_monitor=token_monitor,
+                    display_scope=display_scope,
+                    period="5m",
+                    curve_mode="connected",
+                    color_scheme="classic",
+                    window_scope="both",
+                    usage_panel_layout="combined",
+                    usage_axis_scale="default",
+                    summary_offset=0,
+                )
+                with patch(
+                    "ui.app.current_account_border_color",
+                    return_value="magenta",
+                ) as active_color:
+                    lines, _width, _height = _render_main_content(
+                        state,
+                        [],
+                        accounts,
+                        "openai-2",
+                        120,
+                        36,
+                        [],
+                    )
+                active_color.assert_called_once_with(accounts, "openai-2", "both")
+                self.assertIn("\x1b[35m╭", lines[0])
 
     def test_split_shape_adapts_without_vertical_gaps(self) -> None:
         self.assertEqual(token_split_shape(240, 30), (1, 4))

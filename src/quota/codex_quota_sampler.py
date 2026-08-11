@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Append compact Codex quota snapshots to JSONL once per interval."""
+"""Append usage snapshots while refreshing reset credits independently."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import signal
 import sys
 import tempfile
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,9 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from quota import check_codex_quota as quota
+from core.constants import RESET_CREDITS_INTERVAL_SECONDS
 from core.paths import default_paths, ensure_runtime_layout, monthly_log_path
+from quota.reset_credits_cache import reset_credits_cache_path
 from quota.token_usage_cache import token_usage_cache_path
 
 
@@ -31,6 +34,7 @@ DEFAULT_AUTH_LIST = DEFAULT_PATHS.auth_list_dir
 DEFAULT_LOG_FILE = "quota_snapshots.jsonl"
 DEFAULT_CONTROL_FILE = "sampler_control.json"
 DEFAULT_INTERVAL_SECONDS = 60
+DEFAULT_RESET_CREDITS_INTERVAL_SECONDS = RESET_CREDITS_INTERVAL_SECONDS
 CONTROL_POLL_SECONDS = 5.0
 
 
@@ -109,7 +113,16 @@ def compact_account(account: dict[str, Any], observed_ts: int) -> dict[str, Any]
     return item
 
 
-def make_snapshot(auth_file: Path, auth_list: Path, all_auth: bool, tz_name: str) -> dict[str, Any]:
+def make_snapshot(
+    auth_file: Path,
+    auth_list: Path,
+    all_auth: bool,
+    tz_name: str,
+    *,
+    reset_cache_path: Path | None = None,
+    reset_credits_interval_seconds: int = DEFAULT_RESET_CREDITS_INTERVAL_SECONDS,
+    query_reset_credits: bool = True,
+) -> dict[str, Any]:
     observed_ts = epoch_now()
     configs, current_index = quota.select_requested_configs(
         auth_file,
@@ -125,6 +138,9 @@ def make_snapshot(auth_file: Path, auth_list: Path, all_auth: bool, tz_name: str
         tz_name,
         token_usage_cache_path(auth_list),
         observed_ts,
+        reset_credits_cache_path=reset_cache_path,
+        reset_credits_interval_seconds=reset_credits_interval_seconds,
+        query_reset_credits=query_reset_credits,
     )
     return {
         "t": observed_ts,
@@ -134,6 +150,23 @@ def make_snapshot(auth_file: Path, auth_list: Path, all_auth: bool, tz_name: str
             for account in bundle.get("accounts", [])
         ],
     }
+
+
+def refresh_reset_credits(
+    auth_file: Path,
+    auth_list: Path,
+    all_auth: bool,
+    cache_path: Path,
+) -> dict[str, str]:
+    configs, _current_index = quota.select_requested_configs(
+        auth_file,
+        auth_list,
+        [],
+        False,
+        all_auth,
+        False,
+    )
+    return quota.refresh_reset_credits_cache(configs, cache_path)
 
 
 def append_snapshot(log_path: Path, snapshot: dict[str, Any], tz_name: str) -> None:
@@ -259,9 +292,27 @@ def install_signal_handlers(stop: dict[str, bool]) -> None:
     signal.signal(signal.SIGINT, handle_signal)
 
 
-def run_once(log_path: Path, auth_file: Path, auth_list: Path, all_auth: bool, tz_name: str) -> dict[str, Any]:
+def run_once(
+    log_path: Path,
+    auth_file: Path,
+    auth_list: Path,
+    all_auth: bool,
+    tz_name: str,
+    *,
+    reset_cache_path: Path | None = None,
+    reset_credits_interval_seconds: int = DEFAULT_RESET_CREDITS_INTERVAL_SECONDS,
+    query_reset_credits: bool = True,
+) -> dict[str, Any]:
     try:
-        snapshot = make_snapshot(auth_file, auth_list, all_auth, tz_name)
+        snapshot = make_snapshot(
+            auth_file,
+            auth_list,
+            all_auth,
+            tz_name,
+            reset_cache_path=reset_cache_path,
+            reset_credits_interval_seconds=reset_credits_interval_seconds,
+            query_reset_credits=query_reset_credits,
+        )
     except Exception as exc:
         snapshot = {"t": epoch_now(), "err": str(exc)}
     append_snapshot(log_path, snapshot, tz_name)
@@ -276,34 +327,70 @@ def run_loop(
     tz_name: str,
     interval: int,
     control_path: Path,
+    reset_credits_interval_seconds: int = DEFAULT_RESET_CREDITS_INTERVAL_SECONDS,
 ) -> None:
     stop = {"value": False}
     install_signal_handlers(stop)
     acquire_pid_lock(log_path.parent / "sampler.pid")
 
     current_interval = max(1, interval)
+    current_reset_credits_interval = max(1, reset_credits_interval_seconds)
     current_all_auth = bool(all_auth)
+    reset_cache = reset_credits_cache_path(auth_list)
     last_sample = 0.0
+    last_reset_refresh = 0.0
     last_control_seen_ns = 0
     last_control_check = 0.0
-    while not stop["value"]:
-        now = time.monotonic()
-        if last_control_check <= 0 or now - last_control_check >= CONTROL_POLL_SECONDS:
-            current_interval, last_control_seen_ns, sample_now, all_auth_override = read_control_command(
-                control_path,
-                current_interval,
-                last_control_seen_ns,
-            )
-            if all_auth_override is not None:
-                current_all_auth = all_auth_override
-            last_control_check = now
-            if sample_now:
-                last_sample = 0.0
+    reset_future: Future[dict[str, str]] | None = None
+    reset_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="codextop-reset-credits")
+    try:
+        while not stop["value"]:
             now = time.monotonic()
-        if last_sample <= 0 or now - last_sample >= current_interval:
-            run_once(log_path, auth_file, auth_list, current_all_auth, tz_name)
-            last_sample = time.monotonic()
-        time.sleep(1.0)
+            if reset_future is not None and reset_future.done():
+                try:
+                    reset_future.result()
+                except Exception as exc:
+                    print(f"reset credits refresh failed: {exc}", file=sys.stderr)
+                reset_future = None
+            if (
+                reset_future is None
+                and (last_reset_refresh <= 0 or now - last_reset_refresh >= current_reset_credits_interval)
+            ):
+                reset_future = reset_executor.submit(
+                    refresh_reset_credits,
+                    auth_file,
+                    auth_list,
+                    current_all_auth,
+                    reset_cache,
+                )
+                last_reset_refresh = now
+            if last_control_check <= 0 or now - last_control_check >= CONTROL_POLL_SECONDS:
+                current_interval, last_control_seen_ns, sample_now, all_auth_override = read_control_command(
+                    control_path,
+                    current_interval,
+                    last_control_seen_ns,
+                )
+                if all_auth_override is not None:
+                    current_all_auth = all_auth_override
+                last_control_check = now
+                if sample_now:
+                    last_sample = 0.0
+                now = time.monotonic()
+            if last_sample <= 0 or now - last_sample >= current_interval:
+                run_once(
+                    log_path,
+                    auth_file,
+                    auth_list,
+                    current_all_auth,
+                    tz_name,
+                    reset_cache_path=reset_cache,
+                    reset_credits_interval_seconds=current_reset_credits_interval,
+                    query_reset_credits=False,
+                )
+                last_sample = time.monotonic()
+            time.sleep(1.0)
+    finally:
+        reset_executor.shutdown(wait=True, cancel_futures=True)
 
 
 def main() -> int:
@@ -348,7 +435,16 @@ def main() -> int:
         "--interval",
         type=int,
         default=DEFAULT_INTERVAL_SECONDS,
-        help=f"Sampling interval in seconds. Default: {DEFAULT_INTERVAL_SECONDS}",
+        help=f"Usage sampling interval in seconds. Default: {DEFAULT_INTERVAL_SECONDS}",
+    )
+    parser.add_argument(
+        "--reset-credits-interval",
+        type=int,
+        default=DEFAULT_RESET_CREDITS_INTERVAL_SECONDS,
+        help=(
+            "Reset-credit refresh interval in seconds. Default comes from "
+            "[tool.codextop].reset_credits_interval_seconds in pyproject.toml."
+        ),
     )
     parser.add_argument(
         "--tz",
@@ -369,12 +465,30 @@ def main() -> int:
 
     auth_file = args.auth.expanduser()
     auth_list = args.auth_list.expanduser()
+    reset_cache = reset_credits_cache_path(auth_list)
     if args.once:
-        snapshot = run_once(log_path, auth_file, auth_list, args.all_auth, args.tz)
+        snapshot = run_once(
+            log_path,
+            auth_file,
+            auth_list,
+            args.all_auth,
+            args.tz,
+            reset_cache_path=reset_cache,
+            reset_credits_interval_seconds=max(1, args.reset_credits_interval),
+        )
         print(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")))
         return 0
 
-    run_loop(log_path, auth_file, auth_list, args.all_auth, args.tz, max(1, args.interval), control_path)
+    run_loop(
+        log_path,
+        auth_file,
+        auth_list,
+        args.all_auth,
+        args.tz,
+        max(1, args.interval),
+        control_path,
+        max(1, args.reset_credits_interval),
+    )
     return 0
 
 

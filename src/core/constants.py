@@ -6,6 +6,7 @@ import re
 
 from ui import color_schemes
 from .paths import default_paths
+from .project_config import PROJECT_CONFIG
 from .version import APP_VERSION, PACKAGE_VERSION
 
 DEFAULT_PATHS = default_paths()
@@ -93,6 +94,11 @@ TOKEN_RATE_SMOOTHING_ALPHA = 0.35
 RESET_CREDIT_TITLE_WIDTH = 6
 RESET_CREDIT_MIN_BAR_WIDTH = 6
 GAP_SECONDS = 3 * 60
+RESET_CREDITS_INTERVAL_SECONDS = PROJECT_CONFIG.reset_credits_interval_seconds
+HTTP_429_FALLBACK_SECONDS = PROJECT_CONFIG.http_429_fallback_seconds
+HTTP_401_CREDENTIAL_HINT = (
+    "请切换到对应的 CODEXAUTH，并使用 codex 刷新凭证，再使用 CODEXAUTH 同步新凭证。"
+)
 ANSI_RE = re.compile(r"\x1b\[[0-9;?<>]*[A-Za-z~]")
 BRAILLE_DOT_BITS = {
     (0, 0): 0x01,

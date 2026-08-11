@@ -189,6 +189,22 @@ def merged_account_reset_body(
         f"{paint('当前账号', 'dim')} "
         f"{current_account_quota_summary(accounts, current, window_scope)}"
     )
+    errors = [
+        (account, account_error(account))
+        for account in accounts
+        if isinstance(account, dict) and account_error(account)
+    ]
+    if errors:
+        lines.append(section_rule("数据状态", inner_width))
+        for account, error in errors:
+            account_id = account_index(account)
+            prefix = f"{account_id if account_id is not None else '-'}: "
+            error_lines = plain_wrap(error, max(1, inner_width - 2 - visible_width(prefix)))
+            for line_index, error_line in enumerate(error_lines):
+                line_prefix = prefix if line_index == 0 else " " * visible_width(prefix)
+                add_text(paint(f"{line_prefix}{error_line}", "red"))
+        return [fit_ansi(line, inner_width) for line in lines]
+
     lines.append(section_rule("额度重置", inner_width))
     available = merged_available_resets(accounts)
     add_text(f"{paint('重置次数', 'dim')} 合计 {available if isinstance(available, int) else '-'} 次可用")
@@ -398,18 +414,6 @@ def border_color(
     return "dim"
 
 
-def merged_border_color(
-    accounts: list[dict[str, Any]],
-    window_scope: str = DEFAULT_WINDOW_SCOPE,
-) -> str:
-    for key in window_keys(window_scope):
-        info = merged_window_info(accounts, key)
-        ratio = merged_ratio_percent(info.get("left"), info.get("max_left"))
-        if ratio is not None:
-            return percent_color(ratio)
-    return "dim"
-
-
 def panel(title: str, body: list[str], width: int, height: int, color: str) -> list[str]:
     width = max(12, width)
     height = max(4, height)
@@ -458,6 +462,16 @@ def selected_account(accounts: list[dict[str, Any]], current: int | str | None) 
         if is_current(account):
             return account
     return accounts[0]
+
+
+def current_account_border_color(
+    accounts: list[dict[str, Any]],
+    current: int | str | None,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
+) -> str:
+    if not accounts:
+        return "dim"
+    return border_color(selected_account(accounts, current), current, window_scope)
 
 
 def stacked_summary_panels(

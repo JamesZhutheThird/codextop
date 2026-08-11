@@ -1,13 +1,18 @@
 [project]
 name = "codextop"
-version = "2.3.3"
+version = "2.3.4"
 description = "Terminal monitor for Codex quota usage."
 readme = "README.md"
 license = { text = "CC BY-NC-SA 4.0" }
 requires-python = ">=3.10"
 dependencies = [
   "rich>=13.0.0",
+  "tomli>=2.0.0; python_version < '3.11'",
 ]
+
+[tool.codextop]
+reset_credits_interval_seconds = 60
+http_429_fallback_seconds = 600
 
 [project.scripts]
 codextop = "codextop:main"

@@ -1,5 +1,9 @@
 # 更新日志
 
+## v2.3.4 - 2026-08-11
+
+- 数据更新失败后处理逻辑优化
+
 ## v2.3.3 - 2026-08-05
 
 - 修复共享服务器多用户运行服务导致的账号无法切换问题，CodexAuth 只会检查当前用户的 Codex 进程。（[#1](https://github.com/JamesZhutheThird/codextop/pull/1) [@Peng-yuWang](https://github.com/Peng-yuWang)）

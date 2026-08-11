@@ -11,7 +11,7 @@ from pathlib import Path
 
 from . import color_schemes
 from core.constants import *
-from .history import current_accounts, current_index, read_records_if_due
+from .history import account_freshness_cache_key, current_accounts, current_index, read_records_if_due
 from .models import ClickZone, MonitorState
 from .panels import *
 from .preload import BackgroundDataPreloader
@@ -77,7 +77,7 @@ def _render_main_content(
             chart_lines,
             main_width,
             content_height,
-            "cyan",
+            current_account_border_color(accounts, current, state.window_scope),
         )
     elif not accounts:
         loading_text = (
@@ -119,21 +119,33 @@ def _render_main_content(
             history_body,
             right_width,
             content_height,
-            border_color(active, current, state.window_scope),
+            current_account_border_color(accounts, current, state.window_scope),
         )
         left_lines = compose_columns([left_block, right_block], [left_width, right_width], content_height)
     elif state.display_scope == "merged":
-        color = merged_border_color(accounts, state.window_scope)
+        color = current_account_border_color(accounts, current, state.window_scope)
         if content_height >= 17:
-            top_height = 10
+            base_top_height = 10
         elif content_height >= 14:
-            top_height = 9
+            base_top_height = 9
         else:
-            top_height = max(4, content_height // 2)
-        history_height = max(4, content_height - top_height)
+            base_top_height = max(4, content_height // 2)
         top_left_width = min(50, max(37, main_width // 3))
         top_right_width = max(24, main_width - top_left_width)
         top_left_width = main_width - top_right_width
+        required_top_height = len(
+            merged_account_reset_body(
+                accounts,
+                current,
+                max(10, top_left_width - 2),
+                state.window_scope,
+            )
+        ) + 2
+        top_height = min(
+            max(base_top_height, required_top_height),
+            max(4, content_height - 4),
+        )
+        history_height = max(4, content_height - top_height)
         top_left_block = panel(
             "账号信息",
             merged_account_reset_lines(
@@ -288,10 +300,16 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
     state.history_preload_waiting = False
     state.token_preload_waiting = False
     preloader = state.preloader
+    _adopt_history_preload(state)
     if state.display_scope == "usage":
         records = state.records or []
+        if state.history_cache is not None:
+            token_status = state.status
+            token_error = state.error
+            records = read_records_if_due(state)
+            state.status = token_status
+            state.error = token_error
     else:
-        _adopt_history_preload(state)
         if (
             state.records is None
             and isinstance(preloader, BackgroundDataPreloader)
@@ -368,6 +386,7 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
         getattr(state, "usage_axis_scale", DEFAULT_USAGE_AXIS_SCALE),
         state.color_scheme,
         state.summary_offset,
+        account_freshness_cache_key(accounts),
         state.history_preload_waiting,
         state.token_preload_waiting,
     )

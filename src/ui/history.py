@@ -26,11 +26,60 @@ UPWARD_RESET_TOLERANCE_SECONDS = 10
 RESET_DUE_GRACE_SECONDS = 5
 
 
+def _snapshot_account_index(account: dict[str, Any]) -> int | str | None:
+    index = account.get("i", account.get("index"))
+    return index if isinstance(index, (int, str)) else None
+
+
+def _is_http_429(account: dict[str, Any]) -> bool:
+    error = account.get("err", account.get("error"))
+    return bool(error and "HTTP 429" in str(error))
+
+
+def _has_quota_value(account: dict[str, Any]) -> bool:
+    quota = account.get("q")
+    if isinstance(quota, dict):
+        for raw in quota.values():
+            if isinstance(raw, (list, tuple)) and raw and isinstance(raw[0], (int, float)):
+                return True
+    quota = account.get("quota")
+    if isinstance(quota, dict):
+        for raw in quota.values():
+            if isinstance(raw, dict) and isinstance(raw.get("remaining_percent"), (int, float)):
+                return True
+    return False
+
+
+def _stale_duration_text(seconds: int) -> str:
+    total_minutes = max(1, int(seconds) // 60)
+    days, remaining_minutes = divmod(total_minutes, 24 * 60)
+    hours, minutes = divmod(remaining_minutes, 60)
+    if days:
+        return f"{days}天{hours}小时{minutes}分钟"
+    if hours:
+        return f"{hours}小时{minutes}分钟"
+    return f"{minutes}分钟"
+
+
+def account_freshness_cache_key(accounts: list[dict[str, Any]]) -> tuple[Any, ...]:
+    """Return only time-sensitive fallback state needed by the render cache."""
+    return tuple(
+        (
+            _snapshot_account_index(account),
+            account.get("_quota_fallback_until"),
+            account.get("_quota_stale_minutes"),
+        )
+        for account in accounts
+        if isinstance(account, dict)
+        and ("_quota_fallback_until" in account or "_quota_stale_minutes" in account)
+    )
+
+
 def inherit_snapshot_account_identity(
     record: dict[str, Any],
     previous_record: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Keep the last known email and plan when a snapshot omits identity data."""
+    """Keep identity and reset credits when a snapshot omits previously known data."""
     accounts = record.get("a")
     previous_accounts = previous_record.get("a") if isinstance(previous_record, dict) else None
     if not isinstance(accounts, list) or not isinstance(previous_accounts, list):
@@ -52,6 +101,9 @@ def inherit_snapshot_account_identity(
             previous_plan = previous.get("plan") or previous.get("plan_type")
             if previous_plan:
                 account["plan"] = previous_plan
+        if not isinstance(account.get("rc"), int) and isinstance(previous.get("rc"), int):
+            account["rc"] = previous["rc"]
+            account["r"] = copy.deepcopy(previous.get("r", []))
     return record
 
 
@@ -127,7 +179,9 @@ def smooth_snapshot_record(
         index = account.get("i")
         if not isinstance(index, (int, str)):
             continue
-        if account.get("err"):
+        if account.get("err") or account.get("error"):
+            if _is_http_429(account):
+                continue
             for window in ("5h", "7d"):
                 state = states.get((str(index), window))
                 if state is not None:
@@ -470,10 +524,18 @@ class _OutOfOrderSnapshot(RuntimeError):
 class IncrementalHistoryCache:
     """Append-aware history cache that preserves legacy JSONL read semantics."""
 
-    def __init__(self, log_path: Path, tz_name: str, *, cooperative_yield_seconds: float = 0.0) -> None:
+    def __init__(
+        self,
+        log_path: Path,
+        tz_name: str,
+        *,
+        cooperative_yield_seconds: float = 0.0,
+        http_429_fallback_seconds: int = HTTP_429_FALLBACK_SECONDS,
+    ) -> None:
         self.log_path = log_path.expanduser()
         self.tz_name = tz_name
         self._cooperative_yield_seconds = max(0.0, float(cooperative_yield_seconds))
+        self.http_429_fallback_seconds = max(1, int(http_429_fallback_seconds))
         self._batch_size = 256 if self._cooperative_yield_seconds else 1024
         self._series_index = HistorySeriesIndex()
         self.records: HistoryRecordList = HistoryRecordList(self._series_index)
@@ -486,6 +548,10 @@ class IncrementalHistoryCache:
         self._cursors: dict[Path, _LogCursor] = {}
         self._smooth_states: dict[tuple[str, str], dict[str, Any]] = {}
         self._state_before_last: dict[tuple[str, str], dict[str, Any]] = {}
+        self._last_success_accounts: dict[int | str, tuple[int, dict[str, Any]]] = {}
+        self._first_429_at: dict[int | str, int] = {}
+        self._last_success_before_last: dict[int | str, tuple[int, dict[str, Any]]] = {}
+        self._first_429_before_last: dict[int | str, int] = {}
         self._initialized = False
 
     def _yield_to_foreground(self) -> None:
@@ -504,6 +570,110 @@ class IncrementalHistoryCache:
         self.records = HistoryRecordList(self._series_index)
         self._smooth_states = {}
         self._state_before_last = {}
+        self._last_success_accounts = {}
+        self._first_429_at = {}
+        self._last_success_before_last = {}
+        self._first_429_before_last = {}
+
+    @staticmethod
+    def _track_account_observations(
+        record: dict[str, Any],
+        last_success: dict[int | str, tuple[int, dict[str, Any]]],
+        first_429_at: dict[int | str, int],
+    ) -> None:
+        timestamp = record.get("t")
+        accounts = record.get("a")
+        if not isinstance(timestamp, int) or not isinstance(accounts, list):
+            return
+        for account in accounts:
+            if not isinstance(account, dict):
+                continue
+            index = _snapshot_account_index(account)
+            if index is None:
+                continue
+            if account.get("err") or account.get("error"):
+                if _is_http_429(account):
+                    first_429_at.setdefault(index, timestamp)
+                continue
+            first_429_at.pop(index, None)
+            if _has_quota_value(account):
+                last_success[index] = (timestamp, copy.deepcopy(account))
+
+    @staticmethod
+    def _refresh_fallback_countdowns(account: dict[str, Any], now: int, source_timestamp: int) -> None:
+        quota = account.get("q")
+        if isinstance(quota, dict):
+            for key, raw in tuple(quota.items()):
+                if not isinstance(raw, (list, tuple)) or len(raw) < 3:
+                    continue
+                updated = list(raw)
+                reset_epoch = updated[1]
+                if isinstance(reset_epoch, int):
+                    updated[2] = max(0, reset_epoch - now)
+                quota[key] = updated
+
+        full_quota = account.get("quota")
+        elapsed = max(0, now - source_timestamp)
+        if isinstance(full_quota, dict):
+            for raw in full_quota.values():
+                if not isinstance(raw, dict):
+                    continue
+                reset_after = raw.get("reset_after_seconds")
+                if isinstance(reset_after, (int, float)):
+                    raw["reset_after_seconds"] = max(0, int(reset_after) - elapsed)
+
+    def effective_accounts(
+        self,
+        accounts: list[dict[str, Any]],
+        *,
+        now: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Resolve short HTTP 429 outages without changing the raw history record."""
+        observed_now = int(time.time()) if now is None else int(now)
+        resolved: list[dict[str, Any]] = []
+        for account in accounts:
+            if not isinstance(account, dict) or not _is_http_429(account):
+                resolved.append(account)
+                continue
+
+            index = _snapshot_account_index(account)
+            previous = self._last_success_accounts.get(index) if index is not None else None
+            if previous is not None:
+                source_timestamp, previous_account = previous
+            else:
+                source_timestamp = self._first_429_at.get(index, observed_now) if index is not None else observed_now
+                previous_account = None
+            stale_seconds = max(0, observed_now - source_timestamp)
+
+            if stale_seconds <= self.http_429_fallback_seconds:
+                effective = copy.deepcopy(previous_account if previous_account is not None else account)
+                for key in (
+                    "i",
+                    "index",
+                    "cur",
+                    "current",
+                    "label",
+                    "email",
+                    "plan",
+                    "plan_type",
+                    "u",
+                    "token_usage",
+                ):
+                    if key in account:
+                        effective[key] = copy.deepcopy(account[key])
+                effective.pop("err", None)
+                effective.pop("error", None)
+                effective["_quota_fallback_until"] = source_timestamp + self.http_429_fallback_seconds
+                self._refresh_fallback_countdowns(effective, observed_now, source_timestamp)
+                resolved.append(effective)
+                continue
+
+            stale = copy.deepcopy(account)
+            stale.pop("error", None)
+            stale["err"] = f"已持续 {_stale_duration_text(stale_seconds)} 未获取到新数据"
+            stale["_quota_stale_minutes"] = stale_seconds // 60
+            resolved.append(stale)
+        return resolved
 
     def _process_batch(self, batch: list[dict[str, Any]]) -> bool:
         if not batch:
@@ -530,11 +700,17 @@ class IncrementalHistoryCache:
             if first_timestamp == cached_timestamp:
                 replacement = deduplicated.pop(0)
                 states = copy.deepcopy(self._state_before_last)
+                last_success = copy.deepcopy(self._last_success_before_last)
+                first_429_at = dict(self._first_429_before_last)
                 inherit_snapshot_account_identity(replacement, self.records[-1])
                 normalize_snapshot_record(replacement)
+                latest_replacement = copy.deepcopy(replacement)
+                self._track_account_observations(replacement, last_success, first_429_at)
                 smooth_snapshot_record(replacement, states)
-                self.records[-1] = replacement
+                self.records[-1] = latest_replacement
                 self._smooth_states = states
+                self._last_success_accounts = last_success
+                self._first_429_at = first_429_at
                 self._series_index.replace_timestamp(first_timestamp, replacement)
 
         for index, record in enumerate(deduplicated):
@@ -543,9 +719,15 @@ class IncrementalHistoryCache:
             normalize_snapshot_record(record)
             if index == len(deduplicated) - 1:
                 self._state_before_last = copy.deepcopy(self._smooth_states)
+                self._last_success_before_last = copy.deepcopy(self._last_success_accounts)
+                self._first_429_before_last = dict(self._first_429_at)
+                latest_record = copy.deepcopy(record)
+            else:
+                latest_record = record
+            self._track_account_observations(record, self._last_success_accounts, self._first_429_at)
             smooth_snapshot_record(record, self._smooth_states)
             self._series_index.append_record(record)
-            self.records.append(record)
+            self.records.append(latest_record)
         return True
 
     def _parse_line(self, raw_line: bytes) -> dict[str, Any] | None:
@@ -856,7 +1038,13 @@ def current_accounts(state: MonitorState, records: list[dict[str, Any]]) -> list
         return []
     latest = records[-1]
     accounts = latest.get("a", [])
-    return list(accounts) if isinstance(accounts, list) else []
+    if not isinstance(accounts, list):
+        return []
+    current = list(accounts)
+    cache = getattr(state, "history_cache", None)
+    if isinstance(cache, IncrementalHistoryCache):
+        return cache.effective_accounts(current)
+    return current
 
 
 def current_index(state: MonitorState, records: list[dict[str, Any]]) -> int | str | None:
