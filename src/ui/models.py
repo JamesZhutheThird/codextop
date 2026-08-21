@@ -27,6 +27,7 @@ class MonitorState:
     display_scope: str
     window_scope: str
     color_scheme: str
+    merged_quota_mode: str = "percent"
     usage_directory_scope: str = "current"
     usage_panel_layout: str = "combined"
     usage_axis_scale: str = "default"

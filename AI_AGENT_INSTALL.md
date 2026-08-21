@@ -187,6 +187,7 @@ printf '%s\n' \
   '  CHECK_CODEX_QUOTA        单次查询当前账号额度' \
   '  CHECK_CODEX_QUOTA --all-auth  查询全部账号' \
   '  CODEXAUTH list           查看账号列表' \
+  '  CODEXAUTH --new 1        通过 device auth 添加账号' \
   '  CODEXTOP_UPDATE --check-only  只检查更新' \
   '  CODEXTOP_UPDATE          检查并安装快进更新'
 ```
@@ -194,7 +195,7 @@ printf '%s\n' \
 如果未检测到 `${CODEXTOP_CODEX_DIR:-${CODEX_HOME:-$HOME/.codex}}/auth.json`，紧接着输出：
 
 ```text
-尚未检测到 Codex 登录信息：请先运行 codex login，再运行 CODEXAUTH sync。
+尚未检测到 Codex 登录信息：可运行 CODEXAUTH --new 1，并按屏幕提示在网页版完成登录。
 ```
 
 ## 7. 最终回复

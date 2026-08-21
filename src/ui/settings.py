@@ -37,6 +37,8 @@ def setting_items(state: MonitorState) -> list[tuple[str, str, list[tuple[str, A
             ]
         )
     else:
+        if state.display_scope == "merged":
+            items.append(("merged_quota_mode", "额度叠加", list(MERGED_QUOTA_MODE_CHOICES)))
         items.append(("window_scope", "额度窗口", list(WINDOW_SCOPE_CHOICES)))
     return items
 
@@ -56,6 +58,8 @@ def setting_current_value(state: MonitorState, key: str) -> Any:
         return state.curve_mode
     if key == "window_scope":
         return state.window_scope
+    if key == "merged_quota_mode":
+        return state.merged_quota_mode
     if key == "color_scheme":
         return state.color_scheme
     if key == "display_scope":
@@ -320,6 +324,8 @@ def apply_setting_value(state: MonitorState, key: str, value: Any) -> None:
         state.curve_mode = str(value)
     elif key == "window_scope":
         state.window_scope = str(value)
+    elif key == "merged_quota_mode":
+        state.merged_quota_mode = str(value)
     elif key == "color_scheme":
         state.color_scheme = color_schemes.set_active_color_scheme(str(value))
     elif key == "display_scope":

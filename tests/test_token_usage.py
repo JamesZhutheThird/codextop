@@ -20,7 +20,16 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from quota import check_codex_quota as quota
 from quota.codex_quota_sampler import compact_account
-from quota.quota_format import account_error, format_token_count, merged_window_info, token_usage_rows
+from quota.quota_format import (
+    account_error,
+    account_plan,
+    account_quota_multiplier,
+    format_token_count,
+    merged_quota_rows,
+    merged_plan_text,
+    merged_window_info,
+    token_usage_rows,
+)
 from quota.reset_credits_cache import read_reset_credits_cache
 from quota.token_usage_cache import DailyTokenUsageCacheReader
 from core.constants import HTTP_401_CREDENTIAL_HINT, HTTP_429_FALLBACK_SECONDS
@@ -29,11 +38,16 @@ from core.project_config import (
     DEFAULT_RESET_CREDITS_INTERVAL_SECONDS,
     load_project_config,
 )
-from core.state import saved_usage_axis_scale, saved_usage_directory_scope, saved_usage_panel_layout
+from core.state import (
+    saved_merged_quota_mode,
+    saved_usage_axis_scale,
+    saved_usage_directory_scope,
+    saved_usage_panel_layout,
+)
 from core.version import APP_VERSION, PACKAGE_VERSION
 from ui import color_schemes
 from ui.app import _render_main_content
-from ui.charts import series_chart_lines
+from ui.charts import axis_tick_values, series_chart_lines
 from ui.history import IncrementalHistoryCache, HistorySeriesIndex, inherit_snapshot_account_identity, metric_value_at
 from ui.models import MonitorState
 from ui.session_tokens import (
@@ -42,7 +56,15 @@ from ui.session_tokens import (
     TrustedDirectoryTokenUsageMonitor,
 )
 from ui.settings import render_sidebar, setting_items
-from ui.panels import account_summary_body, current_account_border_color, merged_account_reset_body
+from ui.panels import (
+    account_summary_body,
+    current_account_border_color,
+    merged_account_reset_body,
+    merged_account_window_points,
+    merged_chart_lines,
+    merged_max_value,
+    merged_value_at,
+)
 from ui.terminal_text import plain_wrap, strip_ansi, visible_width
 from ui.token_charts import (
     TOKEN_KEYS,
@@ -84,6 +106,174 @@ def quota_payload() -> dict:
 
 
 class CollectionTests(unittest.TestCase):
+    def test_plan_labels_and_actual_quota_multipliers(self) -> None:
+        self.assertEqual(account_plan({"plan": "plus"}), "Plus")
+        self.assertEqual(account_plan({"plan": "pro"}), "Pro(20x)")
+        self.assertEqual(account_plan({"plan": "pro-5x"}), "Pro(5x)")
+        self.assertEqual(account_plan({"plan": "pro-20x"}), "Pro(20x)")
+        self.assertEqual(account_quota_multiplier({"plan": "plus"}), 1)
+        self.assertEqual(account_quota_multiplier({"plan": "pro"}), 20)
+        self.assertEqual(account_quota_multiplier({"plan": "pro-5x"}), 5)
+        self.assertEqual(account_quota_multiplier({"plan": "pro-20x"}), 20)
+
+    def test_merged_plan_summary_always_shows_tier_counts_without_truncation(self) -> None:
+        accounts = [
+            *({"plan": "plus"} for _ in range(3)),
+            {"plan": "pro-5x"},
+            {"plan": "pro-20x"},
+            {"plan": "pro-20x", "err": "temporarily unavailable"},
+        ]
+        self.assertEqual(
+            merged_plan_text(accounts),
+            "Plus x3 / Pro(5x) x1 / Pro(20x) x2",
+        )
+        rendered = "\n".join(
+            strip_ansi(line)
+            for line in merged_account_reset_body(accounts, None, 35, "both")
+        )
+        self.assertIn("Plus x3", rendered)
+        self.assertIn("Pro(5x) x1", rendered)
+        self.assertIn("Pro(20x) x2", rendered)
+
+    def test_actual_merged_quota_uses_x_units(self) -> None:
+        accounts = [
+            {"i": "plus", "plan": "plus", "q": {"5h": [50, 2_000, 1_000, 18_000]}},
+            {"i": "pro-5", "plan": "pro-5x", "q": {"5h": [20, 2_000, 1_000, 18_000]}},
+            {"i": "pro-20", "plan": "pro-20x", "q": {"5h": [10, 2_000, 1_000, 18_000]}},
+        ]
+        percent = merged_window_info(accounts, "5h")
+        actual = merged_window_info(accounts, "5h", "actual")
+
+        self.assertEqual((percent["left"], percent["max_left"]), (80, 300))
+        self.assertEqual((actual["left"], actual["max_left"]), (3.5, 26))
+        legacy_pro = merged_window_info(
+            [{"plan": "pro", "q": {"5h": [25, 2_000, 1_000, 18_000]}}],
+            "5h",
+            "actual",
+        )
+        self.assertEqual((legacy_pro["left"], legacy_pro["max_left"]), (5, 20))
+        rendered = "\n".join(
+            strip_ansi(
+                line
+            )
+            for line in merged_quota_rows(
+                accounts,
+                None,
+                80,
+                window_scope="5h",
+                merged_quota_mode="actual",
+            )
+        )
+        self.assertIn("3.5x", rendered)
+        self.assertIn("plus(0.5x)", rendered)
+        self.assertIn("pro-5(1x)", rendered)
+        self.assertIn("pro-20(2x)", rendered)
+
+        records = [
+            {"t": 1_000, "a": accounts},
+            {"t": 3_001_000, "a": accounts},
+        ]
+        for curve_mode in ("connected", "points", "braille", "box", "bar", "fine_bar"):
+            with self.subTest(curve_mode=curve_mode):
+                chart = "\n".join(
+                    strip_ansi(line)
+                    for line in merged_chart_lines(
+                        records,
+                        "all",
+                        100,
+                        18,
+                        curve_mode,
+                        "5h",
+                        accounts,
+                        "actual",
+                    )
+                )
+                self.assertIn("26x", chart)
+                self.assertIn("25x", chart)
+
+    def test_actual_axis_uses_adaptive_one_two_five_steps(self) -> None:
+        self.assertEqual(
+            axis_tick_values(23, 10, nice_steps=True),
+            [5, 10, 15, 20, 23],
+        )
+        self.assertEqual(
+            axis_tick_values(23, 5, nice_steps=True),
+            [10, 20, 23],
+        )
+        self.assertEqual(
+            axis_tick_values(223, 10, nice_steps=True),
+            [50, 100, 150, 200, 223],
+        )
+
+    def test_actual_history_keeps_each_record_plan_and_uses_current_plan_when_missing(self) -> None:
+        records = [
+            {
+                "t": 100,
+                "a": [{"i": "account", "plan": "pro-5x", "q": {"7d": [100, 1_000, 900, 604_800]}}],
+            },
+            {
+                "t": 110,
+                "a": [{"i": "account", "plan": "pro-20x", "q": {"7d": [50, 1_000, 890, 604_800]}}],
+            },
+            {
+                "t": 120,
+                "a": [{"i": "account", "q": {"7d": [25, 1_000, 880, 604_800]}}],
+            },
+            {
+                "t": 130,
+                "a": [{"i": "account", "plan": "pro", "q": {"7d": [10, 1_000, 870, 604_800]}}],
+            },
+        ]
+        cache = IncrementalHistoryCache(Path("quota_snapshots.jsonl"), "Asia/Shanghai")
+        cache._process_batch(records)
+        points = cache._series_index.merged_window("7d")
+
+        current_20x = {"account": 20.0}
+        current_5x = {"account": 5.0}
+        current_plus = {"account": 1.0}
+        self.assertEqual(merged_value_at(points, 100, 20, current_20x)[0], 5)
+        self.assertEqual(merged_value_at(points, 110, 20, current_20x)[0], 10)
+        self.assertEqual(merged_value_at(points, 120, 20, current_20x)[0], 5)
+        self.assertEqual(merged_value_at(points, 130, 20, current_20x)[0], 2)
+        self.assertEqual(merged_value_at(points, 110, 20, current_5x)[0], 10)
+        self.assertEqual(merged_value_at(points, 120, 20, current_5x)[0], 1.25)
+        self.assertEqual(merged_value_at(points, 130, 20, current_5x)[0], 0.5)
+        self.assertEqual(merged_value_at(points, 100, 20, current_plus)[0], 5)
+        self.assertEqual(merged_value_at(points, 110, 20, current_plus)[0], 10)
+        self.assertEqual(merged_value_at(points, 120, 20, current_plus)[0], 0.25)
+        self.assertEqual(merged_max_value({"7d": points}, current_plus), 20)
+        self.assertTrue(records[2]["a"][0]["_plan_inherited"])
+
+        raw_points = merged_account_window_points(records, "7d")
+        self.assertEqual(merged_value_at(raw_points, 100, 20, current_plus)[0], 5)
+        self.assertEqual(merged_value_at(raw_points, 120, 20, current_plus)[0], 0.25)
+        self.assertEqual(merged_value_at(raw_points, 130, 20, current_5x)[0], 0.5)
+
+        current_accounts = [{"i": "account", "plan": "plus"}]
+        for curve_mode in ("connected", "points", "braille", "box", "bar", "fine_bar"):
+            with self.subTest(curve_mode=curve_mode):
+                expected = merged_chart_lines(
+                    records,
+                    "all",
+                    100,
+                    13,
+                    curve_mode,
+                    "7d",
+                    current_accounts,
+                    "actual",
+                )
+                actual = merged_chart_lines(
+                    cache.records,
+                    "all",
+                    100,
+                    13,
+                    curve_mode,
+                    "7d",
+                    current_accounts,
+                    "actual",
+                )
+                self.assertEqual(actual, expected)
+
     def test_token_total_display_uses_tokens_suffix(self) -> None:
         self.assertEqual(format_token_count(1_234_567), "1,234,567 Tokens")
         self.assertEqual(format_token_count(None), "-")
@@ -128,7 +318,7 @@ class CollectionTests(unittest.TestCase):
             ["request denied with HTTP 401", HTTP_401_CREDENTIAL_HINT],
         )
 
-    def test_two_quota_endpoints_are_bounded_and_concurrent(self) -> None:
+    def test_account_collection_requests_are_bounded_and_concurrent(self) -> None:
         active = 0
         peak = 0
         lock = threading.Lock()
@@ -159,7 +349,7 @@ class CollectionTests(unittest.TestCase):
         self.assertNotIn("token_usage", bundle["accounts"][0])
         self.assertEqual(bundle["accounts"][0]["quota"]["5h"]["remaining_percent"], 80)
 
-    def test_collection_only_calls_quota_and_reset_endpoints(self) -> None:
+    def test_collection_calls_quota_reset_and_account_endpoints(self) -> None:
         urls: list[str] = []
 
         def fake_get_json(url: str, _token: str, *_args) -> dict:
@@ -179,8 +369,64 @@ class CollectionTests(unittest.TestCase):
             )["accounts"][0]
 
         self.assertNotIn("error", account)
-        self.assertEqual(set(urls), {quota.USAGE_URL, quota.RESET_CREDITS_URL})
+        self.assertEqual(
+            set(urls),
+            {quota.USAGE_URL, quota.RESET_CREDITS_URL, quota.ACCOUNT_INFO_URL},
+        )
         self.assertEqual(account["quota"]["7d"]["remaining_percent"], 60)
+
+    def test_pro_tier_is_resolved_and_cached_once_per_day(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "token_usage_daily.json"
+            urls: list[str] = []
+
+            def fake_get_json(url: str, _token: str, *_args) -> dict:
+                urls.append(url)
+                if url == quota.USAGE_URL:
+                    payload = quota_payload()
+                    payload["plan_type"] = "pro"
+                    return payload
+                if url == quota.RESET_CREDITS_URL:
+                    return {"available_count": 0, "credits": []}
+                if url == quota.ACCOUNT_INFO_URL:
+                    return {
+                        "accounts": {
+                            "account": {
+                                "entitlement": {"subscription_plan": "chatgptpro"}
+                            }
+                        }
+                    }
+                return {
+                    "stats": {"lifetime_tokens": 123},
+                    "metadata": {"generated_at": "2026-08-22T00:00:00Z"},
+                }
+
+            with (
+                patch.object(quota, "load_auth_credentials", return_value=("secret", "account")),
+                patch.object(quota, "get_json", side_effect=fake_get_json),
+            ):
+                first = quota.collect_accounts(
+                    [("openai-1", Path("one"))],
+                    "openai-1",
+                    "Asia/Shanghai",
+                    cache_path,
+                    observed_epoch=1_000,
+                )["accounts"][0]
+                second = quota.collect_accounts(
+                    [("openai-1", Path("one"))],
+                    "openai-1",
+                    "Asia/Shanghai",
+                    cache_path,
+                    observed_epoch=1_001,
+                )["accounts"][0]
+
+            self.assertEqual(first["plan_type"], "pro-20x")
+            self.assertEqual(second["plan_type"], "pro-20x")
+            self.assertEqual(urls.count(quota.ACCOUNT_INFO_URL), 1)
+            self.assertEqual(
+                quota.normalize_plan_type("pro", "chatgptprolite"),
+                "pro-5x",
+            )
 
     def test_reset_credit_failure_does_not_discard_fresh_usage(self) -> None:
         def fake_get_json(url: str, _token: str, *_args) -> dict:
@@ -1096,6 +1342,33 @@ class SettingsTests(unittest.TestCase):
                 self.assertNotIn("usage_directory_scope", quota)
                 self.assertNotIn("usage_panel_layout", quota)
                 self.assertNotIn("usage_axis_scale", quota)
+        self.assertEqual(
+            self.keys("merged")[-2:],
+            ["merged_quota_mode", "window_scope"],
+        )
+
+    def test_merged_quota_mode_state_validation(self) -> None:
+        self.assertEqual(saved_merged_quota_mode({"merged_quota_mode": "actual"}), "actual")
+        self.assertEqual(saved_merged_quota_mode({"merged_quota_mode": "percent"}), "percent")
+        self.assertIsNone(saved_merged_quota_mode({"merged_quota_mode": "invalid"}))
+
+    def test_merged_quota_mode_is_visible_in_a_standard_height_sidebar(self) -> None:
+        state = MonitorState(
+            period="5m",
+            interval=60,
+            tz="Asia/Shanghai",
+            log_path=Path("/tmp/codextop-test/quota.jsonl"),
+            restore_interval=60,
+            state_path=Path("/tmp/codextop-test/state.json"),
+            curve_mode="connected",
+            display_scope="merged",
+            window_scope="both",
+            color_scheme="classic",
+            merged_quota_mode="actual",
+        )
+        plain = "\n".join(strip_ansi(line) for line in render_sidebar(state, 21, 35, 100, []))
+        self.assertIn("额度叠加", plain)
+        self.assertIn("实际额度叠加", plain)
 
     def test_usage_axis_scale_choices_are_available(self) -> None:
         state = SimpleNamespace(display_scope="usage")
@@ -1127,7 +1400,7 @@ class SettingsTests(unittest.TestCase):
             choices for key, _title, choices in setting_items(state) if key == "curve_mode"
         )
         self.assertIn(("精细柱状", "fine_bar"), curve_choices)
-        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("2.3.4", "v2.3.4"))
+        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("2.4.0", "v2.4.0"))
 
 
 class TokenChartTests(unittest.TestCase):

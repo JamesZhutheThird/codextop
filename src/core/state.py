@@ -84,6 +84,12 @@ def saved_window_scope(payload: dict[str, Any]) -> str | None:
     return scope if isinstance(scope, str) and scope in valid_scopes else None
 
 
+def saved_merged_quota_mode(payload: dict[str, Any]) -> str | None:
+    mode = payload.get("merged_quota_mode")
+    valid_modes = {value for _label, value in MERGED_QUOTA_MODE_CHOICES}
+    return mode if isinstance(mode, str) and mode in valid_modes else None
+
+
 def saved_usage_directory_scope(payload: dict[str, Any]) -> str | None:
     scope = payload.get("usage_directory_scope")
     valid_scopes = {value for _label, value in USAGE_DIRECTORY_SCOPE_CHOICES}
@@ -116,6 +122,7 @@ def save_codextop_state(state: MonitorState) -> None:
         "curve_mode": state.curve_mode,
         "display_scope": state.display_scope,
         "window_scope": state.window_scope,
+        "merged_quota_mode": state.merged_quota_mode,
         "usage_directory_scope": state.usage_directory_scope,
         "usage_panel_layout": state.usage_panel_layout,
         "usage_axis_scale": state.usage_axis_scale,

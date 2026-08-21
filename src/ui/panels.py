@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import time
 from typing import Any
 
@@ -9,6 +10,7 @@ from .charts import *
 from core.constants import *
 from .models import ClickZone
 from quota.quota_format import *
+from quota.plans import recorded_quota_multiplier
 from .terminal_text import *
 
 def account_lines(
@@ -67,7 +69,7 @@ def account_lines(
 
     chart_height = max(4, inner_height - len(lines))
     chart_width = max(8, inner_width - 2)
-    if index is not None:
+    if index is not None and records:
         chart = chart_lines(
             records,
             index,
@@ -79,6 +81,11 @@ def account_lines(
         )
     else:
         chart = chart_box([paint("暂无历史数据", "dim")], chart_width, chart_height)
+    detail_height = max(0, inner_height - len(chart))
+    if len(lines) > detail_height:
+        lines = lines[:max(0, detail_height - 1)]
+        if detail_height:
+            lines.append(section_rule("额度历史", inner_width))
     lines.extend(" " + fit_ansi(line, chart_width) for line in chart)
 
     if len(lines) < inner_height:
@@ -182,7 +189,18 @@ def merged_account_reset_body(
     def add_text(line: str) -> None:
         lines.append(" " + fit_ansi(line, max(1, inner_width - 2)).rstrip())
 
-    add_text(f"{paint('账号类型', 'dim')} {plain_fit(merged_plan_text(accounts), inner_width - 10)}")
+    plan_label = "账号类型"
+    plan_width = max(1, inner_width - visible_width(plan_label) - 3)
+    plan_lines: list[str] = []
+    for part in merged_plan_text(accounts).split(" / "):
+        candidate = f"{plan_lines[-1]} / {part}" if plan_lines else part
+        if plan_lines and visible_width(candidate) <= plan_width:
+            plan_lines[-1] = candidate
+        else:
+            plan_lines.extend(plain_wrap(part, plan_width))
+    for line_index, line in enumerate(plan_lines):
+        label = paint(plan_label, "dim") if line_index == 0 else " " * visible_width(plan_label)
+        add_text(f"{label} {line}")
     for line in token_usage_rows(merged_lifetime_tokens(accounts), inner_width - 2):
         add_text(line)
     add_text(
@@ -249,6 +267,7 @@ def merged_quota_summary_lines(
     panel_height: int,
     curve_mode: str = DEFAULT_CURVE_MODE,
     window_scope: str = DEFAULT_WINDOW_SCOPE,
+    merged_quota_mode: str = DEFAULT_MERGED_QUOTA_MODE,
 ) -> list[str]:
     inner_width = max(10, panel_width - 2)
     inner_height = max(4, panel_height - 2)
@@ -264,6 +283,7 @@ def merged_quota_summary_lines(
         compact=True,
         curve_mode=curve_mode,
         window_scope=window_scope,
+        merged_quota_mode=merged_quota_mode,
     )
     lines.append("")
     for line in quota_lines[:2]:
@@ -301,21 +321,51 @@ def merged_account_window_points(records: list[dict[str, Any]], window: str) -> 
                 reset_epoch = timestamp + int(reset_after) if isinstance(reset_after, (int, float)) else None
             if not isinstance(left, (int, float)):
                 continue
+            multiplier = recorded_quota_multiplier(account)
             account_points.setdefault(str(index), []).append(
                 {
                     "t": timestamp,
                     "left": float(left),
                     "reset": reset_epoch if isinstance(reset_epoch, int) else None,
+                    "multiplier": multiplier,
                 }
             )
     return account_points
 
 
-def merged_value_at(account_points: dict[str, list[dict[str, Any]]], ts: int, _max_value: float) -> tuple[float, bool]:
+def historical_multiplier_at(points: Any, ts: int, fallback: float) -> float:
+    if hasattr(points, "multiplier_at"):
+        return points.multiplier_at(ts, fallback)
+    position = bisect.bisect_right(points, ts, key=lambda point: point["t"]) - 1
+    point = points[max(0, position)]
+    multiplier = point.get("multiplier")
+    return float(multiplier) if isinstance(multiplier, (int, float)) and multiplier > 0 else fallback
+
+
+def maximum_historical_multiplier(points: Any, fallback: float) -> float:
+    if hasattr(points, "maximum_multiplier"):
+        return points.maximum_multiplier(fallback)
+    return max(
+        (
+            float(point["multiplier"])
+            if isinstance(point.get("multiplier"), (int, float)) and point["multiplier"] > 0
+            else fallback
+            for point in points
+        ),
+        default=fallback,
+    )
+
+
+def merged_value_at(
+    account_points: dict[str, list[dict[str, Any]]],
+    ts: int,
+    _max_value: float,
+    account_weights: dict[str, float] | None = None,
+) -> tuple[float, bool]:
     total = 0.0
     found = False
     predicted = False
-    for points in account_points.values():
+    for account_id, points in account_points.items():
         if not points:
             continue
         if hasattr(points, "first_timestamp"):
@@ -327,13 +377,37 @@ def merged_value_at(account_points: dict[str, list[dict[str, Any]]], ts: int, _m
         if ts < first_timestamp:
             continue
         value, account_predicted = value_at(points, ts, 100.0)
-        total += value
+        if account_weights is None:
+            total += value
+        else:
+            fallback = account_weights.get(account_id, 1.0)
+            total += value / 100.0 * historical_multiplier_at(points, ts, fallback)
         found = True
         predicted = predicted or account_predicted
     return total, predicted or not found
 
 
-def merged_max_value(points: dict[str, dict[str, list[dict[str, Any]]]]) -> float:
+def merged_max_value(
+    points: dict[str, dict[str, list[dict[str, Any]]]],
+    account_weights: dict[str, float] | None = None,
+) -> float:
+    if account_weights is not None:
+        return max(
+            1.0,
+            max(
+                (
+                    sum(
+                        maximum_historical_multiplier(
+                            account_points,
+                            account_weights.get(account_id, 1.0),
+                        )
+                        for account_id, account_points in series.items()
+                    )
+                    for series in points.values()
+                ),
+                default=1.0,
+            ),
+        )
     account_count = max((len(series) for series in points.values()), default=1)
     return max(100.0, float(account_count * 100))
 
@@ -345,6 +419,8 @@ def merged_chart_lines(
     height: int,
     curve_mode: str,
     window_scope: str = DEFAULT_WINDOW_SCOPE,
+    accounts: list[dict[str, Any]] | None = None,
+    merged_quota_mode: str = DEFAULT_MERGED_QUOTA_MODE,
 ) -> list[str]:
     if not records:
         return [paint("暂无历史数据", "dim")]
@@ -362,7 +438,26 @@ def merged_chart_lines(
             key: merged_account_window_points(relevant, key)
             for key in window_keys(window_scope)
         }
-    max_value = merged_max_value(points)
+    account_weights = None
+    if merged_quota_mode == "actual":
+        account_weights = {
+            str(index): account_quota_multiplier(account)
+            for account in accounts or []
+            if isinstance(account, dict)
+            for index in [account_index(account)]
+            if index is not None
+        }
+    max_value = merged_max_value(points, account_weights)
+
+    def weighted_value_at(series: Any, ts: int, maximum: float) -> tuple[float, bool]:
+        return merged_value_at(
+            series,
+            ts,
+            maximum,
+            account_weights or {},
+        )
+
+    value_getter = weighted_value_at if account_weights is not None else merged_value_at
     return series_chart_lines(
         points,
         start_ts,
@@ -371,7 +466,9 @@ def merged_chart_lines(
         height,
         curve_mode,
         max_value,
-        merged_value_at,
+        value_getter,
+        "x" if account_weights is not None else "",
+        account_weights is not None,
     )
 
 
@@ -382,6 +479,8 @@ def merged_history_lines(
     period: str,
     curve_mode: str,
     window_scope: str = DEFAULT_WINDOW_SCOPE,
+    accounts: list[dict[str, Any]] | None = None,
+    merged_quota_mode: str = DEFAULT_MERGED_QUOTA_MODE,
 ) -> list[str]:
     inner_width = max(10, panel_width - 2)
     inner_height = max(4, panel_height - 2)
@@ -393,6 +492,8 @@ def merged_history_lines(
         inner_height,
         curve_mode,
         window_scope,
+        accounts,
+        merged_quota_mode,
     )
     lines = [" " + fit_ansi(line, chart_width) for line in chart]
     if len(lines) < inner_height:

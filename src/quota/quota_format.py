@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from quota import check_codex_quota as quota
+from quota.plans import account_plan_key, account_quota_multiplier
 from core.constants import *
 from ui.terminal_text import *
 
@@ -33,7 +34,21 @@ def account_email(account: dict[str, Any]) -> str:
 
 
 def account_plan(account: dict[str, Any]) -> str:
-    return str(account.get("plan_type") or account.get("plan") or "-")
+    plan = account_plan_key(account)
+    names = {
+        "plus": "Plus",
+        "chatgptplus": "Plus",
+        "pro": "Pro(20x)",
+        "pro-5x": "Pro(5x)",
+        "pro_5x": "Pro(5x)",
+        "pro5x": "Pro(5x)",
+        "chatgptprolite": "Pro(5x)",
+        "pro-20x": "Pro(20x)",
+        "pro_20x": "Pro(20x)",
+        "pro20x": "Pro(20x)",
+        "chatgptpro": "Pro(20x)",
+    }
+    return names.get(plan, str(account.get("plan_type") or account.get("plan") or "-"))
 
 
 def account_lifetime_tokens(account: dict[str, Any]) -> int | None:
@@ -200,6 +215,14 @@ def percent_sum_text(value: Any) -> str:
     return f"{value:g}%"
 
 
+def quota_multiple_text(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "--x"
+    if float(value).is_integer():
+        return f"{int(value)}x"
+    return f"{value:g}x"
+
+
 def merged_ratio_percent(value: Any, max_value: Any) -> float | None:
     if not isinstance(value, (int, float)) or not isinstance(max_value, (int, float)) or max_value <= 0:
         return None
@@ -215,14 +238,18 @@ def valid_quota_accounts(accounts: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 def merged_plan_text(accounts: list[dict[str, Any]]) -> str:
     counts: dict[str, int] = {}
-    for account in valid_quota_accounts(accounts):
+    for account in accounts:
+        if not isinstance(account, dict):
+            continue
         plan = account_plan(account)
         if not plan or plan == "-":
             continue
         counts[plan] = counts.get(plan, 0) + 1
     if not counts:
         return "-"
-    return " / ".join(f"{plan} x{count}" if count > 1 else plan for plan, count in counts.items())
+    order = {"Plus": 0, "Pro(5x)": 1, "Pro(20x)": 2}
+    plans = sorted(counts.items(), key=lambda item: (order.get(item[0], 3), item[0]))
+    return " / ".join(f"{plan} x{count}" for plan, count in plans)
 
 
 def merged_available_resets(accounts: list[dict[str, Any]]) -> int | None:
@@ -322,8 +349,13 @@ def merged_reset_expiration_rows(accounts: list[dict[str, Any]], limit: int = 3)
     return sorted(rows, key=lambda item: item[0])[:limit]
 
 
-def merged_window_info(accounts: list[dict[str, Any]], key: str) -> dict[str, Any]:
+def merged_window_info(
+    accounts: list[dict[str, Any]],
+    key: str,
+    merged_quota_mode: str = DEFAULT_MERGED_QUOTA_MODE,
+) -> dict[str, Any]:
     total = 0.0
+    max_left = 0.0
     contributors = 0
     reset_candidates: list[int] = []
     for account in valid_quota_accounts(accounts):
@@ -331,7 +363,13 @@ def merged_window_info(accounts: list[dict[str, Any]], key: str) -> dict[str, An
         left = info.get("left")
         if not isinstance(left, (int, float)):
             continue
-        total += float(left)
+        if merged_quota_mode == "actual":
+            multiplier = account_quota_multiplier(account)
+            total += float(left) / 100.0 * multiplier
+            max_left += multiplier
+        else:
+            total += float(left)
+            max_left += 100.0
         contributors += 1
         reset_epoch = info.get("reset_epoch")
         if isinstance(reset_epoch, int):
@@ -352,7 +390,7 @@ def merged_window_info(accounts: list[dict[str, Any]], key: str) -> dict[str, An
     left: int | float = int(total) if total.is_integer() else round(total, 2)
     return {
         "left": left,
-        "max_left": contributors * 100,
+        "max_left": int(max_left) if max_left.is_integer() else round(max_left, 2),
         "contributors": contributors,
         "reset_after": reset_after,
         "reset_at": compact_reset_at(None, nearest_reset),
@@ -360,7 +398,13 @@ def merged_window_info(accounts: list[dict[str, Any]], key: str) -> dict[str, An
     }
 
 
-def account_quota_detail_line(accounts: list[dict[str, Any]], current: int | str | None, key: str, width: int) -> str:
+def account_quota_detail_line(
+    accounts: list[dict[str, Any]],
+    current: int | str | None,
+    key: str,
+    width: int,
+    merged_quota_mode: str = DEFAULT_MERGED_QUOTA_MODE,
+) -> str:
     sortable: list[tuple[float, str]] = []
     for account in valid_quota_accounts(accounts):
         index = account_index(account)
@@ -368,8 +412,12 @@ def account_quota_detail_line(accounts: list[dict[str, Any]], current: int | str
         left = window_info(account, key).get("left")
         if not isinstance(left, (int, float)):
             continue
-        text = f"{account_id}({percent_text(left)})"
-        sortable.append((float(left), paint(text, percent_color(left))))
+        value = float(left)
+        text = percent_text(left)
+        if merged_quota_mode == "actual":
+            value = value / 100.0 * account_quota_multiplier(account)
+            text = quota_multiple_text(value)
+        sortable.append((value, paint(f"{account_id}({text})", percent_color(left))))
     entries = [text for _left, text in sorted(sortable, key=lambda item: item[0], reverse=True)]
     return ansi_ellipsis(", ".join(entries), width)
 
@@ -380,6 +428,7 @@ def merged_quota_detail_reset_line(
     key: str,
     info: dict[str, Any],
     width: int,
+    merged_quota_mode: str = DEFAULT_MERGED_QUOTA_MODE,
 ) -> str:
     reset_text = f"于 {countdown(info['reset_after'])} 后在 {info['reset_at']} 重置"
     reset = paint_style(reset_text, quota.reset_after_style(info["reset_after"]))
@@ -387,7 +436,13 @@ def merged_quota_detail_reset_line(
     detail_width = max(0, width - reset_width - 1)
     if detail_width <= 0:
         return right_ansi(reset, width)
-    detail = account_quota_detail_line(accounts, current, key, detail_width)
+    detail = account_quota_detail_line(
+        accounts,
+        current,
+        key,
+        detail_width,
+        merged_quota_mode,
+    )
     return fit_ansi(detail, detail_width) + " " + right_ansi(reset, reset_width)
 
 
@@ -399,10 +454,14 @@ def merged_quota_rows(
     compact: bool = False,
     curve_mode: str = DEFAULT_CURVE_MODE,
     window_scope: str = DEFAULT_WINDOW_SCOPE,
+    merged_quota_mode: str = DEFAULT_MERGED_QUOTA_MODE,
 ) -> list[str]:
     rows: list[str] = []
     keys = window_keys(window_scope)
-    infos = {key: merged_window_info(accounts, key) for key in keys}
+    infos = {
+        key: merged_window_info(accounts, key, merged_quota_mode)
+        for key in keys
+    }
     primary_color = len(keys) == 1 or sum(
         isinstance(info.get("left"), (int, float)) for info in infos.values()
     ) == 1
@@ -412,13 +471,26 @@ def merged_quota_rows(
         max_left = info["max_left"] if isinstance(info["max_left"], (int, float)) else 100
         label_text = window_marker_label(key, curve_mode, primary=primary_color)
         label = paint(label_text, bold=True)
-        pct_raw = percent_sum_text(left)
+        pct_raw = (
+            quota_multiple_text(left)
+            if merged_quota_mode == "actual"
+            else percent_sum_text(left)
+        )
         pct_width = max(4, visible_width(pct_raw))
         ratio = merged_ratio_percent(left, max_left)
         pct = paint(pct_raw.rjust(pct_width), percent_color(ratio))
         bar_width = max(8, width - visible_width(label_text) - 1 - 1 - pct_width)
         rows.append(f"{label} {progress_bar(left, bar_width, float(max_left))} {pct}")
-        rows.append(merged_quota_detail_reset_line(accounts, current, key, info, width))
+        rows.append(
+            merged_quota_detail_reset_line(
+                accounts,
+                current,
+                key,
+                info,
+                width,
+                merged_quota_mode,
+            )
+        )
         if key != keys[-1] and not compact:
             rows.append("")
     return rows

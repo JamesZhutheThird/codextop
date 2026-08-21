@@ -8,8 +8,40 @@ from core.constants import *
 from .history import period_bounds, period_context_timestamp, records_for_period, value_at, window_points
 from .terminal_text import *
 
-def axis_value_text(value: float) -> str:
-    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+def axis_value_text(value: float, suffix: str = "") -> str:
+    number = str(int(value)) if float(value).is_integer() else f"{value:g}"
+    return f"{number}{suffix}"
+
+
+def axis_tick_prefix(value: float | None, width: int, suffix: str = "") -> str:
+    if value is None:
+        return " " * width
+    return paint(f"{axis_value_text(value, suffix):>{width - 1}} ", "dim")
+
+
+def axis_tick_values(max_value: float, chart_height: int, nice_steps: bool = False) -> list[float]:
+    if not nice_steps:
+        return [max_value * ratio for ratio in (1.0, 0.75, 0.5, 0.25, 0.0)]
+
+    label_limit = max(1, min(6, chart_height))
+    step = 1.0
+    phase = 0
+    while True:
+        regular_count = int(max_value // step)
+        exact_max = abs(regular_count * step - max_value) < 1e-9
+        tick_count = regular_count + (0 if exact_max else 1)
+        if tick_count <= label_limit:
+            values = [step * index for index in range(1, regular_count + 1)]
+            if not exact_max:
+                values.append(max_value)
+            rows = {
+                round((max_value - value) / max_value * max(0, chart_height - 1))
+                for value in values
+            }
+            if len(rows) == len(values):
+                return values
+        step *= (2.0, 2.5, 2.0)[phase]
+        phase = (phase + 1) % 3
 
 
 def chart_series_priority(
@@ -59,18 +91,23 @@ def braille_series_chart_lines(
     height: int,
     max_value: float,
     value_getter: Any,
+    axis_suffix: str = "",
+    nice_axis_ticks: bool = False,
 ) -> list[str]:
     if width <= 10 or height <= 3:
         return [paint("暂无历史数据", "dim")]
     if not any(points.values()) or max_value <= 0:
         return [paint("暂无历史数据", "dim")]
 
-    tick_values = [max_value * ratio for ratio in (1.0, 0.75, 0.5, 0.25, 0.0)]
-    axis_width = max(4, max(visible_width(axis_value_text(value)) for value in tick_values) + 1)
+    chart_height = max(1, height - 3)
+    tick_values = axis_tick_values(max_value, chart_height, nice_axis_ticks)
+    axis_width = max(
+        4,
+        max(visible_width(axis_value_text(value, axis_suffix)) for value in tick_values) + 1,
+    )
     box_width = max(6, width - axis_width)
     plot_width = max(2, box_width - 4)
     chart_width = plot_width + 2
-    chart_height = max(1, height - 3)
     dot_width = plot_width * 2
     dot_height = chart_height * 4
     primary_color = has_single_active_series(points)
@@ -165,7 +202,7 @@ def braille_series_chart_lines(
     lines.append((" " * axis_width) + paint("┌" + "─" * chart_width + "┐", "dim"))
     for row_index, row in enumerate(grid):
         axis = tick_rows.get(row_index)
-        prefix = paint(f"{axis_value_text(axis):>{axis_width - 1}} ", "dim") if axis is not None else " " * axis_width
+        prefix = axis_tick_prefix(axis, axis_width, axis_suffix)
         plot = "".join(paint(braille_char(mask), color) if mask else " " for mask, color, _priority in row)
         line = prefix + paint("│", "dim") + " " + plot + " " + paint("│", "dim")
         lines.append(fit_ansi(line, width))
@@ -184,18 +221,23 @@ def bar_series_chart_lines(
     height: int,
     max_value: float,
     value_getter: Any,
+    axis_suffix: str = "",
+    nice_axis_ticks: bool = False,
 ) -> list[str]:
     if width <= 10 or height <= 3:
         return [paint("暂无历史数据", "dim")]
     if not any(points.values()) or max_value <= 0:
         return [paint("暂无历史数据", "dim")]
 
-    tick_values = [max_value * ratio for ratio in (1.0, 0.75, 0.5, 0.25, 0.0)]
-    axis_width = max(4, max(visible_width(axis_value_text(value)) for value in tick_values) + 1)
+    chart_height = max(2, height - 3)
+    tick_values = axis_tick_values(max_value, chart_height, nice_axis_ticks)
+    axis_width = max(
+        4,
+        max(visible_width(axis_value_text(value, axis_suffix)) for value in tick_values) + 1,
+    )
     box_width = max(6, width - axis_width)
     plot_width = max(2, box_width - 4)
     chart_width = plot_width + 2
-    chart_height = max(2, height - 3)
     sub_width = plot_width * 2
     sub_height = chart_height * 2
     primary_color = has_single_active_series(points)
@@ -251,7 +293,7 @@ def bar_series_chart_lines(
     lines.append((" " * axis_width) + paint("┌" + "─" * chart_width + "┐", "dim"))
     for row_index, row in enumerate(grid):
         axis = tick_rows.get(row_index)
-        prefix = paint(f"{axis_value_text(axis):>{axis_width - 1}} ", "dim") if axis is not None else " " * axis_width
+        prefix = axis_tick_prefix(axis, axis_width, axis_suffix)
         plot = "".join(paint(bar_cell_char(mask), color) if mask else " " for mask, color, _priority, _color_row in row)
         line = prefix + paint("│", "dim") + " " + plot + " " + paint("│", "dim")
         lines.append(fit_ansi(line, width))
@@ -270,18 +312,23 @@ def fine_bar_series_chart_lines(
     height: int,
     max_value: float,
     value_getter: Any,
+    axis_suffix: str = "",
+    nice_axis_ticks: bool = False,
 ) -> list[str]:
     if width <= 10 or height <= 3:
         return [paint("暂无历史数据", "dim")]
     if not any(points.values()) or max_value <= 0:
         return [paint("暂无历史数据", "dim")]
 
-    tick_values = [max_value * ratio for ratio in (1.0, 0.75, 0.5, 0.25, 0.0)]
-    axis_width = max(4, max(visible_width(axis_value_text(value)) for value in tick_values) + 1)
+    chart_height = max(2, height - 3)
+    tick_values = axis_tick_values(max_value, chart_height, nice_axis_ticks)
+    axis_width = max(
+        4,
+        max(visible_width(axis_value_text(value, axis_suffix)) for value in tick_values) + 1,
+    )
     box_width = max(6, width - axis_width)
     plot_width = max(2, box_width - 4)
     chart_width = plot_width + 2
-    chart_height = max(2, height - 3)
     dot_width = plot_width * 2
     dot_height = chart_height * 4
     primary_color = has_single_active_series(points)
@@ -336,7 +383,7 @@ def fine_bar_series_chart_lines(
     lines.append((" " * axis_width) + paint("┌" + "─" * chart_width + "┐", "dim"))
     for row_index, row in enumerate(grid):
         axis = tick_rows.get(row_index)
-        prefix = paint(f"{axis_value_text(axis):>{axis_width - 1}} ", "dim") if axis is not None else " " * axis_width
+        prefix = axis_tick_prefix(axis, axis_width, axis_suffix)
         plot = "".join(
             paint(braille_char(mask), color) if mask else " "
             for mask, color, _priority, _color_row in row
@@ -358,24 +405,59 @@ def series_chart_lines(
     curve_mode: str,
     max_value: float,
     value_getter: Any = value_at,
+    axis_suffix: str = "",
+    nice_axis_ticks: bool = False,
 ) -> list[str]:
     if width <= 10 or height <= 3:
         return [paint("暂无历史数据", "dim")]
     if not any(points.values()) or max_value <= 0:
         return [paint("暂无历史数据", "dim")]
     if curve_mode == "braille":
-        return braille_series_chart_lines(points, start_ts, end_ts, width, height, max_value, value_getter)
+        return braille_series_chart_lines(
+            points,
+            start_ts,
+            end_ts,
+            width,
+            height,
+            max_value,
+            value_getter,
+            axis_suffix,
+            nice_axis_ticks,
+        )
     if curve_mode == "bar":
-        return bar_series_chart_lines(points, start_ts, end_ts, width, height, max_value, value_getter)
+        return bar_series_chart_lines(
+            points,
+            start_ts,
+            end_ts,
+            width,
+            height,
+            max_value,
+            value_getter,
+            axis_suffix,
+            nice_axis_ticks,
+        )
     if curve_mode == "fine_bar":
-        return fine_bar_series_chart_lines(points, start_ts, end_ts, width, height, max_value, value_getter)
+        return fine_bar_series_chart_lines(
+            points,
+            start_ts,
+            end_ts,
+            width,
+            height,
+            max_value,
+            value_getter,
+            axis_suffix,
+            nice_axis_ticks,
+        )
 
-    tick_values = [max_value * ratio for ratio in (1.0, 0.75, 0.5, 0.25, 0.0)]
-    axis_width = max(4, max(visible_width(axis_value_text(value)) for value in tick_values) + 1)
+    chart_height = max(2, height - 3)
+    tick_values = axis_tick_values(max_value, chart_height, nice_axis_ticks)
+    axis_width = max(
+        4,
+        max(visible_width(axis_value_text(value, axis_suffix)) for value in tick_values) + 1,
+    )
     box_width = max(6, width - axis_width)
     plot_width = max(2, box_width - 4)
     chart_width = plot_width + 2
-    chart_height = max(2, height - 3)
     primary_color = has_single_active_series(points)
 
     grid: list[list[tuple[str, str, int]]] = [
@@ -508,7 +590,7 @@ def series_chart_lines(
     lines.append((" " * axis_width) + paint("┌" + "─" * chart_width + "┐", "dim"))
     for row_index, row in enumerate(grid):
         axis = tick_rows.get(row_index)
-        prefix = paint(f"{axis_value_text(axis):>{axis_width - 1}} ", "dim") if axis is not None else " " * axis_width
+        prefix = axis_tick_prefix(axis, axis_width, axis_suffix)
         plot = "".join(paint(char, color) if char != " " else " " for char, color, _priority in row)
         line = prefix + paint("│", "dim") + " " + plot + " " + paint("│", "dim")
         lines.append(fit_ansi(line, width))

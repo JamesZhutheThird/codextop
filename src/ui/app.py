@@ -29,6 +29,7 @@ from core.state import (
     saved_curve_mode,
     saved_display_scope,
     saved_interval,
+    saved_merged_quota_mode,
     saved_period,
     saved_usage_axis_scale,
     saved_usage_directory_scope,
@@ -39,7 +40,11 @@ from core.state import (
 )
 from core.update_check import start_daily_update_check, update_check_path
 from .terminal_io import TerminalSession, parse_input
-from .terminal_text import fit_ansi, paint
+from .terminal_text import center_ansi, fit_ansi, paint
+
+
+DASHBOARD_MIN_PANEL_HEIGHT = 29  # Account details plus a four-line history chart.
+
 
 def _render_main_content(
     state: MonitorState,
@@ -168,6 +173,7 @@ def _render_main_content(
                 top_height,
                 state.curve_mode,
                 state.window_scope,
+                getattr(state, "merged_quota_mode", DEFAULT_MERGED_QUOTA_MODE),
             ),
             top_right_width,
             top_height,
@@ -187,6 +193,12 @@ def _render_main_content(
                 state.period,
                 state.curve_mode,
                 state.window_scope,
+                accounts=accounts,
+                merged_quota_mode=getattr(
+                    state,
+                    "merged_quota_mode",
+                    DEFAULT_MERGED_QUOTA_MODE,
+                ),
             ),
             main_width,
             history_height,
@@ -198,17 +210,27 @@ def _render_main_content(
         left_lines = left_lines[:content_height]
     else:
         columns = min(3, len(accounts))
-        row_count = max(1, (len(accounts) + columns - 1) // columns)
-        base_row_height = max(8, content_height // row_count)
-        left_lines = []
-        for offset in range(0, len(accounts), columns):
-            chunk = accounts[offset:offset + columns]
+        total_rows = (len(accounts) + columns - 1) // columns
+        visible_rows = max(1, content_height // DASHBOARD_MIN_PANEL_HEIGHT)
+        overflow = total_rows > visible_rows
+        body_height = max(4, content_height - 2) if overflow else content_height
+        visible_rows = min(total_rows, max(1, body_height // DASHBOARD_MIN_PANEL_HEIGHT))
+        page_size = min(len(accounts), visible_rows * columns)
+        page_count = (len(accounts) + page_size - 1) // page_size
+        page_index = (state.summary_offset // page_size) % page_count if overflow else 0
+        start = page_index * page_size
+        visible_accounts = accounts[start:start + page_size]
+        row_count = max(1, (len(visible_accounts) + columns - 1) // columns)
+        base_row_height = max(4, body_height // row_count)
+        panel_width = max(24, main_width // columns)
+        widths = [panel_width] * columns
+        widths[-1] += max(0, main_width - sum(widths))
+        body_lines = []
+        for offset in range(0, len(visible_accounts), columns):
+            chunk = visible_accounts[offset:offset + columns]
             row_height = base_row_height
-            if offset + columns >= len(accounts):
-                row_height = max(8, content_height - len(left_lines))
-            panel_width = max(24, main_width // columns)
-            widths = [panel_width] * columns
-            widths[-1] += max(0, main_width - sum(widths))
+            if offset + columns >= len(visible_accounts):
+                row_height = max(4, body_height - len(body_lines))
             blocks = []
             for account, width in zip(chunk, widths):
                 index = account_index(account)
@@ -235,11 +257,27 @@ def _render_main_content(
                     )
                 )
             while len(blocks) < columns:
-                blocks.append([" " * panel_width for _ in range(row_height)])
-            left_lines.extend(compose_columns(blocks, widths, row_height))
-        if len(left_lines) < content_height:
-            left_lines.extend([" " * main_width] * (content_height - len(left_lines)))
-        left_lines = left_lines[:content_height]
+                width = widths[len(blocks)]
+                blocks.append([" " * width for _ in range(row_height)])
+            body_lines.extend(compose_columns(blocks, widths, row_height))
+        body_lines = body_lines[:body_height]
+        if len(body_lines) < body_height:
+            body_lines.extend([" " * main_width] * (body_height - len(body_lines)))
+        if overflow:
+            up_text = "▲ 上一页"
+            down_text = "▼ 下一页"
+            current_offset = state.summary_offset % len(accounts)
+            previous_start = ((page_index - 1) % page_count) * page_size
+            next_start = ((page_index + 1) % page_count) * page_size
+            left_lines = [
+                fit_ansi(paint(center_ansi(up_text, main_width), "cyan", bold=True, reverse=True), main_width),
+                *body_lines,
+                fit_ansi(paint(center_ansi(down_text, main_width), "cyan", bold=True, reverse=True), main_width),
+            ]
+            zones.append(ClickZone(1, main_width, 1, "summary_scroll", previous_start - current_offset))
+            zones.append(ClickZone(1, main_width, content_height, "summary_scroll", next_start - current_offset))
+        else:
+            left_lines = body_lines
     return left_lines, main_width, content_height
 
 
@@ -381,6 +419,7 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
         state.curve_mode,
         state.display_scope,
         state.window_scope,
+        getattr(state, "merged_quota_mode", DEFAULT_MERGED_QUOTA_MODE),
         state.usage_directory_scope,
         state.usage_panel_layout,
         getattr(state, "usage_axis_scale", DEFAULT_USAGE_AXIS_SCALE),
@@ -521,6 +560,12 @@ def main() -> int:
         help="额度窗口：both 同时显示 5h/7d，5h 只显示 5h，7d 只显示 7d。",
     )
     parser.add_argument(
+        "--merged-quota-mode",
+        choices=[value for _label, value in MERGED_QUOTA_MODE_CHOICES],
+        default=None,
+        help="合并额度：percent 百分比叠加，actual 按 Plus 1x / Pro 5x / Pro 20x 叠加。",
+    )
+    parser.add_argument(
         "--color-scheme",
         choices=[value for _label, value in color_schemes.color_scheme_choices()],
         default=None,
@@ -593,6 +638,11 @@ def main() -> int:
         display_scope=args.display_scope or saved_display_scope(saved_state) or DEFAULT_DISPLAY_SCOPE,
         window_scope=args.window_scope or saved_window_scope(saved_state) or DEFAULT_WINDOW_SCOPE,
         color_scheme=selected_color_scheme,
+        merged_quota_mode=(
+            args.merged_quota_mode
+            or saved_merged_quota_mode(saved_state)
+            or DEFAULT_MERGED_QUOTA_MODE
+        ),
         usage_directory_scope=selected_usage_directory_scope,
         usage_panel_layout=selected_usage_panel_layout,
         usage_axis_scale=selected_usage_axis_scale,

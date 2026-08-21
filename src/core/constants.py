@@ -19,6 +19,7 @@ DEFAULT_PERIOD = "5h"
 DEFAULT_CURVE_MODE = "connected"
 DEFAULT_DISPLAY_SCOPE = "all"
 DEFAULT_WINDOW_SCOPE = "both"
+DEFAULT_MERGED_QUOTA_MODE = "percent"
 DEFAULT_USAGE_DIRECTORY_SCOPE = "current"
 DEFAULT_USAGE_PANEL_LAYOUT = "combined"
 DEFAULT_USAGE_AXIS_SCALE = "default"
@@ -63,6 +64,10 @@ WINDOW_SCOPE_CHOICES = [
     ("同时", "both"),
     ("仅 5h", "5h"),
     ("仅 7d", "7d"),
+]
+MERGED_QUOTA_MODE_CHOICES = [
+    ("百分比叠加", "percent"),
+    ("实际额度叠加", "actual"),
 ]
 PERIOD_SECONDS = {
     "5m": 5 * 60,

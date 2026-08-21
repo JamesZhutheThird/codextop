@@ -15,6 +15,7 @@ from typing import Any
 
 from core.constants import *
 from quota.windows import window_key_for_seconds
+from quota.plans import recorded_quota_multiplier
 from .models import MonitorState
 from core.paths import iter_snapshot_log_paths, recent_month_keys
 
@@ -92,6 +93,8 @@ def inherit_snapshot_account_identity(
     for account in accounts:
         if not isinstance(account, dict):
             continue
+        if account.get("plan") or account.get("plan_type"):
+            account.pop("_plan_inherited", None)
         previous = previous_by_index.get(account.get("i"))
         if not isinstance(previous, dict):
             continue
@@ -101,6 +104,7 @@ def inherit_snapshot_account_identity(
             previous_plan = previous.get("plan") or previous.get("plan_type")
             if previous_plan:
                 account["plan"] = previous_plan
+                account["_plan_inherited"] = True
         if not isinstance(account.get("rc"), int) and isinstance(previous.get("rc"), int):
             account["rc"] = previous["rc"]
             account["r"] = copy.deepcopy(previous.get("r", []))
@@ -267,10 +271,12 @@ class HistorySeries:
     times: array
     values: array
     resets: array
+    multiplier_times: array
+    multipliers: array
 
     @classmethod
     def empty(cls) -> "HistorySeries":
-        return cls(array("q"), array("d"), array("q"))
+        return cls(array("q"), array("d"), array("q"), array("q"), array("d"))
 
     def __len__(self) -> int:
         return len(self.times)
@@ -279,16 +285,49 @@ class HistorySeries:
     def first_timestamp(self) -> int:
         return int(self.times[0])
 
-    def append(self, timestamp: int, value: float, reset_epoch: int | None) -> None:
+    def append(
+        self,
+        timestamp: int,
+        value: float,
+        reset_epoch: int | None,
+        multiplier: float | None = None,
+    ) -> None:
         self.times.append(timestamp)
         self.values.append(value)
         self.resets.append(reset_epoch if isinstance(reset_epoch, int) else -1)
+        stored_multiplier = (
+            float(multiplier)
+            if isinstance(multiplier, (int, float)) and multiplier > 0
+            else 0.0
+        )
+        if not self.multipliers or self.multipliers[-1] != stored_multiplier:
+            self.multiplier_times.append(timestamp)
+            self.multipliers.append(stored_multiplier)
 
     def remove_timestamp(self, timestamp: int) -> None:
         while self.times and self.times[-1] == timestamp:
             self.times.pop()
             self.values.pop()
             self.resets.pop()
+        while self.multiplier_times and self.multiplier_times[-1] == timestamp:
+            self.multiplier_times.pop()
+            self.multipliers.pop()
+
+    def multiplier_at(self, timestamp: int, fallback: float) -> float:
+        position = bisect.bisect_right(self.multiplier_times, timestamp) - 1
+        if position < 0:
+            return fallback
+        multiplier = float(self.multipliers[position])
+        return multiplier if multiplier > 0 else fallback
+
+    def maximum_multiplier(self, fallback: float, minimum_timestamp: int | None = None) -> float:
+        start = 0
+        if minimum_timestamp is not None:
+            start = max(0, bisect.bisect_right(self.multiplier_times, minimum_timestamp) - 1)
+        return max(
+            (float(value) if value > 0 else fallback for value in self.multipliers[start:]),
+            default=fallback,
+        )
 
     def value_at(self, timestamp: int, reset_value: float, start: int = 0) -> tuple[float, bool]:
         position = bisect.bisect_right(self.times, timestamp, lo=start) - 1
@@ -335,6 +374,12 @@ class HistorySeriesView:
 
     def value_at(self, timestamp: int, reset_value: float) -> tuple[float, bool]:
         return self.series.value_at(timestamp, reset_value, self.start)
+
+    def multiplier_at(self, timestamp: int, fallback: float) -> float:
+        return self.series.multiplier_at(timestamp, fallback)
+
+    def maximum_multiplier(self, fallback: float) -> float:
+        return self.series.maximum_multiplier(fallback, self.first_timestamp)
 
 
 @dataclass(slots=True)
@@ -408,6 +453,7 @@ class HistorySeriesIndex:
             quota = account.get("q")
             if not isinstance(quota, dict):
                 continue
+            multiplier = recorded_quota_multiplier(account)
             windows = self._accounts.setdefault(index, {})
             for window in ("5h", "7d"):
                 raw = quota.get(window)
@@ -417,7 +463,12 @@ class HistorySeriesIndex:
                 if series is None:
                     series = HistorySeries.empty()
                     windows[window] = series
-                series.append(timestamp, float(raw[0]), raw[1] if isinstance(raw[1], int) else None)
+                series.append(
+                    timestamp,
+                    float(raw[0]),
+                    raw[1] if isinstance(raw[1], int) else None,
+                    multiplier,
+                )
 
     def replace_timestamp(self, timestamp: int, record: dict[str, Any]) -> None:
         for windows in self._accounts.values():

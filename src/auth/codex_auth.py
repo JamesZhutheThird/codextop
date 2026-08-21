@@ -8,7 +8,9 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -44,6 +46,7 @@ BACKUPS_PER_PROVIDER = 10
 AUTH_FILE_RE = re.compile(r"auth-([A-Za-z0-9][A-Za-z0-9_.-]*)\.json$")
 MODEL_PROVIDER_RE = re.compile(r'(?m)^(\s*model_provider\s*=\s*)"([^"]+)"(\s*)$')
 KNOWN_NON_OPENAI_PROVIDERS = {"third-party-api","api"}
+FILE_AUTH_CONFIG = 'cli_auth_credentials_store="file"'
 
 
 class AuthError(Exception):
@@ -69,6 +72,10 @@ def auth_file_map() -> dict[str, Path]:
     return {keyword: path for keyword, path in discover_auth_files()}
 
 
+def new_auth_hint(target: str) -> str:
+    return f"\n提示：可使用 CODEXAUTH --new {target} 添加该 provider。"
+
+
 def resolve_auth_target(target: str) -> str:
     value = normalize_auth_keyword(target)
     if value is None:
@@ -78,13 +85,33 @@ def resolve_auth_target(target: str) -> str:
         for keyword in (value, f"openai-{value}"):
             if keyword in configs:
                 return keyword
-        raise AuthError(f"target auth file not found: auth-{value}.json or auth-openai-{value}.json")
+        raise AuthError(
+            f"target auth file not found: auth-{value}.json or auth-openai-{value}.json"
+            f"{new_auth_hint(value)}"
+        )
     if value in configs:
         return value
     lower_map = {keyword.lower(): keyword for keyword in configs}
     if value.lower() in lower_map:
         return lower_map[value.lower()]
-    raise AuthError(f"target auth file not found: auth-{value}.json")
+    raise AuthError(f"target auth file not found: auth-{value}.json{new_auth_hint(value)}")
+
+
+def normalize_new_auth_target(target: str) -> str:
+    value = normalize_auth_keyword(target)
+    if value is None:
+        raise AuthError("missing new auth target")
+    numeric = re.fullmatch(r"(?:openai-)?(\d+)", value, re.IGNORECASE)
+    if numeric:
+        number = int(numeric.group(1))
+        if number <= 0:
+            raise AuthError("new auth provider number must be greater than 0")
+        value = f"openai-{number}"
+    if AUTH_FILE_RE.fullmatch(f"auth-{value}.json") is None:
+        raise AuthError("invalid new auth target; use letters, numbers, dots, dashes, or underscores")
+    if value.lower() in {"openai", *KNOWN_NON_OPENAI_PROVIDERS}:
+        raise AuthError(f"reserved provider name: {value}")
+    return value
 
 
 def read_auth_payload(path: Path) -> dict[str, Any]:
@@ -278,7 +305,10 @@ def save_active_auth(current_provider: str) -> None:
 def switch_openai_auth(target_provider: str) -> None:
     target_auth_file = auth_file(target_provider)
     if not target_auth_file.exists():
-        raise AuthError(f"target auth file not found: {target_auth_file}")
+        raise AuthError(
+            f"target auth file not found: {target_auth_file}"
+            f"{new_auth_hint(target_provider)}"
+        )
 
     current_provider = read_current_provider()
     if current_provider is not None and auth_file(current_provider).exists():
@@ -463,6 +493,66 @@ def assert_no_running_codex_processes() -> None:
     raise AuthError(f"refusing to switch provider while Codex is running: {rendered}")
 
 
+def run_device_login(login_home: Path) -> str:
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(login_home)
+    process: subprocess.Popen[Any] | None = None
+    try:
+        process = subprocess.Popen(
+            ["codex", "login", "--device-auth", "-c", FILE_AUTH_CONFIG],
+            env=env,
+        )
+        return_code = process.wait()
+    except FileNotFoundError as exc:
+        raise AuthError("codex command not found on PATH") from exc
+    except KeyboardInterrupt as exc:
+        if process is not None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        raise AuthError("Codex device login cancelled") from exc
+    if return_code != 0:
+        raise AuthError(f"Codex device login failed with exit code {return_code}")
+
+    status = subprocess.run(
+        ["codex", "login", "-c", FILE_AUTH_CONFIG, "status"],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    status_text = (status.stdout or status.stderr).strip()
+    if status.returncode != 0 or not status_text:
+        raise AuthError("cannot verify Codex login status")
+    return status_text
+
+
+def validate_new_auth(path: Path, keyword: str) -> dict[str, Any]:
+    from quota.check_codex_quota import collect_account, load_auth_credentials
+
+    try:
+        _access_token, account_id = load_auth_credentials(path)
+    except Exception as exc:
+        raise AuthError(f"cannot verify account information: {exc}") from exc
+    report = collect_account(keyword, path, keyword, "Asia/Shanghai")
+    if report.get("error"):
+        raise AuthError(f"cannot verify account status: {report['error']}")
+    if not any((account_id, report.get("email"), report.get("plan_type"))):
+        raise AuthError("cannot verify account information")
+    if not isinstance(report.get("allowed"), bool):
+        raise AuthError("cannot verify account status")
+    return report
+
+
+def request_sampler_refresh() -> None:
+    from quota.codex_quota_sampler import write_control
+
+    write_control(PATHS.log_dir / "sampler_control.json", sample_now=True, all_auth=True)
+
+
 def command_current(as_json: bool) -> int:
     registry = sync_registry()
     if as_json:
@@ -491,9 +581,50 @@ def command_sync(as_json: bool) -> int:
     return 0
 
 
-def command_switch(target: str, as_json: bool) -> int:
+def command_new(target: str, as_json: bool) -> int:
+    keyword = normalize_new_auth_target(target)
+    target_auth_file = auth_file(keyword)
+    if target_auth_file.exists():
+        raise AuthError(f"provider already exists: {keyword}")
     assert_no_running_codex_processes()
+
+    output = sys.stderr if as_json else sys.stdout
+    print(
+        f"正在通过 device auth 登录新 provider【{keyword}】...\n\n"
+        "请按照下方登录信息在网页版完成登录；等待期间可按 Ctrl-C 取消。\n",
+        file=output,
+        flush=True,
+    )
+    with tempfile.TemporaryDirectory(prefix=".codexauth-login-", dir=PATHS.runtime_dir) as temp_dir:
+        login_home = Path(temp_dir)
+        if CONFIG_FILE.exists():
+            shutil.copy2(CONFIG_FILE, login_home / "config.toml")
+        run_device_login(login_home)
+        login_auth_file = login_home / "auth.json"
+        validate_new_auth(login_auth_file, keyword)
+        shutil.copy2(login_auth_file, target_auth_file)
+        target_auth_file.chmod(0o600)
+
+    switch_openai_auth(keyword)
+    registry = sync_registry()
+    request_sampler_refresh()
+    if as_json:
+        print(json.dumps(registry, ensure_ascii=False, indent=2))
+    else:
+        print()
+        print(f"已新增并切换 provider【{keyword}】")
+        print("Codex 登录状态、账号信息和额度状态验证通过")
+        print(f"provider: {registry['current_provider_path']}")
+        print(f"registry: {registry['registry_path']}")
+    return 0
+
+
+def command_switch(target: str, as_json: bool) -> int:
     value = target.strip().lower()
+    target_provider = None
+    if value not in {"0", "openai", *KNOWN_NON_OPENAI_PROVIDERS}:
+        target_provider = resolve_auth_target(value)
+    assert_no_running_codex_processes()
     before = sync_registry()
     current_provider = read_current_provider()
 
@@ -509,7 +640,7 @@ def command_switch(target: str, as_json: bool) -> int:
             set_model_provider("openai")
             write_provider_config("openai", current_provider)
     else:
-        switch_openai_auth(resolve_auth_target(value))
+        switch_openai_auth(target_provider or value)
 
     after = sync_registry()
     if as_json:
@@ -524,6 +655,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Manage CodexTOP auth slots, provider state, and provider switching."
     )
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    parser.add_argument("--new", metavar="TARGET", help="Add a provider with Codex device authentication.")
     parser.add_argument("command", nargs="?", help="current, list, sync, switch, or legacy provider target.")
     parser.add_argument("target", nargs="?", help="Target provider for `switch`, or legacy switch value.")
     return parser
@@ -533,6 +665,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     try:
+        if args.new is not None:
+            if args.command is not None or args.target is not None:
+                raise AuthError("--new cannot be combined with another command")
+            return command_new(args.new, args.json)
         if not args.command:
             return command_current(args.json)
         if args.command == "current":
