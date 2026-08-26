@@ -8,10 +8,22 @@ from typing import Any
 
 from .charts import *
 from core.constants import *
-from .models import ClickZone
+from core.i18n import t
 from quota.quota_format import *
 from quota.plans import recorded_quota_multiplier
 from .terminal_text import *
+
+DASHBOARD_PANEL_WIDTH = {
+    "lower": 30,
+    "default": 60,
+    "upper": 180,
+}
+DASHBOARD_PANEL_HEIGHT = {
+    "lower": 20,
+    "default": 40,
+    "upper": 80,
+}
+
 
 def account_lines(
     account: dict[str, Any],
@@ -22,11 +34,13 @@ def account_lines(
     current: int | str | None,
     curve_mode: str,
     window_scope: str = DEFAULT_WINDOW_SCOPE,
+    hide_account_info: bool = DEFAULT_HIDE_ACCOUNT_INFO,
 ) -> list[str]:
     inner_width = max(10, panel_width - 2)
     inner_height = max(4, panel_height - 2)
     index = account_index(account)
     lines: list[str] = []
+    compact = panel_height <= 30
 
     error = account_error(account)
     def add_blank() -> None:
@@ -36,28 +50,40 @@ def account_lines(
         lines.append(" " + fit_ansi(line, max(1, inner_width - 2)).rstrip())
 
     def add_section(title: str) -> None:
-        add_blank()
+        if not compact:
+            add_blank()
         lines.append(section_rule(title, inner_width))
-        add_blank()
+        if not compact:
+            add_blank()
 
-    add_blank()
-    add_text(f"{paint('账号邮箱', 'dim')} {plain_fit(account_email(account), inner_width - 11)}")
-    add_text(f"{paint('账号类型', 'dim')} {plain_fit(account_plan(account), inner_width - 11)}")
+    if not compact:
+        add_blank()
+    email_label = t("account.email")
+    plan_label = t("account.type")
+    add_text(
+        f"{paint(email_label, 'dim')} "
+        f"{plain_fit(account_email(account, hide_account_info), inner_width - visible_width(email_label) - 3)}"
+    )
+    add_text(
+        f"{paint(plan_label, 'dim')} "
+        f"{plain_fit(account_plan(account), inner_width - visible_width(plan_label) - 3)}"
+    )
     for line in token_usage_rows(account_lifetime_tokens(account), inner_width - 2):
         add_text(line)
     if error:
-        add_section("错误")
+        add_section(t("common.error"))
         for error_line in plain_wrap(error, inner_width - 2):
             add_text(paint(error_line, "red"))
         return [fit_ansi(line, inner_width) for line in lines[:inner_height]]
 
-    add_section("重置次数")
+    add_section(t("section.reset_credits"))
     for line in reset_rows(account, inner_width - 2):
         add_text(line)
-    add_section("当前额度")
+    add_section(t("section.current_quota"))
     for line in quota_rows(
         account,
         inner_width - 2,
+        compact=compact,
         curve_mode=curve_mode,
         window_scope=window_scope,
     ):
@@ -65,7 +91,7 @@ def account_lines(
             add_text(line)
         else:
             add_blank()
-    add_section("额度历史")
+    add_section(t("section.quota_history"))
 
     chart_height = max(4, inner_height - len(lines))
     chart_width = max(8, inner_width - 2)
@@ -80,12 +106,12 @@ def account_lines(
             window_scope,
         )
     else:
-        chart = chart_box([paint("暂无历史数据", "dim")], chart_width, chart_height)
+        chart = chart_box([paint(t("common.no_history"), "dim")], chart_width, chart_height)
     detail_height = max(0, inner_height - len(chart))
     if len(lines) > detail_height:
         lines = lines[:max(0, detail_height - 1)]
         if detail_height:
-            lines.append(section_rule("额度历史", inner_width))
+            lines.append(section_rule(t("section.quota_history"), inner_width))
     lines.extend(" " + fit_ansi(line, chart_width) for line in chart)
 
     if len(lines) < inner_height:
@@ -98,27 +124,36 @@ def account_summary_body(
     inner_width: int,
     curve_mode: str = DEFAULT_CURVE_MODE,
     window_scope: str = DEFAULT_WINDOW_SCOPE,
+    hide_account_info: bool = DEFAULT_HIDE_ACCOUNT_INFO,
 ) -> list[str]:
     lines: list[str] = []
 
     def add_text(line: str) -> None:
         lines.append(" " + fit_ansi(line, max(1, inner_width - 2)).rstrip())
 
-    add_text(f"{paint('账号邮箱', 'dim')} {plain_fit(account_email(account), inner_width - 11)}")
-    add_text(f"{paint('账号类型', 'dim')} {plain_fit(account_plan(account), inner_width - 11)}")
+    email_label = t("account.email")
+    plan_label = t("account.type")
+    add_text(
+        f"{paint(email_label, 'dim')} "
+        f"{plain_fit(account_email(account, hide_account_info), inner_width - visible_width(email_label) - 3)}"
+    )
+    add_text(
+        f"{paint(plan_label, 'dim')} "
+        f"{plain_fit(account_plan(account), inner_width - visible_width(plan_label) - 3)}"
+    )
     for line in token_usage_rows(account_lifetime_tokens(account), inner_width - 2):
         add_text(line)
 
     error = account_error(account)
     if error:
-        lines.append(section_rule("错误", inner_width))
+        lines.append(section_rule(t("common.error"), inner_width))
         for error_line in plain_wrap(error, inner_width - 2):
             add_text(paint(error_line, "red"))
     else:
-        lines.append(section_rule("重置次数", inner_width))
+        lines.append(section_rule(t("section.reset_credits"), inner_width))
         for line in reset_rows(account, inner_width - 2):
             add_text(line)
-        lines.append(section_rule("当前额度", inner_width))
+        lines.append(section_rule(t("section.current_quota"), inner_width))
         for line in quota_rows(
             account,
             inner_width - 2,
@@ -137,10 +172,17 @@ def account_summary_lines(
     panel_height: int,
     curve_mode: str = DEFAULT_CURVE_MODE,
     window_scope: str = DEFAULT_WINDOW_SCOPE,
+    hide_account_info: bool = DEFAULT_HIDE_ACCOUNT_INFO,
 ) -> list[str]:
     inner_width = max(10, panel_width - 2)
     inner_height = max(4, panel_height - 2)
-    lines = account_summary_body(account, inner_width, curve_mode, window_scope)
+    lines = account_summary_body(
+        account,
+        inner_width,
+        curve_mode,
+        window_scope,
+        hide_account_info,
+    )
 
     if len(lines) < inner_height:
         lines.extend([""] * (inner_height - len(lines)))
@@ -161,7 +203,7 @@ def account_history_lines(
     chart_width = max(8, inner_width - 2)
     index = account_index(account)
     if index is None:
-        chart = chart_box([paint("暂无历史数据", "dim")], chart_width, inner_height)
+        chart = chart_box([paint(t("common.no_history"), "dim")], chart_width, inner_height)
     else:
         chart = chart_lines(
             records,
@@ -189,7 +231,7 @@ def merged_account_reset_body(
     def add_text(line: str) -> None:
         lines.append(" " + fit_ansi(line, max(1, inner_width - 2)).rstrip())
 
-    plan_label = "账号类型"
+    plan_label = t("account.type")
     plan_width = max(1, inner_width - visible_width(plan_label) - 3)
     plan_lines: list[str] = []
     for part in merged_plan_text(accounts).split(" / "):
@@ -204,7 +246,7 @@ def merged_account_reset_body(
     for line in token_usage_rows(merged_lifetime_tokens(accounts), inner_width - 2):
         add_text(line)
     add_text(
-        f"{paint('当前账号', 'dim')} "
+        f"{paint(t('account.current'), 'dim')} "
         f"{current_account_quota_summary(accounts, current, window_scope)}"
     )
     errors = [
@@ -213,7 +255,7 @@ def merged_account_reset_body(
         if isinstance(account, dict) and account_error(account)
     ]
     if errors:
-        lines.append(section_rule("数据状态", inner_width))
+        lines.append(section_rule(t("section.data_status"), inner_width))
         for account, error in errors:
             account_id = account_index(account)
             prefix = f"{account_id if account_id is not None else '-'}: "
@@ -223,9 +265,11 @@ def merged_account_reset_body(
                 add_text(paint(f"{line_prefix}{error_line}", "red"))
         return [fit_ansi(line, inner_width) for line in lines]
 
-    lines.append(section_rule("额度重置", inner_width))
+    lines.append(section_rule(t("section.quota_resets"), inner_width))
     available = merged_available_resets(accounts)
-    add_text(f"{paint('重置次数', 'dim')} 合计 {available if isinstance(available, int) else '-'} 次可用")
+    reset_label = t("section.reset_credits")
+    reset_count = available if isinstance(available, int) else "-"
+    add_text(f"{paint(reset_label, 'dim')} {t('quota.reset_total', count=reset_count)}")
     expirations = merged_reset_expiration_rows(accounts, 3)
     day_width = reset_credit_day_width(
         [expire_epoch - int(time.time()) for expire_epoch, _account_id, _title in expirations]
@@ -235,9 +279,9 @@ def merged_account_reset_body(
             expire_epoch, account_id, _title = expirations[rank - 1]
             remaining = max(0, expire_epoch - int(time.time()))
             countdown_text = reset_credit_countdown(remaining, day_width)
-            row = f"{rank}. 来自 {account_id} 于 {countdown_text} 后过期"
+            row = t("quota.expiration_from", rank=rank, account=account_id, countdown=countdown_text)
             if visible_width(row) > inner_width:
-                row = f"{rank}. {account_id} 于 {countdown_text} 后过期"
+                row = t("quota.expiration_compact", rank=rank, account=account_id, countdown=countdown_text)
             lines.append(center_ansi(row, inner_width))
         else:
             lines.append(center_ansi(f"{rank}. -", inner_width))
@@ -423,7 +467,7 @@ def merged_chart_lines(
     merged_quota_mode: str = DEFAULT_MERGED_QUOTA_MODE,
 ) -> list[str]:
     if not records:
-        return [paint("暂无历史数据", "dim")]
+        return [paint(t("common.no_history"), "dim")]
     series_index = getattr(records, "series_index", None)
     if series_index is not None:
         start_ts, end_ts = period_bounds(records, period)
@@ -565,6 +609,100 @@ def selected_account(accounts: list[dict[str, Any]], current: int | str | None) 
     return accounts[0]
 
 
+def _even_sizes(total: int, count: int) -> list[int]:
+    base, extra = divmod(total, count)
+    return [base + (index < extra) for index in range(count)]
+
+
+def dashboard_grid_layout(
+    width: int,
+    height: int,
+    account_count: int,
+    density: str = DEFAULT_DASHBOARD_DENSITY,
+) -> tuple[list[int], list[int], int]:
+    lower_width = DASHBOARD_PANEL_WIDTH["lower"]
+    default_width = DASHBOARD_PANEL_WIDTH["default"]
+    upper_width = DASHBOARD_PANEL_WIDTH["upper"]
+    lower_height = DASHBOARD_PANEL_HEIGHT["lower"]
+    default_height = DASHBOARD_PANEL_HEIGHT["default"]
+    upper_height = DASHBOARD_PANEL_HEIGHT["upper"]
+
+    def lower_count(total: int, lower: int) -> int:
+        return max(1, total // lower)
+
+    def default_count(total: int, default: int) -> int:
+        return max(1, (total + default // 2) // default)
+
+    def upper_count(total: int, upper: int) -> int:
+        return max(1, (total + upper - 1) // upper)
+
+    if density == "compact":
+        columns = lower_count(width, lower_width)
+        rows = lower_count(height, lower_height)
+    elif density == "relaxed":
+        columns = upper_count(width, upper_width)
+        rows = upper_count(height, upper_height)
+    else:
+        columns = default_count(width, default_width)
+        rows = default_count(height, default_height)
+
+    if density == "fill":
+        min_columns = upper_count(width, upper_width)
+        min_rows = upper_count(height, upper_height)
+        max_columns = lower_count(width, lower_width)
+        max_rows = lower_count(height, lower_height)
+        if account_count <= max_columns * max_rows:
+            candidates = [
+                (candidate_rows, candidate_columns)
+                for candidate_rows in range(min_rows, max_rows + 1)
+                for candidate_columns in range(min_columns, max_columns + 1)
+                if candidate_rows * candidate_columns >= account_count
+            ]
+
+            def fill_score(shape: tuple[int, int]) -> tuple[int, float]:
+                candidate_rows, candidate_columns = shape
+                empty_slots = candidate_rows * candidate_columns - account_count
+                size_distance = (
+                    abs(width / candidate_columns - default_width) / default_width
+                    + abs(height / candidate_rows - default_height) / default_height
+                )
+                return -empty_slots, -size_distance
+
+            rows, columns = max(candidates, key=fill_score)
+    widths = _even_sizes(width, columns)
+    heights = _even_sizes(height, rows)
+    page_size = rows * columns
+    last_page_start = max(0, (account_count - 1) // page_size * page_size)
+    return heights, widths, last_page_start
+
+
+def focus_page_layout(
+    accounts: list[dict[str, Any]],
+    width: int,
+    height: int,
+    curve_mode: str,
+    window_scope: str,
+    offset: int = 0,
+) -> tuple[list[int], list[int], int]:
+    inner_width = max(10, width - 2)
+    panel_heights = [
+        max(4, len(account_summary_body(account, inner_width, curve_mode, window_scope)) + 2)
+        for account in accounts
+    ]
+    if not panel_heights:
+        return [], [], 0
+
+    page_starts = [0]
+    used_height = 0
+    for position, panel_height in enumerate(panel_heights):
+        if used_height and used_height + panel_height > height:
+            page_starts.append(position)
+            used_height = 0
+        used_height += panel_height
+    page_index = max(0, bisect.bisect_right(page_starts, max(0, offset)) - 1)
+    return panel_heights, page_starts, page_index
+
+
 def current_account_border_color(
     accounts: list[dict[str, Any]],
     current: int | str | None,
@@ -583,34 +721,27 @@ def stacked_summary_panels(
     offset: int,
     curve_mode: str,
     window_scope: str,
-    zones: list[ClickZone],
-    x_origin: int,
+    hide_account_info: bool = DEFAULT_HIDE_ACCOUNT_INFO,
 ) -> list[str]:
     if not accounts:
         return [" " * width for _ in range(height)]
     rows: list[str] = []
-    inner_width = max(10, width - 2)
+    panel_heights, page_starts, page_index = focus_page_layout(
+        accounts,
+        width,
+        height,
+        curve_mode,
+        window_scope,
+        offset,
+    )
+    start = page_starts[page_index]
+    stop = page_starts[page_index + 1] if page_index + 1 < len(page_starts) else len(accounts)
 
-    panel_heights = [
-        max(4, len(account_summary_body(account, inner_width, curve_mode, window_scope)) + 2)
-        for account in accounts
-    ]
-    overflow = sum(panel_heights) > height
-    body_height = max(0, height - 2) if overflow else height
-
-    if overflow:
-        up_text = "▲ 上一个账号"
-        down_text = "▼ 下一个账号"
-        rows.append(fit_ansi(paint(center_ansi(up_text, width), "cyan", bold=True, reverse=True), width))
-        zones.append(ClickZone(x_origin, x_origin + width - 1, 1, "summary_scroll", -1))
-    remaining = body_height
-    start = offset % len(accounts)
-    ordered = accounts[start:] + accounts[:start]
-    for account in ordered:
-        panel_height = max(
-            4,
-            len(account_summary_body(account, inner_width, curve_mode, window_scope)) + 2,
-        )
+    for account_position in range(start, stop):
+        panel_height = panel_heights[account_position]
+        if len(rows) + panel_height > height:
+            break
+        account = accounts[account_position]
         title = provider_name(account)
         if current is not None and account_index(account) == current:
             title = f"【{title}】"
@@ -620,23 +751,16 @@ def stacked_summary_panels(
             panel_height,
             curve_mode,
             window_scope,
+            hide_account_info,
         )
-        rendered = panel(
-            title,
-            body,
-            width,
-            panel_height,
-            border_color(account, current, window_scope),
+        rows.extend(
+            panel(
+                title,
+                body,
+                width,
+                panel_height,
+                border_color(account, current, window_scope),
+            )
         )
-        rows.extend(rendered[:remaining])
-        remaining -= min(panel_height, remaining)
-        if remaining <= 0:
-            break
-    if overflow:
-        while len(rows) < height - 1:
-            rows.append(" " * width)
-        rows.append(fit_ansi(paint(center_ansi(down_text, width), "cyan", bold=True, reverse=True), width))
-        zones.append(ClickZone(x_origin, x_origin + width - 1, height, "summary_scroll", 1))
-    if len(rows) < height:
-        rows.extend([" " * width] * (height - len(rows)))
-    return [fit_ansi(line, width) for line in rows[:height]]
+    rows.extend([" " * width for _ in range(height - len(rows))])
+    return rows

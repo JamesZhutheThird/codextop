@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from core.constants import *
+from core.i18n import t
 from quota.windows import window_key_for_seconds
 from quota.plans import recorded_quota_multiplier
 from .models import MonitorState
@@ -56,10 +57,10 @@ def _stale_duration_text(seconds: int) -> str:
     days, remaining_minutes = divmod(total_minutes, 24 * 60)
     hours, minutes = divmod(remaining_minutes, 60)
     if days:
-        return f"{days}天{hours}小时{minutes}分钟"
+        return t("duration.days_hours_minutes", days=days, hours=hours, minutes=minutes)
     if hours:
-        return f"{hours}小时{minutes}分钟"
-    return f"{minutes}分钟"
+        return t("duration.hours_minutes", hours=hours, minutes=minutes)
+    return t("duration.minutes", minutes=minutes)
 
 
 def account_freshness_cache_key(accounts: list[dict[str, Any]]) -> tuple[Any, ...]:
@@ -401,8 +402,16 @@ class MetricSeries:
         return int(self.times[0])
 
     def append(self, timestamp: int, value: float) -> None:
-        self.times.append(timestamp)
-        self.values.append(value)
+        if not self.times or timestamp > self.times[-1]:
+            self.times.append(timestamp)
+            self.values.append(value)
+            return
+        position = bisect.bisect_left(self.times, timestamp)
+        if position < len(self.times) and self.times[position] == timestamp:
+            self.values[position] = value
+            return
+        self.times.insert(position, timestamp)
+        self.values.insert(position, value)
 
     def remove_timestamp(self, timestamp: int) -> None:
         while self.times and self.times[-1] == timestamp:
@@ -436,6 +445,7 @@ class MetricSeriesView:
 class HistorySeriesIndex:
     def __init__(self) -> None:
         self._accounts: dict[int | str, dict[str, HistorySeries]] = {}
+        self._system_tokens: dict[int | str, MetricSeries] = {}
 
     def append_record(self, record: dict[str, Any]) -> None:
         timestamp = record.get("t")
@@ -448,6 +458,13 @@ class HistorySeriesIndex:
             index = account.get("i")
             if not isinstance(index, (int, str)):
                 continue
+            token_usage = account.get("u")
+            if isinstance(token_usage, (list, tuple)) and token_usage:
+                total = token_usage[0]
+                observed_at = token_usage[1] if len(token_usage) > 1 else timestamp
+                if isinstance(total, (int, float)) and isinstance(observed_at, (int, float)):
+                    series = self._system_tokens.setdefault(index, MetricSeries.empty())
+                    series.append(int(observed_at), float(total))
             if account.get("err"):
                 continue
             quota = account.get("q")
@@ -507,6 +524,19 @@ class HistorySeriesIndex:
             if bounded:
                 merged[str(index)] = bounded
         return merged
+
+    def system_token_increase(self, start_timestamp: int, end_timestamp: int) -> int | None:
+        total = 0.0
+        compared = False
+        for series in self._system_tokens.values():
+            start = bisect.bisect_left(series.times, start_timestamp)
+            end = bisect.bisect_left(series.times, end_timestamp)
+            for position in range(max(1, start), end):
+                compared = True
+                delta = float(series.values[position]) - float(series.values[position - 1])
+                if delta > 0:
+                    total += delta
+        return int(total) if compared else None
 
 class HistoryRecordList(Sequence):
     __slots__ = ("series_index", "timestamps", "_latest")
@@ -587,7 +617,7 @@ class IncrementalHistoryCache:
         self.tz_name = tz_name
         self._cooperative_yield_seconds = max(0.0, float(cooperative_yield_seconds))
         self.http_429_fallback_seconds = max(1, int(http_429_fallback_seconds))
-        self._batch_size = 256 if self._cooperative_yield_seconds else 1024
+        self._batch_size = 1024
         self._series_index = HistorySeriesIndex()
         self.records: HistoryRecordList = HistoryRecordList(self._series_index)
         self.version = 0
@@ -631,6 +661,7 @@ class IncrementalHistoryCache:
         record: dict[str, Any],
         last_success: dict[int | str, tuple[int, dict[str, Any]]],
         first_429_at: dict[int | str, int],
+        stored_success_ids: set[int] | None = None,
     ) -> None:
         timestamp = record.get("t")
         accounts = record.get("a")
@@ -647,7 +678,7 @@ class IncrementalHistoryCache:
                     first_429_at.setdefault(index, timestamp)
                 continue
             first_429_at.pop(index, None)
-            if _has_quota_value(account):
+            if (stored_success_ids is None or id(account) in stored_success_ids) and _has_quota_value(account):
                 last_success[index] = (timestamp, copy.deepcopy(account))
 
     @staticmethod
@@ -721,7 +752,7 @@ class IncrementalHistoryCache:
 
             stale = copy.deepcopy(account)
             stale.pop("error", None)
-            stale["err"] = f"已持续 {_stale_duration_text(stale_seconds)} 未获取到新数据"
+            stale["err"] = t("history.stale", duration=_stale_duration_text(stale_seconds))
             stale["_quota_stale_minutes"] = stale_seconds // 60
             resolved.append(stale)
         return resolved
@@ -729,6 +760,8 @@ class IncrementalHistoryCache:
     def _process_batch(self, batch: list[dict[str, Any]]) -> bool:
         if not batch:
             return False
+        if any(batch[index]["t"] < batch[index - 1]["t"] for index in range(1, len(batch))):
+            batch.sort(key=lambda record: record["t"])
         deduplicated: list[dict[str, Any]] = []
         for record in batch:
             timestamp = record["t"]
@@ -764,6 +797,21 @@ class IncrementalHistoryCache:
                 self._first_429_at = first_429_at
                 self._series_index.replace_timestamp(first_timestamp, replacement)
 
+        # Copy only the two snapshots needed for latest-record replacement and 429 fallback.
+        recent_successes: dict[int | str, list[int]] = {}
+        for record in deduplicated:
+            for account in record.get("a", []):
+                if not isinstance(account, dict) or account.get("err") or account.get("error"):
+                    continue
+                account_index = _snapshot_account_index(account)
+                if account_index is not None and _has_quota_value(account):
+                    recent_successes.setdefault(account_index, []).append(id(account))
+        stored_success_ids = {
+            account_id
+            for account_ids in recent_successes.values()
+            for account_id in account_ids[-2:]
+        }
+
         for index, record in enumerate(deduplicated):
             previous_record = self.records[-1] if self.records else None
             inherit_snapshot_account_identity(record, previous_record)
@@ -775,7 +823,12 @@ class IncrementalHistoryCache:
                 latest_record = copy.deepcopy(record)
             else:
                 latest_record = record
-            self._track_account_observations(record, self._last_success_accounts, self._first_429_at)
+            self._track_account_observations(
+                record,
+                self._last_success_accounts,
+                self._first_429_at,
+                stored_success_ids,
+            )
             smooth_snapshot_record(record, self._smooth_states)
             self._series_index.append_record(record)
             self.records.append(latest_record)
@@ -1071,15 +1124,15 @@ def read_records_if_due(state: MonitorState, force: bool = False) -> list[dict[s
             if state.records:
                 state.last_update = float(state.records[-1]["t"])
                 age = int(completed_at - state.last_update)
-                state.status = f"数据更新于 {age}s 前"
+                state.status = t("history.updated_seconds_ago", seconds=age)
                 state.error = None
             else:
-                state.status = "等待数据"
+                state.status = t("history.waiting")
                 state.error = None
         except Exception as exc:
             state.records = state.records or []
             state.next_read = time.time() + min(10, state.interval)
-            state.status = "读取失败"
+            state.status = t("history.read_failed")
             state.error = str(exc)
     return state.records or []
 

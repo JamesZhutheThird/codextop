@@ -11,13 +11,22 @@ from pathlib import Path
 
 from . import color_schemes
 from core.constants import *
+from core.i18n import detect_language, set_language, t
 from .history import account_freshness_cache_key, current_accounts, current_index, read_records_if_due
 from .models import ClickZone, MonitorState
 from .panels import *
 from .preload import BackgroundDataPreloader
 from core.paths import ensure_runtime_layout
 from quota.token_usage_cache import DailyTokenUsageCacheReader, TOKEN_USAGE_CACHE_FILE
-from .settings import handle_click, handle_setting_key, render_sidebar
+from .settings import (
+    handle_click,
+    handle_setting_key,
+    handle_update_dialog_key,
+    handle_version_dialog_key,
+    render_sidebar,
+    render_update_overlay,
+    render_version_overlay,
+)
 from .session_tokens import TrustedDirectoryTokenUsageMonitor
 from .token_charts import token_usage_chart_lines
 from .trusted_directories import TOKEN_USAGE_DIRECTORIES_FILE
@@ -27,8 +36,12 @@ from core.state import (
     read_sampler_interval,
     saved_color_scheme,
     saved_curve_mode,
+    saved_dashboard_density,
+    saved_daily_summary_date,
     saved_display_scope,
+    saved_hide_account_info,
     saved_interval,
+    saved_language,
     saved_merged_quota_mode,
     saved_period,
     saved_usage_axis_scale,
@@ -40,10 +53,13 @@ from core.state import (
 )
 from core.update_check import start_daily_update_check, update_check_path
 from .terminal_io import TerminalSession, parse_input
-from .terminal_text import center_ansi, fit_ansi, paint
-
-
-DASHBOARD_MIN_PANEL_HEIGHT = 29  # Account details plus a four-line history chart.
+from .terminal_text import fit_ansi, paint
+from .statistics_summary import (
+    close_expired_statistics,
+    handle_statistics_key,
+    open_daily_statistics_if_due,
+    render_statistics_overlay,
+)
 
 
 def _render_main_content(
@@ -58,12 +74,12 @@ def _render_main_content(
     token_monitor = state.token_monitor
     token_usage = getattr(token_monitor, "latest", None)
     token_series = getattr(token_monitor, "rate_series", {})
-    sidebar_width = 21
+    sidebar_width = SIDEBAR_WIDTH
     main_width = max(40, term_width - sidebar_width)
     content_height = max(6, term_height - 1)
     if state.display_scope == "usage":
         if getattr(state, "token_preload_waiting", False):
-            chart_lines = [paint("正在后台预加载 Token 数据...", "yellow")]
+            chart_lines = [paint(t("app.token_preloading"), "yellow")]
             chart_lines.extend([""] * max(0, content_height - 3))
         else:
             chart_lines = token_usage_chart_lines(
@@ -78,7 +94,7 @@ def _render_main_content(
                 getattr(state, "usage_axis_scale", DEFAULT_USAGE_AXIS_SCALE),
             )
         left_lines = panel(
-            "Token 用量",
+            t("app.token_usage"),
             chart_lines,
             main_width,
             content_height,
@@ -86,18 +102,27 @@ def _render_main_content(
         )
     elif not accounts:
         loading_text = (
-            "正在后台预加载 quota 数据..."
+            t("app.quota_preloading")
             if getattr(state, "history_preload_waiting", False)
-            else "正在加载 quota 数据..."
+            else t("app.quota_loading")
         )
         left_lines = [paint(loading_text, "yellow")]
         left_lines.extend([""] * (content_height - 1))
         left_lines = [fit_ansi(line, main_width) for line in left_lines[:content_height]]
-    elif state.display_scope == "current":
+    elif state.display_scope == "focus":
         active = selected_account(accounts, current)
         left_width = min(50, max(20, main_width // 3))
         right_width = max(12, main_width - left_width)
         left_width = main_width - right_width
+        _focus_heights, page_starts, page_index = focus_page_layout(
+            accounts,
+            left_width,
+            content_height,
+            state.curve_mode,
+            state.window_scope,
+            state.summary_offset,
+        )
+        state.summary_offset = page_starts[page_index]
         left_block = stacked_summary_panels(
             accounts,
             current,
@@ -106,10 +131,9 @@ def _render_main_content(
             state.summary_offset,
             state.curve_mode,
             state.window_scope,
-            zones,
-            1,
+            getattr(state, "hide_account_info", DEFAULT_HIDE_ACCOUNT_INFO),
         )
-        history_title = f"【{provider_name(active)}】额度历史"
+        history_title = t("app.provider_quota_history", provider=provider_name(active))
         history_body = account_history_lines(
             active,
             records,
@@ -152,7 +176,7 @@ def _render_main_content(
         )
         history_height = max(4, content_height - top_height)
         top_left_block = panel(
-            "账号信息",
+            t("app.account_info"),
             merged_account_reset_lines(
                 accounts,
                 current,
@@ -165,7 +189,7 @@ def _render_main_content(
             color,
         )
         top_right_block = panel(
-            "总额度",
+            t("app.total_quota"),
             merged_quota_summary_lines(
                 accounts,
                 current,
@@ -185,7 +209,7 @@ def _render_main_content(
             top_height,
         )
         history_block = panel(
-            "合并额度历史",
+            t("app.merged_quota_history"),
             merged_history_lines(
                 records,
                 main_width,
@@ -209,30 +233,27 @@ def _render_main_content(
             left_lines.extend([" " * main_width] * (content_height - len(left_lines)))
         left_lines = left_lines[:content_height]
     else:
-        columns = min(3, len(accounts))
-        total_rows = (len(accounts) + columns - 1) // columns
-        visible_rows = max(1, content_height // DASHBOARD_MIN_PANEL_HEIGHT)
-        overflow = total_rows > visible_rows
-        body_height = max(4, content_height - 2) if overflow else content_height
-        visible_rows = min(total_rows, max(1, body_height // DASHBOARD_MIN_PANEL_HEIGHT))
-        page_size = min(len(accounts), visible_rows * columns)
-        page_count = (len(accounts) + page_size - 1) // page_size
-        page_index = (state.summary_offset // page_size) % page_count if overflow else 0
-        start = page_index * page_size
-        visible_accounts = accounts[start:start + page_size]
-        row_count = max(1, (len(visible_accounts) + columns - 1) // columns)
-        base_row_height = max(4, body_height // row_count)
-        panel_width = max(24, main_width // columns)
-        widths = [panel_width] * columns
-        widths[-1] += max(0, main_width - sum(widths))
+        heights, widths, last_page_start = dashboard_grid_layout(
+            main_width,
+            content_height,
+            len(accounts),
+            getattr(state, "dashboard_density", DEFAULT_DASHBOARD_DENSITY),
+        )
+        page_size = max(1, len(heights) * len(widths))
+        state.summary_offset = min(
+            max(0, state.summary_offset) // page_size * page_size,
+            last_page_start,
+        )
+        row_count = len(heights)
         body_lines = []
-        for offset in range(0, len(visible_accounts), columns):
-            chunk = visible_accounts[offset:offset + columns]
-            row_height = base_row_height
-            if offset + columns >= len(visible_accounts):
-                row_height = max(4, body_height - len(body_lines))
+        for row, row_height in enumerate(heights):
             blocks = []
-            for account, width in zip(chunk, widths):
+            for column, width in enumerate(widths):
+                account_position = state.summary_offset + column * row_count + row
+                if account_position >= len(accounts):
+                    blocks.append([" " * width for _ in range(row_height)])
+                    continue
+                account = accounts[account_position]
                 index = account_index(account)
                 title = provider_name(account)
                 if current is not None and index == current:
@@ -246,6 +267,7 @@ def _render_main_content(
                     current,
                     state.curve_mode,
                     state.window_scope,
+                    getattr(state, "hide_account_info", DEFAULT_HIDE_ACCOUNT_INFO),
                 )
                 blocks.append(
                     panel(
@@ -256,28 +278,8 @@ def _render_main_content(
                         border_color(account, current, state.window_scope),
                     )
                 )
-            while len(blocks) < columns:
-                width = widths[len(blocks)]
-                blocks.append([" " * width for _ in range(row_height)])
             body_lines.extend(compose_columns(blocks, widths, row_height))
-        body_lines = body_lines[:body_height]
-        if len(body_lines) < body_height:
-            body_lines.extend([" " * main_width] * (body_height - len(body_lines)))
-        if overflow:
-            up_text = "▲ 上一页"
-            down_text = "▼ 下一页"
-            current_offset = state.summary_offset % len(accounts)
-            previous_start = ((page_index - 1) % page_count) * page_size
-            next_start = ((page_index + 1) % page_count) * page_size
-            left_lines = [
-                fit_ansi(paint(center_ansi(up_text, main_width), "cyan", bold=True, reverse=True), main_width),
-                *body_lines,
-                fit_ansi(paint(center_ansi(down_text, main_width), "cyan", bold=True, reverse=True), main_width),
-            ]
-            zones.append(ClickZone(1, main_width, 1, "summary_scroll", previous_start - current_offset))
-            zones.append(ClickZone(1, main_width, content_height, "summary_scroll", next_start - current_offset))
-        else:
-            left_lines = body_lines
+        left_lines = body_lines
     return left_lines, main_width, content_height
 
 
@@ -296,7 +298,7 @@ def _adopt_history_preload(state: MonitorState) -> bool:
     try:
         result = preloader.take_history_if_ready()
     except Exception as exc:
-        state.status = "quota 预加载失败，正在前台加载"
+        state.status = t("status.quota_preload_failed")
         state.error = str(exc)
         return False
     if result is None:
@@ -313,7 +315,8 @@ def _adopt_history_preload(state: MonitorState) -> bool:
 def _token_preload_needed(state: MonitorState, monitor: object) -> bool:
     if not isinstance(monitor, TrustedDirectoryTokenUsageMonitor) or monitor.version == 0:
         return True
-    return state.usage_directory_scope == "all" and monitor.scope != "all"
+    requested_scope = "all" if state.statistics_open else state.usage_directory_scope
+    return requested_scope == "all" and monitor.scope != "all"
 
 
 def _adopt_token_preload(state: MonitorState) -> bool:
@@ -323,7 +326,7 @@ def _adopt_token_preload(state: MonitorState) -> bool:
     try:
         monitor = preloader.take_token_if_ready()
     except Exception as exc:
-        state.status = "Token 预加载失败，正在前台加载"
+        state.status = t("status.token_preload_failed")
         state.error = str(exc)
         return False
     if monitor is None:
@@ -334,7 +337,29 @@ def _adopt_token_preload(state: MonitorState) -> bool:
     return True
 
 
+def _prepare_statistics_tokens(state: MonitorState) -> bool:
+    preloader = state.preloader
+    if isinstance(preloader, BackgroundDataPreloader):
+        if not state.background_preload_started:
+            return False
+        if preloader.token_scheduled:
+            _adopt_token_preload(state)
+            if preloader.token_pending:
+                return False
+    monitor = state.token_monitor
+    if not isinstance(monitor, TrustedDirectoryTokenUsageMonitor):
+        return False
+    if monitor.scope != "all":
+        monitor.set_scope("all")
+    if monitor.poll(force_discovery=monitor.version == 0):
+        state.token_version = monitor.version
+        state.main_cache_key = None
+        state.statistics_cache_key = None
+    return monitor.error is None
+
+
 def render_frame(state: MonitorState, term_width: int, term_height: int) -> tuple[list[str], list[ClickZone]]:
+    close_expired_statistics(state)
     state.history_preload_waiting = False
     state.token_preload_waiting = False
     preloader = state.preloader
@@ -354,7 +379,7 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
             and preloader.history_scheduled
         ):
             state.history_preload_waiting = True
-            state.status = "正在后台预加载 quota 数据"
+            state.status = t("status.quota_preloading")
             records = []
         else:
             records = read_records_if_due(state)
@@ -368,25 +393,30 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
         if (
             _token_preload_needed(state, token_monitor)
             and isinstance(preloader, BackgroundDataPreloader)
-            and preloader.token_scheduled
+            and (preloader.token_scheduled or (state.statistics_open and not state.background_preload_started))
         ):
             state.token_preload_waiting = True
-            state.status = "正在后台预加载 Token 数据"
+            state.status = t("status.token_preloading")
         elif isinstance(token_monitor, TrustedDirectoryTokenUsageMonitor):
-            token_monitor.set_scope(state.usage_directory_scope)
+            token_monitor.set_scope("all" if state.statistics_open else state.usage_directory_scope)
             if token_monitor.poll():
                 state.token_version = token_monitor.version
                 state.main_cache_key = None
             if token_monitor.error:
-                state.status = "Token 读取失败"
+                state.status = t("status.token_read_failed")
                 state.error = token_monitor.error
             elif state.status in {
-                "启动中",
-                "正在后台预加载 Token 数据",
-                "Token 预加载失败，正在前台加载",
+                t("status.starting"),
+                t("status.token_preloading"),
+                t("status.token_preload_failed"),
             }:
-                state.status = "Token 数据已加载" if token_monitor.latest is not None else "等待 Token 数据"
+                state.status = (
+                    t("status.token_loaded")
+                    if token_monitor.latest is not None
+                    else t("status.token_waiting")
+                )
                 state.error = None
+    statistics_tokens_ready = _prepare_statistics_tokens(state) if state.statistics_open else False
     accounts = current_accounts(state, records)
     token_total_reader = state.token_total_reader
     if isinstance(token_total_reader, DailyTokenUsageCacheReader):
@@ -418,6 +448,8 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
         state.period,
         state.curve_mode,
         state.display_scope,
+        getattr(state, "dashboard_density", DEFAULT_DASHBOARD_DENSITY),
+        getattr(state, "hide_account_info", DEFAULT_HIDE_ACCOUNT_INFO),
         state.window_scope,
         getattr(state, "merged_quota_mode", DEFAULT_MERGED_QUOTA_MODE),
         state.usage_directory_scope,
@@ -436,7 +468,7 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
     ):
         left_lines = state.main_cache_lines
         main_zones = list(state.main_cache_zones)
-        sidebar_width = 21
+        sidebar_width = SIDEBAR_WIDTH
         main_width = max(40, term_width - sidebar_width)
         content_height = max(6, term_height - 1)
     else:
@@ -450,7 +482,7 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
             term_height,
             main_zones,
         )
-        sidebar_width = 21
+        sidebar_width = SIDEBAR_WIDTH
         state.main_cache_key = cache_key
         state.main_cache_lines = left_lines
         state.main_cache_zones = list(main_zones)
@@ -462,7 +494,22 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
         lines.append(fit_ansi(left, main_width) + fit_ansi(right, sidebar_width))
     while len(lines) < term_height:
         lines.append(" " * term_width)
-    return [fit_ansi(line, term_width) for line in lines[:term_height]], zones
+    fitted = [fit_ansi(line, term_width) for line in lines[:term_height]]
+    if state.version_dialog_open:
+        return render_version_overlay(fitted, state, term_width, term_height)
+    if state.update_dialog_open:
+        return render_update_overlay(fitted, state, term_width, term_height)
+    if state.statistics_open:
+        return render_statistics_overlay(
+            fitted,
+            state,
+            records,
+            accounts,
+            term_width,
+            term_height,
+            local_tokens_ready=statistics_tokens_ready,
+        )
+    return fitted, zones
 
 
 def run_once(state: MonitorState) -> int:
@@ -474,27 +521,34 @@ def run_once(state: MonitorState) -> int:
 
 def run_update_after_tui() -> int:
     updater_path = Path(__file__).resolve().parents[1] / "core" / "updater.py"
-    print("正在更新 CodexTOP...\n")
+    print(t("update.starting") + "\n")
     proc = subprocess.run([sys.executable, str(updater_path)], check=False)
     if proc.returncode == 0:
-        print("\n更新完成。请重新打开 CODEXTOP。")
+        print("\n" + t("update.complete_restart"))
     else:
-        print("\n更新失败。请查看上面的命令行输出后重试。")
+        print("\n" + t("update.failed_retry"))
     return proc.returncode
 
 
 def run_tui(state: MonitorState) -> int:
+    if open_daily_statistics_if_due(state):
+        try:
+            save_codextop_state(state)
+        except Exception as exc:
+            state.status = t("cleanup.save_settings_failed", error=exc)
+            state.error = str(exc)
     start_daily_update_check(state)
     state.next_read = 0.0
     if state.interval != state.restore_interval or state.display_scope == "merged":
         try:
             send_sampler_interval(state, state.interval, sample_now=True, all_auth=True)
         except Exception as exc:
-            state.status = "命令失败"
+            state.status = t("common.command_failed")
             state.error = str(exc)
     cleanup_errors: list[str] = []
     try:
         with TerminalSession() as session:
+            start_background_preload(state)
             running = True
             zones: list[ClickZone] = []
             while running:
@@ -502,7 +556,6 @@ def run_tui(state: MonitorState) -> int:
                 lines, zones = render_frame(state, width, height)
                 sys.stdout.write("\x1b[H" + "\n".join(lines))
                 sys.stdout.flush()
-                start_background_preload(state)
 
                 deadline = time.monotonic() + 0.2
                 while time.monotonic() < deadline:
@@ -512,7 +565,14 @@ def run_tui(state: MonitorState) -> int:
                         break
                     interacted = bool(keys or clicks)
                     for key in keys:
-                        running = handle_setting_key(state, key)
+                        if state.version_dialog_open:
+                            running = handle_version_dialog_key(state, key)
+                        elif state.update_dialog_open:
+                            running = handle_update_dialog_key(state, key)
+                        elif state.statistics_open:
+                            handle_statistics_key(state, key)
+                        else:
+                            running = handle_setting_key(state, key)
                         if not running:
                             break
                     if not running:
@@ -527,14 +587,17 @@ def run_tui(state: MonitorState) -> int:
                         break
                     time.sleep(0.03)
     finally:
+        preloader = state.preloader
+        if isinstance(preloader, BackgroundDataPreloader):
+            preloader.persist(state.history_cache, state.token_monitor)
         try:
             save_codextop_state(state)
         except Exception as exc:
-            cleanup_errors.append(f"保存 CodexTOP 设置失败: {exc}")
+            cleanup_errors.append(t("cleanup.save_settings_failed", error=exc))
         try:
             send_sampler_interval(state, state.restore_interval, sample_now=False)
         except Exception as exc:
-            cleanup_errors.append(f"恢复 sampler 间隔失败: {exc}")
+            cleanup_errors.append(t("cleanup.restore_interval_failed", error=exc))
     if cleanup_errors:
         print("\n".join(cleanup_errors), file=sys.stderr)
         return 1
@@ -544,70 +607,72 @@ def run_tui(state: MonitorState) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="全屏 Codex quota 监控。")
-    parser.add_argument("-p", "--period", choices=PERIOD_CHOICES, default=None, help="初始历史长度。")
-    parser.add_argument("-i", "--interval", type=parse_interval, default=None, help="初始读取/后台更新间隔，如 30s 或 2m。")
+    parser = argparse.ArgumentParser(description=t("app.arg.description"))
+    parser.add_argument("-p", "--period", choices=PERIOD_CHOICES, default=None, help=t("app.arg.period"))
+    parser.add_argument("-i", "--interval", type=parse_interval, default=None, help=t("app.arg.interval"))
     parser.add_argument(
         "--curve-mode",
         choices=[value for _label, value in CURVE_MODE_CHOICES],
         default=None,
-        help="历史曲线模式：connected 连续，box 线条，bar 柱状，braille 精细，points 间断。",
+        help=t("app.arg.curve_mode"),
     )
     parser.add_argument(
         "--window-scope",
         choices=[value for _label, value in WINDOW_SCOPE_CHOICES],
         default=None,
-        help="额度窗口：both 同时显示 5h/7d，5h 只显示 5h，7d 只显示 7d。",
+        help=t("app.arg.window_scope"),
     )
     parser.add_argument(
         "--merged-quota-mode",
         choices=[value for _label, value in MERGED_QUOTA_MODE_CHOICES],
         default=None,
-        help="合并额度：percent 百分比叠加，actual 按 Plus 1x / Pro 5x / Pro 20x 叠加。",
+        help=t("app.arg.merged_quota_mode"),
     )
     parser.add_argument(
         "--color-scheme",
         choices=[value for _label, value in color_schemes.color_scheme_choices()],
         default=None,
-        help="百分比配色方案 keyword。",
+        help=t("app.arg.color_scheme"),
     )
     parser.add_argument(
         "--display-scope",
-        choices=["all", "current", "merged", "usage"],
+        choices=[value for _label, value in DISPLAY_SCOPE_CHOICES],
         default=None,
-        help="展示范围：all 全部账号，current 启用账号，merged 合并账号，usage 当前项目 Token 用量。",
+        help=t("app.arg.display_scope"),
     )
     parser.add_argument(
         "--usage-directory-scope",
         choices=[value for _label, value in USAGE_DIRECTORY_SCOPE_CHOICES],
         default=None,
-        help="Token 用量目录范围：current 当前信任目录，all 全部未禁用信任目录。",
+        help=t("app.arg.usage_directory_scope"),
     )
     parser.add_argument(
         "--usage-panel-layout",
         choices=[value for _label, value in USAGE_PANEL_LAYOUT_CHOICES],
         default=None,
-        help="Token 用量面板布局：combined 合并图，split 四图拆分。",
+        help=t("app.arg.usage_panel_layout"),
     )
     parser.add_argument(
         "--usage-axis-scale",
         choices=[value for _label, value in USAGE_AXIS_SCALE_CHOICES],
         default=None,
-        help="Token 用量坐标轴：default 默认坐标轴，log 对数坐标轴。",
+        help=t("app.arg.usage_axis_scale"),
     )
-    parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR, help="quota 历史日志目录。")
-    parser.add_argument("--log-file", default=DEFAULT_LOG_FILE, help="quota 历史日志基础文件名，用于匹配月度日志。")
-    parser.add_argument("--control-file", default=DEFAULT_CONTROL_FILE, help="后台 sampler 控制文件名。")
-    parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help="CodexTOP 状态文件名。")
-    parser.add_argument("--project-dir", type=Path, default=Path.cwd(), help="用于选择当前 Codex 线程的项目目录。")
-    parser.add_argument("--tz", default="Asia/Shanghai", help="本地时区。")
-    parser.add_argument("--once", action="store_true", help="渲染一帧后退出，用于调试。")
+    parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR, help=t("app.arg.log_dir"))
+    parser.add_argument("--log-file", default=DEFAULT_LOG_FILE, help=t("app.arg.log_file"))
+    parser.add_argument("--control-file", default=DEFAULT_CONTROL_FILE, help=t("app.arg.control_file"))
+    parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help=t("app.arg.state_file"))
+    parser.add_argument("--project-dir", type=Path, default=Path.cwd(), help=t("app.arg.project_dir"))
+    parser.add_argument("--tz", default="Asia/Shanghai", help=t("app.arg.timezone"))
+    parser.add_argument("--once", action="store_true", help=t("app.arg.once"))
     args = parser.parse_args()
 
     runtime_paths = ensure_runtime_layout()
     control_path = args.log_dir.expanduser() / args.control_file
     state_path = args.log_dir.expanduser() / args.state_file
     saved_state = read_codextop_state(state_path)
+    selected_language = saved_language(saved_state) or detect_language()
+    set_language(selected_language)
     restore_interval = read_sampler_interval(control_path, DEFAULT_SAMPLER_INTERVAL_SECONDS)
     selected_color_scheme = color_schemes.set_active_color_scheme(
         args.color_scheme or saved_color_scheme(saved_state) or DEFAULT_COLOR_SCHEME
@@ -627,6 +692,7 @@ def main() -> int:
         or saved_usage_axis_scale(saved_state)
         or DEFAULT_USAGE_AXIS_SCALE
     )
+    selected_hide_account_info = saved_hide_account_info(saved_state)
     state = MonitorState(
         period=args.period or saved_period(saved_state) or DEFAULT_PERIOD,
         interval=args.interval if args.interval is not None else (saved_interval(saved_state) or restore_interval),
@@ -636,8 +702,18 @@ def main() -> int:
         state_path=state_path,
         curve_mode=args.curve_mode or saved_curve_mode(saved_state) or DEFAULT_CURVE_MODE,
         display_scope=args.display_scope or saved_display_scope(saved_state) or DEFAULT_DISPLAY_SCOPE,
+        dashboard_density=(
+            saved_dashboard_density(saved_state) or DEFAULT_DASHBOARD_DENSITY
+        ),
+        hide_account_info=(
+            selected_hide_account_info
+            if selected_hide_account_info is not None
+            else DEFAULT_HIDE_ACCOUNT_INFO
+        ),
         window_scope=args.window_scope or saved_window_scope(saved_state) or DEFAULT_WINDOW_SCOPE,
         color_scheme=selected_color_scheme,
+        language=selected_language,
+        status=t("status.starting"),
         merged_quota_mode=(
             args.merged_quota_mode
             or saved_merged_quota_mode(saved_state)
@@ -646,6 +722,8 @@ def main() -> int:
         usage_directory_scope=selected_usage_directory_scope,
         usage_panel_layout=selected_usage_panel_layout,
         usage_axis_scale=selected_usage_axis_scale,
+        daily_summary_date=saved_daily_summary_date(saved_state),
+        statistics_week_start=SUMMARY_WEEK_START,
         control_path=control_path,
         update_check_path=update_check_path(runtime_paths.settings_dir),
         token_monitor=TrustedDirectoryTokenUsageMonitor(
@@ -665,6 +743,7 @@ def main() -> int:
             args.project_dir,
             runtime_paths.codex_dir / "config.toml",
             runtime_paths.settings_dir / TOKEN_USAGE_DIRECTORIES_FILE,
+            cache_dir=runtime_paths.runtime_dir / "cache",
         ),
     )
     if args.once:

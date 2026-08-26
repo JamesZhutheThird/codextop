@@ -31,6 +31,7 @@ from core.paths import (
     normalize_auth_keyword,
 )
 from core.constants import HTTP_401_CREDENTIAL_HINT, RESET_CREDITS_INTERVAL_SECONDS
+from core.i18n import t
 from quota.reset_credits_cache import (
     cached_reset_credits_payload,
     compatible_reset_credits_entry,
@@ -48,7 +49,7 @@ from quota.token_usage_cache import (
     token_usage_query_due,
     write_token_usage_cache,
 )
-from quota.windows import window_key_for_seconds
+from quota.windows import WINDOW_SECONDS, window_key_for_seconds
 from ui import color_schemes
 
 
@@ -68,14 +69,14 @@ def load_auth_credentials(auth_path: Path) -> tuple[str, str | None]:
     try:
         data = json.loads(auth_path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise RuntimeError(f"auth file not found: {auth_path}") from exc
+        raise RuntimeError(t("quota.error.auth_file_not_found", path=auth_path)) from exc
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"auth file is not valid JSON: {auth_path}") from exc
+        raise RuntimeError(t("quota.error.auth_json_invalid", path=auth_path)) from exc
 
     tokens = data.get("tokens", {})
     token = tokens.get("access_token") if isinstance(tokens, dict) else None
     if not isinstance(token, str) or not token:
-        raise RuntimeError(f"tokens.access_token not found in {auth_path}")
+        raise RuntimeError(t("quota.error.token_missing", path=auth_path))
     account_id = tokens.get("account_id") if isinstance(tokens, dict) else None
     return token, account_id if isinstance(account_id, str) and account_id else None
 
@@ -107,18 +108,14 @@ def get_json(
             return json.loads(resp.read().decode("utf-8"))
     except HTTPError as exc:
         if exc.code == 401:
-            raise RuntimeError(
-                f"request denied with HTTP 401\n{HTTP_401_CREDENTIAL_HINT}"
-            ) from exc
+            raise RuntimeError(t("quota.error.request_401", hint=HTTP_401_CREDENTIAL_HINT)) from exc
         if exc.code == 403:
-            raise RuntimeError(
-                f"request denied with HTTP {exc.code}; run `codex login` or refresh the local Codex credential"
-            ) from exc
-        raise RuntimeError(f"request failed with HTTP {exc.code}") from exc
+            raise RuntimeError(t("quota.error.request_denied", code=exc.code)) from exc
+        raise RuntimeError(t("quota.error.request_failed", code=exc.code)) from exc
     except URLError as exc:
-        raise RuntimeError(f"network error: {exc.reason}") from exc
+        raise RuntimeError(t("quota.error.network", error=exc.reason)) from exc
     except TimeoutError as exc:
-        raise RuntimeError("request timed out") from exc
+        raise RuntimeError(t("quota.error.timeout")) from exc
 
 
 def parse_time(value: Any, tz: ZoneInfo) -> str | None:
@@ -253,6 +250,17 @@ def normalize_rate_limit_windows(rate_limit: Any, tz: ZoneInfo) -> dict[str, dic
             continue
         normalized[key] = normalize_window(key, raw, tz)
         assigned.add(key)
+    if "7d" in assigned and "5h" not in assigned:
+        seconds = WINDOW_SECONDS["5h"]
+        normalized["5h"] = normalize_window(
+            "5h",
+            {
+                "used_percent": 0,
+                "limit_window_seconds": seconds,
+                "reset_after_seconds": seconds,
+            },
+            tz,
+        )
     return normalized
 
 
@@ -294,7 +302,7 @@ def normalize_token_usage(payload: Any) -> dict[str, Any]:
     metadata = metadata if isinstance(metadata, dict) else {}
     lifetime_tokens = stats.get("lifetime_tokens")
     if not isinstance(lifetime_tokens, (int, float)) or lifetime_tokens < 0:
-        raise RuntimeError("token usage response has no stats.lifetime_tokens")
+        raise RuntimeError(t("quota.error.token_stats_missing"))
     generated_at = metadata.get("generated_at") or payload.get("stats_as_of")
     generated_dt = parse_datetime_utc(generated_at)
     return {
@@ -479,9 +487,9 @@ def select_auth_configs(
 
     if current_only:
         if current_index is None:
-            raise RuntimeError(f"current provider not found in {auth_list_dir}")
+            raise RuntimeError(t("quota.error.current_provider_not_found", path=auth_list_dir))
         if current_index not in by_keyword:
-            raise RuntimeError(f"current provider {current_index} has no auth file")
+            raise RuntimeError(t("quota.error.current_provider_auth_missing", provider=current_index))
         return [(current_index, by_keyword[current_index])], current_index
 
     if indices:
@@ -495,11 +503,11 @@ def select_auth_configs(
                 selected.append((keyword, by_keyword[keyword]))
         if missing:
             joined = ", ".join(str(index) for index in missing)
-            raise RuntimeError(f"auth config not found for index: {joined}")
+            raise RuntimeError(t("quota.error.config_index_not_found", index=joined))
         return selected, current_index
 
     if not configs:
-        raise RuntimeError(f"no auth-*.json files found in {auth_list_dir}")
+        raise RuntimeError(t("quota.error.no_auth_files", path=auth_list_dir))
     return configs, current_index
 
 
@@ -756,7 +764,7 @@ def collect_accounts(
         except Exception as exc:
             for entry in entries:
                 report = entry["report"]
-                report.setdefault("token_usage_error", f"cannot write daily token cache: {exc}")
+                report.setdefault("token_usage_error", t("quota.error.token_cache_write", error=exc))
 
     if (
         reset_cache_changed
@@ -768,7 +776,7 @@ def collect_accounts(
         except Exception as exc:
             for entry in entries:
                 report = entry["report"]
-                report.setdefault("reset_credits_error", f"cannot write reset credits cache: {exc}")
+                report.setdefault("reset_credits_error", t("quota.error.reset_cache_write", error=exc))
 
     accounts = [entry["report"] for entry in entries]
     return {
@@ -828,37 +836,37 @@ def refresh_reset_credits_cache(
 
 
 def print_text(report: dict[str, Any]) -> None:
-    print("Codex quota")
-    print(f"email: {report.get('email')}")
-    print(f"plan_type: {report.get('plan_type')}")
-    print(f"total_usage: {lifetime_token_text(report)}")
-    print(f"allowed: {report.get('allowed')}")
-    print(f"limit_reached: {report.get('limit_reached')}")
+    print(t("quota.plain.title"))
+    print(f"{t('quota.plain.email')}: {report.get('email')}")
+    print(f"{t('quota.plain.plan_type')}: {report.get('plan_type')}")
+    print(f"{t('quota.plain.total_usage')}: {lifetime_token_text(report)}")
+    print(f"{t('quota.plain.allowed')}: {report.get('allowed')}")
+    print(f"{t('quota.plain.limit_reached')}: {report.get('limit_reached')}")
     print()
 
     quota = report.get("quota", {})
     for key in ("5h", "7d"):
         window = quota.get(key, {})
-        print(f"{key}额度:")
-        print(f"  used_percent: {window.get('used_percent')}")
-        print(f"  remaining_percent: {window.get('remaining_percent')}")
-        print(f"  reset_after: {window.get('reset_after')}")
-        print(f"  reset_at: {window.get('reset_at')}")
+        print(t("quota.window_heading", window=key))
+        print(f"  {t('quota.plain.used_percent')}: {window.get('used_percent')}")
+        print(f"  {t('quota.plain.remaining_percent')}: {window.get('remaining_percent')}")
+        print(f"  {t('quota.plain.reset_after')}: {window.get('reset_after')}")
+        print(f"  {t('quota.plain.reset_at')}: {window.get('reset_at')}")
         print()
 
     reset = report.get("reset_credits", {})
-    print("重置次数:")
-    print(f"  available_count: {reset.get('available_count')}")
-    print(f"  total_earned_count: {reset.get('total_earned_count')}")
-    print(f"  count_by_status: {json.dumps(reset.get('count_by_status', {}), ensure_ascii=False)}")
+    print(t("quota.reset_credits_heading"))
+    print(f"  {t('quota.plain.available_count')}: {reset.get('available_count')}")
+    print(f"  {t('quota.plain.total_earned_count')}: {reset.get('total_earned_count')}")
+    print(f"  {t('quota.plain.count_by_status')}: {json.dumps(reset.get('count_by_status', {}), ensure_ascii=False)}")
     print()
-    print("重置有效期:")
+    print(t("quota.reset_expiration_heading"))
     for index, credit in enumerate(reset.get("credits", []), start=1):
         print(f"  {index}.")
-        print(f"     status: {credit.get('status')}")
-        print(f"     title: {credit.get('title')}")
-        print(f"     granted_at: {credit.get('granted_at')}")
-        print(f"     expires_at: {credit.get('expires_at')}")
+        print(f"     {t('quota.plain.status')}: {credit.get('status')}")
+        print(f"     {t('quota.plain.credit_title')}: {credit.get('title')}")
+        print(f"     {t('quota.plain.granted_at')}: {credit.get('granted_at')}")
+        print(f"     {t('quota.plain.expires_at')}: {credit.get('expires_at')}")
 
 
 def percent_text(value: Any) -> str:
@@ -997,15 +1005,18 @@ def lifetime_token_text(account: dict[str, Any]) -> str:
 
 
 def make_identity_section(account: dict[str, Any], panel_width: int) -> "Table":
+    from rich.cells import cell_len
     from rich.table import Table
 
     table = Table.grid(expand=True)
-    table.add_column(justify="left", style="dim", no_wrap=True, width=8)
+    labels = (t("account.email"), t("account.type"), t("quota.total_usage"))
+    label_width = max(map(cell_len, labels))
+    table.add_column(justify="left", style="dim", no_wrap=True, width=label_width)
     table.add_column(justify="left")
-    email_width = max(8, panel_width - 14)
-    table.add_row("账号邮箱", truncate_text(account.get("email"), email_width))
-    table.add_row("账号类型", str(account.get("plan_type") or "-"))
-    table.add_row("使用总量", lifetime_token_text(account))
+    email_width = max(8, panel_width - label_width - 6)
+    table.add_row(labels[0], truncate_text(account.get("email"), email_width))
+    table.add_row(labels[1], str(account.get("plan_type") or "-"))
+    table.add_row(labels[2], lifetime_token_text(account))
     return table
 
 
@@ -1044,9 +1055,10 @@ def make_quota_section(account: dict[str, Any], panel_width: int) -> "Group":
         left = window.get("remaining_percent")
         reset_seconds = window.get("reset_after_seconds")
         rows.append(make_quota_bar_row(key, left, panel_width))
-        reset_text = (
-            f"{countdown_text(reset_seconds)} 后在 "
-            f"{compact_time(window.get('reset_at'))} 重置"
+        reset_text = t(
+            "quota.resets_after_at",
+            countdown=countdown_text(reset_seconds),
+            time=compact_time(window.get("reset_at")),
         )
         rows.append(make_right_line(reset_text, reset_after_style(reset_seconds)))
     return Group(*rows)
@@ -1066,7 +1078,7 @@ def make_reset_row(credit: dict[str, Any], panel_width: int) -> "Table":
     table.add_row(
         f"[{status_style(credit.get('status'))}]{compact_reset_title(credit.get('title'))}[/{status_style(credit.get('status'))}]",
         progress_bar(remaining, bar_width),
-        f"[{style}]于 {countdown_text(seconds)} 后过期[/{style}]",
+        f"[{style}]{t('quota.expires_after', countdown=countdown_text(seconds))}[/{style}]",
     )
     return table
 
@@ -1082,7 +1094,7 @@ def make_resets_section(account: dict[str, Any], panel_width: int) -> "Group":
     ]
 
     if not credits:
-        text = "无可用额度重置次数"
+        text = t("quota.no_reset_credits")
         if isinstance(available_count, int):
             text = f"{text} ({available_count})"
         return Group(make_right_line(text, "dim"))
@@ -1106,7 +1118,7 @@ def make_account_panel(account: dict[str, Any], width: int) -> "Panel":
     if account.get("error"):
         sections.extend(
             [
-                Rule("错误", style="red"),
+                Rule(t("common.error"), style="red"),
                 Text(str(account["error"]), style="red", overflow="fold", no_wrap=False),
             ]
         )
@@ -1162,9 +1174,9 @@ def print_rich(bundle: dict[str, Any], requested_width: int | None = None) -> No
         row.add_row(*cells)
         rows.append(row)
     current = bundle.get("current_index")
-    title = "Codex 额度统计"
+    title = t("quota.dashboard_title")
     if current is not None:
-        title = f"{title} | 当前服务【{current}】"
+        title = t("quota.current_service_title", title=title, service=current)
     print()
     console.print(
         Panel(
@@ -1183,79 +1195,73 @@ def print_plain_bundle(bundle: dict[str, Any]) -> None:
     for account in bundle.get("accounts", []):
         print(str(account.get("label") or account.get("index") or "-"))
         if account.get("current"):
-            print("current: True")
+            print(f"{t('quota.plain.current')}: {t('common.yes')}")
         if account.get("error"):
-            print(f"email: {account.get('email')}")
-            print(f"plan_type: {account.get('plan_type')}")
-            print(f"total_usage: {lifetime_token_text(account)}")
-            print(f"error: {account.get('error')}")
+            print(f"{t('quota.plain.email')}: {account.get('email')}")
+            print(f"{t('quota.plain.plan_type')}: {account.get('plan_type')}")
+            print(f"{t('quota.plain.total_usage')}: {lifetime_token_text(account)}")
+            print(f"{t('common.error')}: {account.get('error')}")
         else:
             print_text(account)
         print()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Output Codex 5h/7d quota and reset credits."
-    )
+    parser = argparse.ArgumentParser(description=t("quota.arg.description"))
     parser.add_argument(
         "indices",
         nargs="*",
         type=int,
-        help="Optional auth_list indices to show, e.g. `1 3`. Supplying indices enables auth_list mode.",
+        help=t("quota.arg.indices"),
     )
     parser.add_argument(
         "--current",
         action="store_true",
-        help="Only show the currently enabled auth_list entry.",
+        help=t("quota.arg.current"),
     )
     parser.add_argument(
         "--auth",
         type=Path,
         default=DEFAULT_AUTH_FILE,
-        help="Path to the Codex auth JSON. Default: $CODEXTOP_CODEX_DIR/auth.json",
+        help=t("quota.arg.auth"),
     )
     parser.add_argument(
         "--all-auth",
         action="store_true",
-        help="Prefer auth_list mode and show every auth-*.json entry when available.",
+        help=t("quota.arg.all_auth"),
     )
     parser.add_argument(
         "--auth-list",
         type=Path,
         default=None,
-        help=(
-            "Path to Codex auth_list. Supplying this option enables auth_list "
-            "mode unless the directory is missing or empty. Default path: "
-            "$CODEXTOP_CODEX_DIR/codextop/auth_list"
-        ),
+        help=t("quota.arg.auth_list"),
     )
     parser.add_argument(
         "--tz",
         default="Asia/Shanghai",
-        help="Timezone for reset/granted/expires times. Default: Asia/Shanghai",
+        help=t("quota.arg.timezone"),
     )
     parser.add_argument(
         "--json",
         action="store_true",
-        help="Print sanitized JSON instead of text.",
+        help=t("quota.arg.json"),
     )
     parser.add_argument(
         "--plain",
         action="store_true",
-        help="Print the original plain text output instead of Rich tables.",
+        help=t("quota.arg.plain"),
     )
     parser.add_argument(
         "--width",
         type=int,
         default=None,
-        help="Total card width budget; each account panel uses width/3. Default: 50 per account.",
+        help=t("quota.arg.width"),
     )
     parser.add_argument(
         "--color-scheme",
         choices=[value for _label, value in color_schemes.color_scheme_choices()],
         default=None,
-        help="Percent color scheme keyword.",
+        help=t("quota.arg.color_scheme"),
     )
     args = parser.parse_args()
 
@@ -1278,7 +1284,7 @@ def main() -> int:
             token_usage_cache_path(auth_list),
         )
     except Exception as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(t("common.error_message", error=exc), file=sys.stderr)
         return 1
 
     if args.json:

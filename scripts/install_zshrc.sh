@@ -13,6 +13,8 @@ else
 fi
 MARKER_BEGIN="# >>> codextop initialize >>>"
 MARKER_END="# <<< codextop initialize <<<"
+CODEXTOP_LANGUAGE="$(PYTHONPATH="$REPO_DIR/src" python3 -c 'from core.i18n import detect_language; print(detect_language())')"
+export CODEXTOP_LANG="$CODEXTOP_LANGUAGE"
 
 print_codextop_banner() {
   local cols padding line
@@ -41,6 +43,7 @@ SNIPPET="$(cat <<EOF
 $MARKER_BEGIN
 export CODEXTOP_HOME="$REPO_DIR"
 export CODEXTOP_CODEX_DIR="\${CODEXTOP_CODEX_DIR:-\$HOME/.codex}"
+export CODEXTOP_LANG="\${CODEXTOP_LANG:-$CODEXTOP_LANGUAGE}"
 
 CODEXTOP() {
   command python3 "\$CODEXTOP_HOME/src/codextop.py" "\$@"
@@ -102,6 +105,7 @@ write_wrapper() {
 #!/usr/bin/env bash
 export CODEXTOP_HOME="$REPO_DIR"
 export CODEXTOP_CODEX_DIR="\${CODEXTOP_CODEX_DIR:-\${CODEX_HOME:-\$HOME/.codex}}"
+export CODEXTOP_LANG="\${CODEXTOP_LANG:-$CODEXTOP_LANGUAGE}"
 exec python3 "$REPO_DIR/src/$module_path" "\$@"
 EOF
   chmod +x "$target"
@@ -114,6 +118,13 @@ write_wrapper SWITCH_CODEX_PROVIDER auth/codex_auth.py
 write_wrapper CODEXTOP_UPDATE core/updater.py
 
 "$REPO_DIR/scripts/start_codextop_backend.sh"
-echo "Installed CODEXTOP shell hook in $ZSHRC"
-echo "Installed CODEXTOP commands in $BIN_DIR"
+PYTHONPATH="$REPO_DIR/src" python3 - "$ZSHRC" "$BIN_DIR" <<'PY'
+import sys
+
+from core.i18n import language_name, t
+
+print(t("install.shell_hook", path=sys.argv[1]))
+print(t("install.commands", path=sys.argv[2]))
+print(t("install.language", language=language_name()))
+PY
 print_codextop_banner

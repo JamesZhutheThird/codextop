@@ -6,11 +6,13 @@ import argparse
 import json
 import os
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 from ui import color_schemes
 from .constants import *
+from .i18n import available_languages, t
 from ui.models import MonitorState
 
 def send_sampler_interval(
@@ -74,8 +76,20 @@ def saved_curve_mode(payload: dict[str, Any]) -> str | None:
 
 def saved_display_scope(payload: dict[str, Any]) -> str | None:
     scope = payload.get("display_scope")
+    scope = {"all": "list", "current": "focus"}.get(scope, scope)
     valid_scopes = {value for _label, value in DISPLAY_SCOPE_CHOICES}
     return scope if isinstance(scope, str) and scope in valid_scopes else None
+
+
+def saved_dashboard_density(payload: dict[str, Any]) -> str | None:
+    density = payload.get("dashboard_density")
+    valid_densities = {value for _label, value in DASHBOARD_DENSITY_CHOICES}
+    return density if isinstance(density, str) and density in valid_densities else None
+
+
+def saved_hide_account_info(payload: dict[str, Any]) -> bool | None:
+    hidden = payload.get("hide_account_info")
+    return hidden if isinstance(hidden, bool) else None
 
 
 def saved_window_scope(payload: dict[str, Any]) -> str | None:
@@ -113,6 +127,22 @@ def saved_color_scheme(payload: dict[str, Any]) -> str | None:
     return scheme if isinstance(scheme, str) and color_schemes.color_scheme_exists(scheme) else None
 
 
+def saved_language(payload: dict[str, Any]) -> str | None:
+    language = payload.get("language")
+    return language if isinstance(language, str) and language in available_languages() else None
+
+
+def saved_daily_summary_date(payload: dict[str, Any]) -> str | None:
+    value = payload.get("daily_summary_date")
+    if not isinstance(value, str):
+        return None
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return None
+    return value
+
+
 def save_codextop_state(state: MonitorState) -> None:
     state.state_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -121,12 +151,16 @@ def save_codextop_state(state: MonitorState) -> None:
         "interval": max(1, int(state.interval)),
         "curve_mode": state.curve_mode,
         "display_scope": state.display_scope,
+        "dashboard_density": state.dashboard_density,
+        "hide_account_info": state.hide_account_info,
         "window_scope": state.window_scope,
         "merged_quota_mode": state.merged_quota_mode,
         "usage_directory_scope": state.usage_directory_scope,
         "usage_panel_layout": state.usage_panel_layout,
         "usage_axis_scale": state.usage_axis_scale,
         "color_scheme": state.color_scheme,
+        "language": state.language,
+        "daily_summary_date": state.daily_summary_date,
     }
     tmp_path = state.state_path.with_name(f".{state.state_path.name}.{os.getpid()}.tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -139,14 +173,14 @@ def sampler_status(log_dir: Path) -> str:
     try:
         pid = int(pid_path.read_text(encoding="utf-8").strip())
     except (FileNotFoundError, ValueError, OSError):
-        return "后台 未运行"
+        return t("backend.not_running")
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return "后台 未运行"
+        return t("backend.not_running")
     except PermissionError:
-        return "后台 运行中"
-    return f"后台 PID {pid}"
+        return t("backend.running")
+    return t("backend.pid", pid=pid)
 
 
 def parse_interval(value: str) -> int:
@@ -161,7 +195,7 @@ def parse_interval(value: str) -> int:
     elif raw.isdigit():
         seconds = int(raw)
     else:
-        raise argparse.ArgumentTypeError("更新间隔格式应为 15s、2m 或秒数")
+        raise argparse.ArgumentTypeError(t("interval.invalid_format"))
     if seconds <= 0:
-        raise argparse.ArgumentTypeError("更新间隔必须大于 0")
+        raise argparse.ArgumentTypeError(t("interval.must_be_positive"))
     return seconds

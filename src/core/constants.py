@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 from ui import color_schemes
+from .i18n import t
 from .paths import default_paths
 from .project_config import PROJECT_CONFIG
 from .version import APP_VERSION, PACKAGE_VERSION
@@ -17,13 +18,16 @@ DEFAULT_STATE_FILE = "codextop_state.json"
 DEFAULT_SAMPLER_INTERVAL_SECONDS = 60
 DEFAULT_PERIOD = "5h"
 DEFAULT_CURVE_MODE = "connected"
-DEFAULT_DISPLAY_SCOPE = "all"
+DEFAULT_DISPLAY_SCOPE = "list"
+DEFAULT_DASHBOARD_DENSITY = "default"
+DEFAULT_HIDE_ACCOUNT_INFO = False
 DEFAULT_WINDOW_SCOPE = "both"
 DEFAULT_MERGED_QUOTA_MODE = "percent"
 DEFAULT_USAGE_DIRECTORY_SCOPE = "current"
 DEFAULT_USAGE_PANEL_LAYOUT = "combined"
 DEFAULT_USAGE_AXIS_SCALE = "default"
 DEFAULT_COLOR_SCHEME = color_schemes.default_color_scheme_key()
+SIDEBAR_WIDTH = 23
 INTERVAL_CHOICES = [
     ("5s", 5),
     ("10s", 10),
@@ -35,39 +39,45 @@ INTERVAL_CHOICES = [
 ]
 PERIOD_CHOICES = ["5m", "15m", "30m", "1h", "5h", "12h", "1d", "3d", "7d", "30d", "all"]
 CURVE_MODE_CHOICES = [
-    ("连续", "connected"),
-    ("间断", "points"),
-    ("精细", "braille"),
-    ("线条", "box"),
-    ("柱状", "bar"),
-    ("精细柱状", "fine_bar"),
+    (t("choice.curve.connected"), "connected"),
+    (t("choice.curve.points"), "points"),
+    (t("choice.curve.braille"), "braille"),
+    (t("choice.curve.box"), "box"),
+    (t("choice.curve.bar"), "bar"),
+    (t("choice.curve.fine_bar"), "fine_bar"),
 ]
 DISPLAY_SCOPE_CHOICES = [
-    ("看板模式", "all"),
-    ("专注模式", "current"),
-    ("合并模式", "merged"),
-    ("用量模式", "usage"),
+    (t("choice.display.list"), "list"),
+    (t("choice.display.focus"), "focus"),
+    (t("choice.display.merged"), "merged"),
+    (t("choice.display.usage"), "usage"),
+]
+DASHBOARD_DENSITY_CHOICES = [
+    (t("choice.dashboard_density.default"), "default"),
+    (t("choice.dashboard_density.compact"), "compact"),
+    (t("choice.dashboard_density.relaxed"), "relaxed"),
+    (t("choice.dashboard_density.fill"), "fill"),
 ]
 USAGE_DIRECTORY_SCOPE_CHOICES = [
-    ("当前目录", "current"),
-    ("全部目录", "all"),
+    (t("choice.directory.current"), "current"),
+    (t("choice.directory.all"), "all"),
 ]
 USAGE_PANEL_LAYOUT_CHOICES = [
-    ("合并", "combined"),
-    ("拆分", "split"),
+    (t("choice.layout.combined"), "combined"),
+    (t("choice.layout.split"), "split"),
 ]
 USAGE_AXIS_SCALE_CHOICES = [
-    ("默认", "default"),
-    ("对数坐标轴", "log"),
+    (t("choice.axis.default"), "default"),
+    (t("choice.axis.log"), "log"),
 ]
 WINDOW_SCOPE_CHOICES = [
-    ("同时", "both"),
-    ("仅 5h", "5h"),
-    ("仅 7d", "7d"),
+    (t("choice.window.both"), "both"),
+    (t("choice.window.5h"), "5h"),
+    (t("choice.window.7d"), "7d"),
 ]
 MERGED_QUOTA_MODE_CHOICES = [
-    ("百分比叠加", "percent"),
-    ("实际额度叠加", "actual"),
+    (t("choice.merged.percent"), "percent"),
+    (t("choice.merged.actual"), "actual"),
 ]
 PERIOD_SECONDS = {
     "5m": 5 * 60,
@@ -101,9 +111,8 @@ RESET_CREDIT_MIN_BAR_WIDTH = 6
 GAP_SECONDS = 3 * 60
 RESET_CREDITS_INTERVAL_SECONDS = PROJECT_CONFIG.reset_credits_interval_seconds
 HTTP_429_FALLBACK_SECONDS = PROJECT_CONFIG.http_429_fallback_seconds
-HTTP_401_CREDENTIAL_HINT = (
-    "请切换到对应的 CODEXAUTH，并使用 codex 刷新凭证，再使用 CODEXAUTH 同步新凭证。"
-)
+SUMMARY_WEEK_START = PROJECT_CONFIG.week_start
+HTTP_401_CREDENTIAL_HINT = t("credential.http_401_hint")
 ANSI_RE = re.compile(r"\x1b\[[0-9;?<>]*[A-Za-z~]")
 BRAILLE_DOT_BITS = {
     (0, 0): 0x01,

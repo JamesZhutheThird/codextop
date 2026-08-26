@@ -17,18 +17,37 @@ PROJECT_CONFIG_ENV = "CODEXTOP_PROJECT_CONFIG"
 DEFAULT_PROJECT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "pyproject.toml"
 DEFAULT_RESET_CREDITS_INTERVAL_SECONDS = 60
 DEFAULT_HTTP_429_FALLBACK_SECONDS = 10 * 60
+DEFAULT_WEEK_START = 0
+WEEKDAY_NAMES = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
 
 
 @dataclass(frozen=True, slots=True)
 class CodexTopProjectConfig:
     reset_credits_interval_seconds: int = DEFAULT_RESET_CREDITS_INTERVAL_SECONDS
     http_429_fallback_seconds: int = DEFAULT_HTTP_429_FALLBACK_SECONDS
+    week_start: int = DEFAULT_WEEK_START
 
 
 def _positive_int(value: Any, fallback: int) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 1:
         return fallback
     return int(value)
+
+
+def _week_start(value: Any) -> int:
+    if isinstance(value, str):
+        return WEEKDAY_NAMES.get(value.strip().lower(), DEFAULT_WEEK_START)
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 6:
+        return value
+    return DEFAULT_WEEK_START
 
 
 def project_config_path() -> Path:
@@ -55,6 +74,7 @@ def load_project_config(path: Path | None = None) -> CodexTopProjectConfig:
             codextop.get("http_429_fallback_seconds"),
             DEFAULT_HTTP_429_FALLBACK_SECONDS,
         ),
+        week_start=_week_start(codextop.get("week_start")),
     )
 
 

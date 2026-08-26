@@ -9,6 +9,7 @@
 - 适用环境：Linux 或 WSL，使用 `zsh`，且已经安装并能正常使用 Codex CLI。
 - 默认安装目录：`${CODEXTOP_INSTALL_DIR:-$HOME/.local/share/codextop}`。
 - Codex 数据目录：`${CODEXTOP_CODEX_DIR:-${CODEX_HOME:-$HOME/.codex}}`。
+- 语言优先读取 `CODEXTOP_LANG`，否则使用系统 locale；支持 `en` 和 `zh_CN`，无法识别时默认英文，不询问用户。
 - 不要把源码安装到 `~/.codex/codextop`；该目录用于 CodexTOP 的运行时数据。
 - 不询问安装目录或依赖安装方式；环境变量未指定时直接使用上述默认值。
 - 不使用 `sudo`，不读取或输出 `auth.json`、API key、access token、refresh token 的内容。
@@ -125,6 +126,7 @@ rmdir "$STAGE_DIR"
 
 - 在 `~/.zshrc` 中写入带有 CodexTOP 标记的可重复更新区块；
 - 安装 `CODEXTOP`、`CHECK_CODEX_QUOTA`、`CODEXAUTH`、`CODEXTOP_UPDATE` 等命令包装器；
+- 根据 `CODEXTOP_LANG` 或系统 locale 选择界面语言，并写入 shell 配置和命令包装器；
 - 启动后台采样器；
 - 如果 auth list 为空且已有 `~/.codex/auth.json`，首次运行时自动导入为 `auth-openai-1.json`。
 
@@ -137,6 +139,7 @@ rmdir "$STAGE_DIR"
 ```bash
 zsh -ic 'command -v CODEXTOP && command -v CHECK_CODEX_QUOTA && command -v CODEXAUTH && command -v CODEXTOP_UPDATE'
 zsh -ic 'CODEXTOP --help >/dev/null'
+zsh -ic 'case "$CODEXTOP_LANG" in en|zh_CN) printf "%s\n" "$CODEXTOP_LANG" ;; *) exit 1 ;; esac'
 zsh -ic 'CODEXAUTH sync'
 ```
 
@@ -167,35 +170,51 @@ python3 -c 'import sys; from importlib.metadata import version; print(sys.versio
 
 ## 6. 在命令行输出使用指引
 
-验证通过后，必须在命令行执行一段清晰的安装报告，而不是只在聊天回复中说明：
+验证通过后，必须在命令行执行一段清晰的安装报告，而不是只在聊天回复中说明。报告文案
+从安装目录内对应的单语言翻译文件读取：
 
 ```bash
-printf '%s\n' \
-  '' \
-  'CodexTOP 安装并验证完成。' \
-  "安装目录：$INSTALL_DIR" \
-  "源码备份：${BACKUP_DIR:-无（此前没有安装）}" \
-  "Shell 配置备份：${ZSHRC_BACKUP:-无（此前没有配置文件）}" \
-  "命令包装器备份：${COMMAND_BACKUP_DIR:-无（此前没有同名包装器）}" \
-  '' \
-  '打开新的 zsh 终端即可直接使用；当前终端可执行：' \
-  "  source $ZSHRC_PATH" \
-  '  rehash' \
-  '' \
-  '常用命令：' \
-  '  CODEXTOP                 打开主界面' \
-  '  CHECK_CODEX_QUOTA        单次查询当前账号额度' \
-  '  CHECK_CODEX_QUOTA --all-auth  查询全部账号' \
-  '  CODEXAUTH list           查看账号列表' \
-  '  CODEXAUTH --new 1        通过 device auth 添加账号' \
-  '  CODEXTOP_UPDATE --check-only  只检查更新' \
-  '  CODEXTOP_UPDATE          检查并安装快进更新'
+PYTHONPATH="$INSTALL_DIR/src" python3 - \
+  "$INSTALL_DIR" "${BACKUP_DIR:-}" "${ZSHRC_BACKUP:-}" \
+  "${COMMAND_BACKUP_DIR:-}" "$ZSHRC_PATH" <<'PY'
+import sys
+
+from core.i18n import t
+
+install_dir, source_backup, shell_backup, command_backup, zshrc = sys.argv[1:]
+source_backup = source_backup or t("install.report.none_source")
+shell_backup = shell_backup or t("install.report.none_shell")
+command_backup = command_backup or t("install.report.none_commands")
+
+print()
+print(t("install.report.complete"))
+print(t("install.report.install_dir", path=install_dir))
+print(t("install.report.source_backup", path=source_backup))
+print(t("install.report.shell_backup", path=shell_backup))
+print(t("install.report.command_backup", path=command_backup))
+print()
+print(t("install.report.new_terminal"))
+print(f"  source {zshrc}")
+print("  rehash")
+print()
+print(t("install.report.commands"))
+for key in (
+    "codextop",
+    "check",
+    "check_all",
+    "list",
+    "new",
+    "update_check",
+    "update",
+):
+    print(t(f"install.report.command.{key}"))
+PY
 ```
 
 如果未检测到 `${CODEXTOP_CODEX_DIR:-${CODEX_HOME:-$HOME/.codex}}/auth.json`，紧接着输出：
 
-```text
-尚未检测到 Codex 登录信息：可运行 CODEXAUTH --new 1，并按屏幕提示在网页版完成登录。
+```bash
+PYTHONPATH="$INSTALL_DIR/src" python3 -c 'from core.i18n import t; print(t("install.report.no_auth"))'
 ```
 
 ## 7. 最终回复

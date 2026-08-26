@@ -22,6 +22,7 @@ if __package__ in {None, ""}:
 
 from quota import check_codex_quota as quota
 from core.constants import RESET_CREDITS_INTERVAL_SECONDS
+from core.i18n import t
 from core.paths import default_paths, ensure_runtime_layout, monthly_log_path
 from quota.reset_credits_cache import reset_credits_cache_path
 from quota.token_usage_cache import token_usage_cache_path
@@ -262,8 +263,8 @@ def acquire_pid_lock(pid_path: Path) -> None:
         handle.seek(0)
         owner_pid = handle.read().strip()
         handle.close()
-        owner = f" with pid {owner_pid}" if owner_pid else ""
-        raise RuntimeError(f"sampler already running{owner}") from exc
+        owner = t("sampler.owner_pid", pid=owner_pid) if owner_pid else ""
+        raise RuntimeError(t("sampler.already_running", owner=owner)) from exc
 
     handle.seek(0)
     handle.truncate()
@@ -350,7 +351,7 @@ def run_loop(
                 try:
                     reset_future.result()
                 except Exception as exc:
-                    print(f"reset credits refresh failed: {exc}", file=sys.stderr)
+                    print(t("sampler.reset_refresh_failed", error=exc), file=sys.stderr)
                 reset_future = None
             if (
                 reset_future is None
@@ -394,65 +395,59 @@ def run_loop(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Sample Codex quotas into JSONL.")
+    parser = argparse.ArgumentParser(description=t("sampler.arg.description"))
     parser.add_argument(
         "--auth",
         type=Path,
         default=DEFAULT_AUTH_FILE,
-        help="Path to Codex auth JSON. Default: $CODEXTOP_CODEX_DIR/auth.json",
+        help=t("sampler.arg.auth"),
     )
     parser.add_argument(
         "--auth-list",
         type=Path,
         default=DEFAULT_AUTH_LIST,
-        help=(
-            "Path to Codex auth_list. Used when --all-auth is set. Default: "
-            "$CODEXTOP_CODEX_DIR/codextop/auth_list"
-        ),
+        help=t("sampler.arg.auth_list"),
     )
     parser.add_argument(
         "--all-auth",
         action="store_true",
-        help="Prefer auth_list mode and sample every auth-*.json entry when available.",
+        help=t("sampler.arg.all_auth"),
     )
     parser.add_argument(
         "--log-dir",
         type=Path,
         default=DEFAULT_LOG_DIR,
-        help="Directory for quota JSONL logs. Default: $CODEXTOP_CODEX_DIR/codextop/log",
+        help=t("sampler.arg.log_dir"),
     )
     parser.add_argument(
         "--log-file",
         default=DEFAULT_LOG_FILE,
-        help=f"Base quota JSONL file name for monthly logs. Default: {DEFAULT_LOG_FILE}",
+        help=t("sampler.arg.log_file", value=DEFAULT_LOG_FILE),
     )
     parser.add_argument(
         "--control-file",
         default=DEFAULT_CONTROL_FILE,
-        help=f"Sampler control file name. Default: {DEFAULT_CONTROL_FILE}",
+        help=t("sampler.arg.control_file", value=DEFAULT_CONTROL_FILE),
     )
     parser.add_argument(
         "--interval",
         type=int,
         default=DEFAULT_INTERVAL_SECONDS,
-        help=f"Usage sampling interval in seconds. Default: {DEFAULT_INTERVAL_SECONDS}",
+        help=t("sampler.arg.interval", value=DEFAULT_INTERVAL_SECONDS),
     )
     parser.add_argument(
         "--reset-credits-interval",
         type=int,
         default=DEFAULT_RESET_CREDITS_INTERVAL_SECONDS,
-        help=(
-            "Reset-credit refresh interval in seconds. Default comes from "
-            "[tool.codextop].reset_credits_interval_seconds in pyproject.toml."
-        ),
+        help=t("sampler.arg.reset_interval"),
     )
     parser.add_argument(
         "--tz",
         default="Asia/Shanghai",
-        help="Timezone for collected reset timestamps. Default: Asia/Shanghai",
+        help=t("sampler.arg.timezone"),
     )
-    parser.add_argument("--once", action="store_true", help="Collect one snapshot and exit.")
-    parser.add_argument("--set-interval", type=int, default=None, help="Send a new interval command to the running sampler and exit.")
+    parser.add_argument("--once", action="store_true", help=t("sampler.arg.once"))
+    parser.add_argument("--set-interval", type=int, default=None, help=t("sampler.arg.set_interval"))
     args = parser.parse_args()
 
     ensure_runtime_layout()

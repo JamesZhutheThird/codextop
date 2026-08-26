@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from core.paths import atomic_write_json
+from core.i18n import t
 
 
 RESET_CREDITS_CACHE_FILE = "reset_credits.json"
@@ -86,10 +87,10 @@ def reset_credits_query_due(
 
 def sanitize_reset_credits_payload(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
-        raise RuntimeError("reset credits response is not a JSON object")
+        raise RuntimeError(t("quota.error.reset_response_object"))
     credits = payload.get("credits", [])
     if not isinstance(credits, list):
-        raise RuntimeError("reset credits response has no credits list")
+        raise RuntimeError(t("quota.error.reset_response_credits"))
     sanitized_credits = [
         {
             key: credit.get(key)

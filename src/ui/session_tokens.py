@@ -382,6 +382,12 @@ class _UsageInterval:
     rates: tuple[float, float, float, float]
 
 
+@dataclass(frozen=True, slots=True)
+class _UsageDelta:
+    timestamp: float
+    usage: TokenUsageBreakdown
+
+
 @dataclass(slots=True)
 class _TrackedRollout:
     path: Path
@@ -401,6 +407,7 @@ class _TrackedRollout:
         default_factory=lambda: {key: None for key in TOKEN_RATE_KEYS}
     )
     intervals: list[_UsageInterval] = field(default_factory=list)
+    deltas: list[_UsageDelta] = field(default_factory=list)
 
     def reset_content(self, device: int, inode: int) -> None:
         self.device = device
@@ -415,6 +422,7 @@ class _TrackedRollout:
         self.previous_usage = None
         self.smoothed_rates = {key: None for key in TOKEN_RATE_KEYS}
         self.intervals.clear()
+        self.deltas.clear()
 
 
 class TrustedDirectoryTokenUsageMonitor:
@@ -512,13 +520,16 @@ class TrustedDirectoryTokenUsageMonitor:
         owner = self.registry.owner_for(self.project_cwd)
         return owner.key if owner is not None else None
 
-    def _included(self, state: _TrackedRollout) -> bool:
+    def _included_for_scope(self, state: _TrackedRollout, scope: str) -> bool:
         if state.metadata.source not in INTERACTIVE_THREAD_SOURCES:
             return False
         owner = self.registry.by_key(state.owner_key)
         if owner is None or owner.disable:
             return False
-        return self.scope == "all" or owner.key == self._current_owner_key()
+        return scope == "all" or owner.key == self._current_owner_key()
+
+    def _included(self, state: _TrackedRollout) -> bool:
+        return self._included_for_scope(state, self.scope)
 
     @staticmethod
     def _parse_usage_record(raw: bytes) -> tuple[float, TokenUsageBreakdown] | None:
@@ -547,6 +558,22 @@ class TrustedDirectoryTokenUsageMonitor:
         changed = usage != state.latest or timestamp != state.latest_event_at
         previous_timestamp = state.previous_timestamp
         previous_usage = state.previous_usage
+        delta: TokenUsageBreakdown | None = None
+        if previous_timestamp is None or previous_usage is None:
+            delta = usage
+        elif timestamp > previous_timestamp:
+            if usage.total_tokens < previous_usage.total_tokens:
+                delta = usage
+            else:
+                delta = TokenUsageBreakdown(
+                    max(0, usage.input_tokens - previous_usage.input_tokens),
+                    max(0, usage.cached_input_tokens - previous_usage.cached_input_tokens),
+                    max(0, usage.output_tokens - previous_usage.output_tokens),
+                    max(0, usage.reasoning_output_tokens - previous_usage.reasoning_output_tokens),
+                    max(0, usage.total_tokens - previous_usage.total_tokens),
+                )
+        if delta is not None and delta.total_tokens > 0:
+            state.deltas.append(_UsageDelta(timestamp, delta))
         if previous_timestamp is not None and previous_usage is not None and timestamp > previous_timestamp:
             elapsed = timestamp - previous_timestamp
             if usage.total_tokens < previous_usage.total_tokens or elapsed > GAP_SECONDS:
@@ -582,6 +609,28 @@ class TrustedDirectoryTokenUsageMonitor:
         state.latest_event_at = timestamp
         return changed
 
+    def usage_between(self, start_timestamp: float, end_timestamp: float, scope: str = "all") -> TokenUsageBreakdown:
+        totals = [0, 0, 0, 0, 0]
+        normalized_scope = scope if scope in {"current", "all"} else "all"
+        for state in self._states.values():
+            if not state.loaded or not self._included_for_scope(state, normalized_scope):
+                continue
+            for item in state.deltas:
+                if item.timestamp < start_timestamp:
+                    continue
+                if item.timestamp >= end_timestamp:
+                    break
+                values = (
+                    item.usage.input_tokens,
+                    item.usage.cached_input_tokens,
+                    item.usage.output_tokens,
+                    item.usage.reasoning_output_tokens,
+                    item.usage.total_tokens,
+                )
+                for index, value in enumerate(values):
+                    totals[index] += value
+        return TokenUsageBreakdown(*totals)
+
     def _read_state(self, state: _TrackedRollout, stat: os.stat_result) -> bool:
         if state.loaded and stat.st_size == state.size and stat.st_mtime_ns == state.mtime_ns:
             return False
@@ -590,6 +639,7 @@ class TrustedDirectoryTokenUsageMonitor:
             or state.device != stat.st_dev
             or state.inode != stat.st_ino
             or stat.st_size < state.offset
+            or (stat.st_size == state.size and stat.st_mtime_ns != state.mtime_ns)
         ):
             state.reset_content(stat.st_dev, stat.st_ino)
             self.full_loads += 1

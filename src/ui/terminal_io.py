@@ -14,13 +14,20 @@ from typing import Any
 MOUSE_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 CSI_RE = re.compile(rb"\x1b\[[0-9;?<>]*[A-Za-z~]")
 KEY_PATTERNS = [
+    (re.compile(rb"\x1b(?:OP|\[11(?:;[0-9]+)?~|\[1;[0-9]+P)"), "f1"),
+    (re.compile(rb"\x1b(?:OQ|\[12(?:;[0-9]+)?~|\[1;[0-9]+Q)"), "f2"),
+    (re.compile(rb"\x1b\[19(?:;[0-9]+)?~"), "f8"),
     (re.compile(rb"\x1b\[20(?:;[0-9]+)?~"), "f9"),
     (re.compile(rb"\x1b\[21(?:;[0-9]+)?~"), "f10"),
     (re.compile(rb"\x1b\[23(?:;[0-9]+)?~"), "f11"),
     (re.compile(rb"\x1b\[(?:1;[0-9]+)?A"), "up"),
     (re.compile(rb"\x1b\[(?:1;[0-9]+)?B"), "down"),
+    (re.compile(rb"\x1b\[(?:1;[0-9]+)?C"), "right"),
+    (re.compile(rb"\x1b\[(?:1;[0-9]+)?D"), "left"),
     (re.compile(rb"\x1bOA"), "up"),
     (re.compile(rb"\x1bOB"), "down"),
+    (re.compile(rb"\x1bOC"), "right"),
+    (re.compile(rb"\x1bOD"), "left"),
 ]
 
 class TerminalSession:
@@ -83,6 +90,10 @@ def parse_input(session: TerminalSession) -> tuple[bool, list[tuple[int, int]], 
             keys.append("enter")
             pos += 1
             continue
+        if byte in {b"\x08", b"\x7f"}:
+            keys.append("backspace")
+            pos += 1
+            continue
         if byte != b"\x1b":
             pos += 1
             continue
@@ -114,7 +125,6 @@ def parse_input(session: TerminalSession) -> tuple[bool, list[tuple[int, int]], 
             continue
 
         if pos == len(data) - 1:
-            keys.append("esc")
             pos += 1
             continue
 
@@ -125,7 +135,6 @@ def parse_input(session: TerminalSession) -> tuple[bool, list[tuple[int, int]], 
         if data[pos:pos + 2] == b"\x1b[":
             trailing = data[pos:]
             break
-        keys.append("esc")
         pos += 1
 
     session.buffer = trailing

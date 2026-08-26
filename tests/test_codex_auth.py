@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 import stat
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from subprocess import CompletedProcess
 from types import SimpleNamespace
@@ -16,6 +17,44 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from auth import codex_auth
+from core.i18n import t
+
+
+def jwt_with_claims(claims: dict[str, object]) -> str:
+    def encode(payload: dict[str, object]) -> str:
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+    return f"{encode({'alg': 'none'})}.{encode(claims)}."
+
+
+def auth_payload(email: str, marker: str) -> dict[str, object]:
+    return {
+        "tokens": {
+            "id_token": jwt_with_claims({"email": email, "jti": marker}),
+            "access_token": jwt_with_claims(
+                {
+                    "https://api.openai.com/profile": {"email": email},
+                    "jti": marker,
+                }
+            ),
+            "refresh_token": f"refresh-{marker}",
+            "account_id": f"account-{marker}",
+        }
+    }
+
+
+def path_globals(paths: object) -> dict[str, object]:
+    return {
+        "PATHS": paths,
+        "CODEX_DIR": paths.codex_dir,
+        "CONFIG_FILE": paths.config_file,
+        "ACTIVE_AUTH_FILE": paths.active_auth_file,
+        "AUTH_LIST_DIR": paths.auth_list_dir,
+        "CURRENT_PROVIDER_FILE": paths.current_provider_file,
+        "REGISTRY_FILE": paths.registry_file,
+        "AUTH_BACKUP_DIR": paths.auth_backup_dir,
+    }
 
 
 class FakeProcEntry:
@@ -178,16 +217,236 @@ class CodexAuthNewProviderTests(unittest.TestCase):
                 [account["auth_keyword"] for account in registry["accounts"]],
                 ["openai-1", "openai-4"],
             )
-            self.assertIn(
-                "请按照下方登录信息在网页版完成登录；等待期间可按 Ctrl-C 取消。\n\n",
-                output.getvalue(),
-            )
+            self.assertIn(t("auth.login_intro", provider="openai-4").strip(), output.getvalue())
             refresh.assert_called_once_with()
 
     def test_main_routes_new_option(self) -> None:
         with patch.object(codex_auth, "command_new", return_value=0) as command_new:
             self.assertEqual(codex_auth.main(["--new", "4"]), 0)
         command_new.assert_called_once_with("4", False)
+
+
+class CodexAuthProviderMutationTests(unittest.TestCase):
+    def test_refresh_validates_matching_email_before_replacing_current_auth(self) -> None:
+        old_payload = auth_payload("same@example.com", "old")
+        new_payload = auth_payload("same@example.com", "new")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = codex_auth.ensure_runtime_layout(
+                codex_auth.default_paths(Path(temp_dir) / ".codex"),
+                migrate=False,
+            )
+            paths.active_auth_file.write_text(json.dumps(old_payload), encoding="utf-8")
+            slot = paths.auth_list_dir / "auth-openai-1.json"
+            slot.write_text(json.dumps(old_payload), encoding="utf-8")
+            paths.config_file.write_text('model_provider = "openai"\n', encoding="utf-8")
+            codex_auth.atomic_write_json(
+                paths.current_provider_file,
+                codex_auth.provider_config_payload("openai", "openai-1"),
+            )
+
+            def login(login_home: Path) -> str:
+                (login_home / "auth.json").write_text(json.dumps(new_payload), encoding="utf-8")
+                return "Logged in using ChatGPT"
+
+            output = io.StringIO()
+            with (
+                patch.multiple(codex_auth, **path_globals(paths)),
+                patch.object(codex_auth, "assert_no_running_codex_processes"),
+                patch.object(codex_auth, "run_device_login", side_effect=login),
+                patch.object(
+                    codex_auth,
+                    "validate_new_auth",
+                    return_value={"email": "same@example.com", "allowed": True},
+                ),
+                patch.object(codex_auth, "request_sampler_refresh") as refresh,
+                redirect_stdout(output),
+            ):
+                result = codex_auth.command_refresh(None, False)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(json.loads(slot.read_text(encoding="utf-8")), new_payload)
+            self.assertEqual(json.loads(paths.active_auth_file.read_text(encoding="utf-8")), new_payload)
+            backups = list((paths.auth_backup_dir / "openai-1").glob("auth-*.backup.*.json"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(json.loads(backups[0].read_text(encoding="utf-8")), old_payload)
+            self.assertIn(t("auth.provider_refreshed", provider="openai-1"), output.getvalue())
+            refresh.assert_called_once_with()
+
+    def test_refresh_email_mismatch_does_not_overwrite_any_auth(self) -> None:
+        old_payload = auth_payload("owner@example.com", "old")
+        new_payload = auth_payload("other@example.com", "new")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = codex_auth.ensure_runtime_layout(
+                codex_auth.default_paths(Path(temp_dir) / ".codex"),
+                migrate=False,
+            )
+            paths.active_auth_file.write_text(json.dumps(old_payload), encoding="utf-8")
+            slot = paths.auth_list_dir / "auth-openai-1.json"
+            slot.write_text(json.dumps(old_payload), encoding="utf-8")
+            paths.config_file.write_text('model_provider = "openai"\n', encoding="utf-8")
+            codex_auth.atomic_write_json(
+                paths.current_provider_file,
+                codex_auth.provider_config_payload("openai", "openai-1"),
+            )
+
+            def login(login_home: Path) -> str:
+                (login_home / "auth.json").write_text(json.dumps(new_payload), encoding="utf-8")
+                return "Logged in using ChatGPT"
+
+            with (
+                patch.multiple(codex_auth, **path_globals(paths)),
+                patch.object(codex_auth, "assert_no_running_codex_processes"),
+                patch.object(codex_auth, "run_device_login", side_effect=login),
+                patch.object(
+                    codex_auth,
+                    "validate_new_auth",
+                    return_value={"email": "other@example.com", "allowed": True},
+                ),
+                patch.object(codex_auth, "request_sampler_refresh") as refresh,
+                redirect_stdout(io.StringIO()),
+                self.assertRaises(codex_auth.AuthError),
+            ):
+                codex_auth.command_refresh("openai-1", False)
+
+            self.assertEqual(json.loads(slot.read_text(encoding="utf-8")), old_payload)
+            self.assertEqual(json.loads(paths.active_auth_file.read_text(encoding="utf-8")), old_payload)
+            self.assertFalse((paths.auth_backup_dir / "openai-1").exists())
+            refresh.assert_not_called()
+
+    def test_refresh_failed_online_validation_does_not_overwrite_any_auth(self) -> None:
+        old_payload = auth_payload("owner@example.com", "old")
+        new_payload = auth_payload("owner@example.com", "new")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = codex_auth.ensure_runtime_layout(
+                codex_auth.default_paths(Path(temp_dir) / ".codex"),
+                migrate=False,
+            )
+            paths.active_auth_file.write_text(json.dumps(old_payload), encoding="utf-8")
+            slot = paths.auth_list_dir / "auth-openai-1.json"
+            slot.write_text(json.dumps(old_payload), encoding="utf-8")
+            paths.config_file.write_text('model_provider = "openai"\n', encoding="utf-8")
+            codex_auth.atomic_write_json(
+                paths.current_provider_file,
+                codex_auth.provider_config_payload("openai", "openai-1"),
+            )
+
+            def login(login_home: Path) -> str:
+                (login_home / "auth.json").write_text(json.dumps(new_payload), encoding="utf-8")
+                return "Logged in using ChatGPT"
+
+            with (
+                patch.multiple(codex_auth, **path_globals(paths)),
+                patch.object(codex_auth, "assert_no_running_codex_processes"),
+                patch.object(codex_auth, "run_device_login", side_effect=login),
+                patch.object(
+                    codex_auth,
+                    "validate_new_auth",
+                    side_effect=codex_auth.AuthError("unusable auth"),
+                ),
+                patch.object(codex_auth, "request_sampler_refresh") as refresh,
+                redirect_stdout(io.StringIO()),
+                self.assertRaises(codex_auth.AuthError),
+            ):
+                codex_auth.command_refresh("openai-1", False)
+
+            self.assertEqual(json.loads(slot.read_text(encoding="utf-8")), old_payload)
+            self.assertEqual(json.loads(paths.active_auth_file.read_text(encoding="utf-8")), old_payload)
+            self.assertFalse((paths.auth_backup_dir / "openai-1").exists())
+            refresh.assert_not_called()
+
+    def test_delete_requires_exact_full_id_and_keeps_files_on_mismatch(self) -> None:
+        payload = auth_payload("owner@example.com", "old")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = codex_auth.ensure_runtime_layout(
+                codex_auth.default_paths(Path(temp_dir) / ".codex"),
+                migrate=False,
+            )
+            paths.active_auth_file.write_text(json.dumps(payload), encoding="utf-8")
+            slot = paths.auth_list_dir / "auth-openai-1.json"
+            slot.write_text(json.dumps(payload), encoding="utf-8")
+            paths.config_file.write_text('model_provider = "openai"\n', encoding="utf-8")
+            codex_auth.atomic_write_json(
+                paths.current_provider_file,
+                codex_auth.provider_config_payload("openai", "openai-1"),
+            )
+
+            with (
+                patch.multiple(codex_auth, **path_globals(paths)),
+                patch.object(codex_auth, "assert_no_running_codex_processes"),
+                patch.object(codex_auth.sys, "stdin", io.StringIO("1\n")),
+                patch.object(codex_auth, "request_sampler_refresh") as refresh,
+                redirect_stderr(io.StringIO()),
+                self.assertRaises(codex_auth.AuthError),
+            ):
+                codex_auth.command_delete("openai-1", False)
+
+            self.assertTrue(slot.exists())
+            self.assertTrue(paths.active_auth_file.exists())
+            refresh.assert_not_called()
+
+    def test_delete_current_provider_removes_backups_and_selects_replacement(self) -> None:
+        first_payload = auth_payload("first@example.com", "first")
+        second_payload = auth_payload("second@example.com", "second")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = codex_auth.ensure_runtime_layout(
+                codex_auth.default_paths(Path(temp_dir) / ".codex"),
+                migrate=False,
+            )
+            paths.active_auth_file.write_text(json.dumps(first_payload), encoding="utf-8")
+            first_slot = paths.auth_list_dir / "auth-openai-1.json"
+            second_slot = paths.auth_list_dir / "auth-openai-2.json"
+            first_slot.write_text(json.dumps(first_payload), encoding="utf-8")
+            second_slot.write_text(json.dumps(second_payload), encoding="utf-8")
+            backup_dir = paths.auth_backup_dir / "openai-1"
+            backup_dir.mkdir()
+            (backup_dir / "auth-openai-1.backup.old.json").write_text(
+                json.dumps(first_payload),
+                encoding="utf-8",
+            )
+            paths.config_file.write_text('model_provider = "openai"\n', encoding="utf-8")
+            codex_auth.atomic_write_json(
+                paths.current_provider_file,
+                codex_auth.provider_config_payload("openai", "openai-1"),
+            )
+
+            output = io.StringIO()
+            with (
+                patch.multiple(codex_auth, **path_globals(paths)),
+                patch.object(codex_auth, "assert_no_running_codex_processes"),
+                patch.object(codex_auth.sys, "stdin", io.StringIO("openai-1\n")),
+                patch.object(codex_auth, "request_sampler_refresh") as refresh,
+                redirect_stderr(io.StringIO()),
+                redirect_stdout(output),
+            ):
+                result = codex_auth.command_delete(None, False)
+
+            self.assertEqual(result, 0)
+            self.assertFalse(first_slot.exists())
+            self.assertFalse(backup_dir.exists())
+            self.assertEqual(json.loads(paths.active_auth_file.read_text(encoding="utf-8")), second_payload)
+            current = json.loads(paths.current_provider_file.read_text(encoding="utf-8"))
+            self.assertEqual(current["auth_keyword"], "openai-2")
+            registry = json.loads(paths.registry_file.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [account["auth_keyword"] for account in registry["accounts"]],
+                ["openai-2"],
+            )
+            self.assertIn(t("auth.provider_deleted", provider="openai-1"), output.getvalue())
+            refresh.assert_called_once_with()
+
+    def test_main_routes_refresh_and_delete_options(self) -> None:
+        with patch.object(codex_auth, "command_refresh", return_value=0) as refresh:
+            self.assertEqual(codex_auth.main(["--refresh"]), 0)
+        refresh.assert_called_once_with(None, False)
+
+        with patch.object(codex_auth, "command_delete", return_value=0) as delete:
+            self.assertEqual(codex_auth.main(["--json", "--delete", "openai-2"]), 0)
+        delete.assert_called_once_with("openai-2", True)
 
 
 if __name__ == "__main__":

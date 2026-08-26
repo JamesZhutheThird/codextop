@@ -14,30 +14,29 @@ from core.constants import (
     PERIOD_SECONDS,
     TOKEN_RATE_HOURLY_THRESHOLD_SECONDS,
 )
+from core.i18n import t
 from quota.quota_format import compact_token_count
 from . import color_schemes
 from .history import metric_value_at
 from .terminal_text import compact_ansi, fit_ansi, paint, time_axis_line, visible_width
 
 
-TOKEN_LABELS = {
-    "input": "输入",
-    "cached": "缓存",
-    "output": "输出",
-    "total": "总量",
-}
+TOKEN_KEYS = ("input", "cached", "output", "total")
 TOKEN_MARKERS = {
     "input": "●",
     "cached": "◆",
     "output": "▲",
     "total": "■",
 }
-TOKEN_KEYS = tuple(TOKEN_LABELS)
 TOKEN_PLOT_KEYS = ("output", "input", "cached", "total")
 TOKEN_STACK_KEYS = TOKEN_PLOT_KEYS[:-1]
 TOKEN_PRIORITIES = {key: index for index, key in enumerate(TOKEN_PLOT_KEYS, 1)}
 SPLIT_FULL_AXIS_MIN_HEIGHT = 11
 LOG_AXIS_MIN_EXPONENT = 6
+
+
+def token_label(key: str) -> str:
+    return t(f"token.{key}")
 
 
 def token_rate_unit(seconds_per_column: float) -> tuple[int, str]:
@@ -151,7 +150,7 @@ def token_legend(
             marker = TOKEN_MARKERS[key]
         current = _series_value(rate_series.get(key, []), timestamp, factor)
         pieces.append(
-            paint(f"{marker} {TOKEN_LABELS[key]}", colors[key], bold=True)
+            paint(f"{marker} {token_label(key)}", colors[key], bold=True)
             + f" {compact_token_count(current)} ({compact_token_count(totals[key])})"
         )
     return fit_ansi("  ".join(pieces), width)
@@ -495,7 +494,7 @@ def _single_token_chart_lines(
     shared_log_ticks: tuple[int, ...] | None = None,
 ) -> list[str]:
     if width <= 14 or height <= 6:
-        return [fit_ansi(paint(f"{TOKEN_LABELS[key]}：空间不足", "dim"), width)] + [
+        return [fit_ansi(paint(t("token.space_insufficient", label=token_label(key)), "dim"), width)] + [
             " " * width for _ in range(max(0, height - 1))
         ]
 
@@ -597,11 +596,15 @@ def _single_token_chart_lines(
     else:
         marker = TOKEN_MARKERS[key]
     legend_text = (
-        paint(f"{marker} {TOKEN_LABELS[key]}", colors[key], bold=True)
+        paint(f"{marker} {token_label(key)}", colors[key], bold=True)
         + f" {compact_token_count(current)} ({compact_token_count(totals[key])})"
     )
     header_width = chart_width + 2
-    scale_text = f"{unit} 对数" if log_exponent is not None else f"{unit} ×10^{exponent}"
+    scale_text = (
+        t("token.axis_log", unit=unit)
+        if log_exponent is not None
+        else t("token.axis_power", unit=unit, exponent=exponent)
+    )
     legend_width = max(0, header_width - visible_width(scale_text) - 1)
     legend_text = compact_ansi(legend_text, legend_width)
     header_gap = max(1, header_width - visible_width(scale_text) - visible_width(legend_text))
@@ -649,7 +652,7 @@ def split_token_usage_chart_lines(
     usage_axis_scale: str = "default",
 ) -> list[str]:
     if width <= 14 or height <= 7:
-        return [paint("终端空间不足", "dim")]
+        return [paint(t("terminal.space_insufficient"), "dim")]
     colors = color_schemes.token_series_colors(key=color_scheme)
     start_ts, end_ts = token_chart_bounds(rate_series, period)
     rows, columns = token_split_shape(width, height)
@@ -724,7 +727,7 @@ def token_usage_chart_lines(
             usage_axis_scale,
         )
     if width <= 14 or height <= 7:
-        return [paint("终端空间不足", "dim")]
+        return [paint(t("terminal.space_insufficient"), "dim")]
     colors = color_schemes.token_series_colors(key=color_scheme)
     start_ts, end_ts = token_chart_bounds(rate_series, period)
     log_exponent: int | None = None
@@ -829,7 +832,11 @@ def token_usage_chart_lines(
             for row, ratio in tick_rows.items()
         }
     header_width = chart_width + 2
-    scale_text = f"{unit} 对数" if log_exponent is not None else f"{unit} ×10^{exponent}"
+    scale_text = (
+        t("token.axis_log", unit=unit)
+        if log_exponent is not None
+        else t("token.axis_power", unit=unit, exponent=exponent)
+    )
     legend_width = max(0, header_width - visible_width(scale_text) - 1)
     legend_text = compact_ansi(
         token_legend(

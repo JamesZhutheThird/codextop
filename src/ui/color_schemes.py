@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from core.i18n import t
+
 
 COLOR_SCHEME_DIR_ENV = "CODEXTOP_COLOR_SCHEME_DIR"
 COLOR_SCHEME_FILE_ENV = "CODEXTOP_COLOR_SCHEME_FILE"
@@ -43,9 +45,9 @@ def _read_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise RuntimeError(f"color style file not found: {path}") from exc
+        raise RuntimeError(t("color.file_not_found", path=path)) from exc
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"color style file is not valid JSON: {path}") from exc
+        raise RuntimeError(t("color.invalid_json", path=path)) from exc
 
 
 def _read_payload(source: Path) -> dict[str, Any]:
@@ -57,12 +59,12 @@ def _read_payload(source: Path) -> dict[str, Any]:
             for scheme_file in scheme_files:
                 scheme = _read_json(scheme_file)
                 if not isinstance(scheme, dict):
-                    raise RuntimeError(f"color style root must be an object: {scheme_file}")
+                    raise RuntimeError(t("color.root_object", path=scheme_file))
                 payload[scheme_file.stem] = scheme
         else:
             payload = _read_json(resolved)
             if not isinstance(payload, dict):
-                raise RuntimeError(f"color style source root must be an object: {resolved}")
+                raise RuntimeError(t("color.source_root_object", path=resolved))
         _validate_payload(payload, resolved)
         _prepare_payload(payload)
         _SCHEME_CACHE[resolved] = payload
@@ -71,32 +73,32 @@ def _read_payload(source: Path) -> dict[str, Any]:
 
 def _validate_payload(payload: dict[str, Any], path: Path) -> None:
     if not payload:
-        raise RuntimeError(f"color scheme file must contain non-empty color styles: {path}")
+        raise RuntimeError(t("color.nonempty", path=path))
     for key, scheme in payload.items():
         if not isinstance(key, str) or not key:
-            raise RuntimeError(f"color scheme key must be a non-empty string: {path}")
+            raise RuntimeError(t("color.key_nonempty", path=path))
         if not isinstance(scheme, dict):
-            raise RuntimeError(f"color scheme {key!r} must be an object: {path}")
+            raise RuntimeError(t("color.scheme_object", key=key, path=path))
         percent = scheme.get("percent")
         if not isinstance(percent, dict):
-            raise RuntimeError(f"color scheme {key!r} must contain a percent object: {path}")
+            raise RuntimeError(t("color.percent_object", key=key, path=path))
         if not percent:
-            raise RuntimeError(f"color scheme {key!r} percent object must not be empty: {path}")
+            raise RuntimeError(t("color.percent_nonempty", key=key, path=path))
         seen_values: set[int] = set()
         for raw_value, color in percent.items():
             try:
                 value = int(raw_value)
             except (TypeError, ValueError) as exc:
-                raise RuntimeError(f"color scheme {key!r} percent key must be an integer 0-100: {raw_value}") from exc
+                raise RuntimeError(t("color.percent_integer", key=key, value=raw_value)) from exc
             if str(value) != str(raw_value):
-                raise RuntimeError(f"color scheme {key!r} percent key must be an integer 0-100: {raw_value}")
+                raise RuntimeError(t("color.percent_integer", key=key, value=raw_value))
             if not 0 <= value <= 100:
-                raise RuntimeError(f"color scheme {key!r} percent key out of range 0-100: {raw_value}")
+                raise RuntimeError(t("color.percent_range", key=key, value=raw_value))
             if value in seen_values:
-                raise RuntimeError(f"color scheme {key!r} duplicate percent key: {raw_value}")
+                raise RuntimeError(t("color.percent_duplicate", key=key, value=raw_value))
             seen_values.add(value)
             if not isinstance(color, str) or not HEX_COLOR_RE.match(color):
-                raise RuntimeError(f"color scheme {key!r} percent {value} must be #rrggbb: {path}")
+                raise RuntimeError(t("color.percent_hex", key=key, value=value, path=path))
 
 
 def _prepare_payload(payload: dict[str, Any]) -> None:
@@ -110,7 +112,8 @@ def color_scheme_choices(path: Path | str | None = None) -> list[tuple[str, str]
     choices: list[tuple[str, str]] = []
     for key, scheme in payload.items():
         label = scheme.get("label") if isinstance(scheme, dict) else None
-        choices.append((str(label or key), key))
+        display_label = str(label) if label else t(f"color_scheme.{key}", _default=key)
+        choices.append((display_label, key))
     return choices
 
 
@@ -139,7 +142,7 @@ def set_active_color_scheme(key: str | None = None, path: Path | str | None = No
     payload = _read_payload(scheme_source)
     selected = _resolve_color_scheme_key(key or default_color_scheme_key(scheme_source), payload)
     if selected not in payload:
-        raise RuntimeError(f"color scheme not found: {selected}")
+        raise RuntimeError(t("color.not_found", key=selected))
     _ACTIVE_SCHEME_SOURCE = scheme_source
     _ACTIVE_SCHEME_KEY = selected
     _ACTIVE_SCHEME = payload[selected]
@@ -171,7 +174,7 @@ def _active_scheme(path: Path | str | None = None, key: str | None = None) -> di
     payload = _read_payload(scheme_source)
     key = _resolve_color_scheme_key(key, payload)
     if key not in payload:
-        raise RuntimeError(f"color scheme not found: {key}")
+        raise RuntimeError(t("color.not_found", key=key))
     scheme = payload[key]
     if implicit_active_request:
         _ACTIVE_SCHEME_SOURCE = scheme_source

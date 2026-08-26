@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 CODEXTOP_CODEX_DIR="${CODEXTOP_CODEX_DIR:-${CODEX_HOME:-$HOME/.codex}}"
 LOG_DIR="${CODEXTOP_LOG_DIR:-$CODEXTOP_CODEX_DIR/codextop/log}"
 PID_FILE="$LOG_DIR/sampler.pid"
@@ -12,7 +15,13 @@ fi
 PID="$(<"$PID_FILE")"
 if [[ "$PID" =~ ^[0-9]+$ ]] && kill -0 "$PID" >/dev/null 2>&1; then
   if [[ ! -r "/proc/$PID/cmdline" ]]; then
-    echo "refusing to stop unverified process $PID" >&2
+    PYTHONPATH="$REPO_DIR/src" "$PYTHON_BIN" - "$PID" <<'PY' >&2
+import sys
+
+from core.i18n import t
+
+print(t("backend.stop_unverified", pid=sys.argv[1]))
+PY
     exit 1
   fi
   CMDLINE="$(tr '\0' ' ' < "/proc/$PID/cmdline")"

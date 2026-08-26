@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.i18n import t
+
 from core.paths import atomic_write_json
 
 
@@ -55,7 +57,7 @@ def trusted_paths_from_config(config_path: Path) -> list[str]:
     except FileNotFoundError:
         return []
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise RuntimeError(f"cannot read Codex trusted projects: {exc}") from exc
+        raise RuntimeError(t("trusted.config_read_failed", error=exc)) from exc
     projects = payload.get("projects") if isinstance(payload, dict) else None
     if not isinstance(projects, dict):
         return []
@@ -86,7 +88,7 @@ def read_directory_registry(path: Path) -> tuple[dict[str, bool], list[str]]:
     except FileNotFoundError:
         return {}, []
     except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"cannot read Token directory registry: {exc}") from exc
+        raise RuntimeError(t("trusted.registry_read_failed", error=exc)) from exc
     disabled: dict[str, bool] = {}
     listed_paths: list[str] = []
     for entry in _registry_entries(payload):

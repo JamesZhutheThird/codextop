@@ -1,6 +1,6 @@
 [project]
 name = "codextop"
-version = "2.4.0"
+version = "3.0.0"
 description = "Terminal monitor for Codex quota usage."
 readme = "README.md"
 license = { text = "CC BY-NC-SA 4.0" }
@@ -13,6 +13,7 @@ dependencies = [
 [tool.codextop]
 reset_credits_interval_seconds = 60
 http_429_fallback_seconds = 600
+week_start = "monday"
 
 [project.scripts]
 codextop = "codextop:main"
@@ -32,6 +33,7 @@ py-modules = ["codextop"]
 where = ["src"]
 
 [tool.setuptools.package-data]
+core = ["locales/*.json"]
 ui = ["styles/*.json"]
 
 [tool.ruff]

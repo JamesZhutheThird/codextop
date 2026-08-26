@@ -39,7 +39,7 @@ class UsageModeLazyHistoryTests(unittest.TestCase):
         self.assertIsNone(state.records)
 
     def test_quota_frame_still_loads_history(self) -> None:
-        state = state_for_test("all")
+        state = state_for_test("list")
 
         with patch("ui.app.read_records_if_due", return_value=[]) as read_records:
             render_frame(state, 120, 36)

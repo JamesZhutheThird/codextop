@@ -1,14 +1,15 @@
 <div align="center">
+<p><strong>简体中文</strong> | <a href="./README_EN.md">English</a></p>
 <table>
 <tr>
 <td>
 <pre>
-   ██████╗ ██████╗ ██████╗ ███████╗██╗  ██╗████████╗ ██████╗ ██████╗   
-  ██╔════╝██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝╚══██╔══╝██╔═══██╗██╔══██╗  
-  ██║     ██║   ██║██║  ██║█████╗   ╚███╔╝    ██║   ██║   ██║██████╔╝  
-  ██║     ██║   ██║██║  ██║██╔══╝   ██╔██╗    ██║   ██║   ██║██╔═══╝   
-  ╚██████╗╚██████╔╝██████╔╝███████╗██╔╝ ██╗   ██║   ╚██████╔╝██║       
-   ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝       
+   ██████╗ ██████╗ ██████╗ ███████╗██╗  ██╗████████╗ ██████╗ ██████╗
+  ██╔════╝██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝╚══██╔══╝██╔═══██╗██╔══██╗
+  ██║     ██║   ██║██║  ██║█████╗   ╚███╔╝    ██║   ██║   ██║██████╔╝
+  ██║     ██║   ██║██║  ██║██╔══╝   ██╔██╗    ██║   ██║   ██║██╔═══╝
+  ╚██████╗╚██████╔╝██████╔╝███████╗██╔╝ ██╗   ██║   ╚██████╔╝██║
+   ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝
 </pre>
 </td>
 </tr>
@@ -20,30 +21,35 @@
 </div>
 
 <div align="center">
-  <img src="./assets/demo1.png" alt="CodexTOP focus mode" width="820">
+  <img src="./assets/demo-1.png" alt="CodexTOP focus mode" width="820">
   <p>专注模式</p>
-  <img src="./assets/demo2.png" alt="CodexTOP board mode" width="820">
+  <img src="./assets/demo-2.png" alt="CodexTOP board mode" width="820">
   <p>看板模式</p>
-  <img src="./assets/demo3.png" alt="CodexTOP merged mode" width="820">
+  <img src="./assets/demo-3.png" alt="CodexTOP merged mode" width="820">
   <p>合并模式</p>
-  <img src="./assets/demo4.png" alt="CodexTOP merged mode" width="820">
+  <img src="./assets/demo-4.png" alt="CodexTOP usage mode" width="820">
   <p>用量模式</p>
+  <img src="./assets/demo-summary.png" alt="CodexTOP usage mode" width="410">
+  <p>数据统计</p>
+  <img src="./assets/demo-auth.png" alt="CodexTOP usage mode" width="820">
+  <p>账号管理</p>
   <img src="./assets/demo-check.png" alt="CodexTOP single check" width="820">
   <p>命令行单次查询</p>
 </div>
 
 ## 功能概览
 
-| 状态   | 功能         | 说明                                                                 |
-|------|------------|----------------------------------------------------------------------|
-| ✅已支持 | 彩色可交互终端界面  | 支持看板、专注、合并和用量模式；额度与 Token 曲线分开展示            |
-| ✅已支持 | 命令行用量查询    | `CHECK_CODEX_QUOTA` 输出账号额度和每日缓存的联网使用总量             |
-| ✅已支持 | 后台采样服务     | 用量与额度重置次数独立查询、缓存，并写入本地 JSONL                   |
-| ✅已支持 | 多账号切换      | `CODEXAUTH` 管理 `auth-openai-*` 账号并切换 provider                 |
-| ✅已支持 | 版本更新       | 从 GitHub remote 检测版本/分支更新并自动快进同步                     |
+| 状态 | 功能 | 说明 |
+|---|---|---|
+| ✅已支持 | 彩色可交互终端界面 | 支持看板、专注、合并和用量模式；额度与 Token 曲线分开展示 |
+| ✅已支持 | 命令行用量查询 | `CHECK_CODEX_QUOTA` 输出账号额度和每日缓存的联网使用总量 |
+| ✅已支持 | 后台采样服务 | 用量与额度重置次数独立查询、缓存，并写入本地 JSONL |
+| ✅已支持 | 多账号切换 | `CODEXAUTH` 管理 `auth-openai-*` 账号并切换 provider |
+| ✅已支持 | 版本更新 | 仅根据 GitHub Releases 检测新版本，并自动快进同步 |
 | ✅已支持 | Token 用量统计 | 用量模式增量读取可信目录根线程日志；支持四类曲线、堆叠柱状和精细柱状 |
-| ✅已支持 | 新账号注册      | 支持新账号接入和初始化流程                                           |
-| ⏩规划中 | 额度重置通知     | 额度恢复后通过系统通知提醒                                           |
+| ✅已支持 | 周期统计总结 | 每日首次打开显示昨日总结；侧栏可查看日、周、月额度与 Token 统计 |
+| ✅已支持 | 新账号注册 | 支持新账号接入和初始化流程 |
+| ⏩规划中 | 额度重置通知 | 额度恢复后通过系统通知提醒 |
 
 ## 安装
 
@@ -86,6 +92,30 @@ CODEXTOP_UPDATE         # 检测 GitHub 更新并自动同步
 ```
 
 ## 配置
+
+### 语言
+
+首次启动时会先读取 `CODEXTOP_LANG`，未设置时依次参考系统的 `LC_ALL`、`LC_MESSAGES`、
+`LANGUAGE` 和 `LANG`。目前内置 `en` 与 `zh_CN`；系统语言不受支持或无法识别时使用英文。
+可以在首次运行前显式指定：
+
+```bash
+export CODEXTOP_LANG=zh_CN  # 简体中文
+export CODEXTOP_LANG=en     # English
+```
+
+主界面按 `F9` 进入设置后，可通过“界面语言”在简体中文和 English 之间切换。选择会保存到
+`codextop_state.json`，优先于环境自动检测，并立即生效，不会重新加载历史数据。WSL 如果使用
+`C.UTF-8`，其中不包含可识别的语言代码，因此首次启动会回退到英文；在设置中选择一次
+简体中文即可持久生效。
+
+历史与 Token 派生索引缓存在 `~/.codex/codextop/cache/`；月度 JSONL 和 Codex 会话日志仍是
+权威数据源。缓存与源文件不一致、版本不兼容或内容损坏时会被自动丢弃并重建。
+
+翻译文件位于 `src/core/locales/`，每种语言对应一个 JSON 文件。新增语言时复制
+`en.json`，保留相同的 key 并翻译 value；文件名就是 `CODEXTOP_LANG` 使用的语言代码。
+
+### 运行路径
 
 默认使用 Codex 目录：
 
@@ -157,6 +187,28 @@ CODEXAUTH --new name_of_provider  # 使用自定义 provider 名称
 账号信息和额度 status；全部通过后才会保存 `auth-{provider}.json`、切换到新 provider、
 更新 auth registry，并通知后台采样器立即刷新数据。数字 `4` 会规范化为 `openai-4`。
 
+手动刷新已有 provider（不指定时刷新当前 provider）：
+
+```bash
+CODEXAUTH --refresh
+CODEXAUTH --refresh openai-2
+```
+
+刷新同样在临时目录中执行 device auth。只有新 auth 通过登录状态和在线额度校验，且
+token 邮箱、在线返回邮箱与原 provider 邮箱一致时，才会备份并替换原 auth；任一条件
+无法明确验证时，原 provider 和当前 `auth.json` 都不会被覆盖。
+
+删除已注册 provider（不指定时以当前 provider 为目标）：
+
+```bash
+CODEXAUTH --delete            # 删除当前 provider
+CODEXAUTH --delete openai-2
+```
+
+删除前必须按提示再次输入完整且完全一致的 provider ID，例如 `openai-2`。确认成功后会
+删除该 provider 的 auth 文件及其凭据备份；若删除当前 provider，会改用另一个已注册
+provider，没有剩余 provider 时则移除当前 `auth.json`。已有额度历史记录不会被删除。
+
 切换 provider：
 
 ```bash
@@ -170,7 +222,7 @@ CODEXAUTH switch third-party-api
 输入数字时会先找 `auth-1.json`，再找 `auth-openai-1.json`。
 如果目标不存在，错误信息会给出对应的 `CODEXAUTH --new ...` 添加命令。
 
-在 `config.toml` 中添加下列配置（你还需要修改 `base_url` 和在系统环境变量中注册你的api key）即可切换并使用第三方 API provider：
+在 `config.toml` 中添加下列配置（还需要修改 `base_url`，并在系统环境变量中注册 API key）即可切换并使用第三方 API provider：
 
 ```toml
 [model_providers.third-party-api]
@@ -180,15 +232,15 @@ wire_api = "responses"
 env_key = "API_AUTH_TOKEN"
 ```
 
-如果有命令名以 `codex` 开头的 Codex 主程序正在运行，会拒绝切换。
+如果有命令名以 `codex` 开头的 Codex 主程序正在运行，会拒绝新增、刷新、删除或切换 provider。
 
 ### 命令行查询
 
 查询额度信息：
 
 ```bash
-CHECK_CODEX_QUOTA             % 输出当前账号额度信息
-CHECK_CODEX_QUOTA --all-auth  % 输出所有账号额度信息
+CHECK_CODEX_QUOTA             # 输出当前账号额度信息
+CHECK_CODEX_QUOTA --all-auth  # 输出所有账号额度信息
 ```
 
 ### 更新
@@ -196,17 +248,20 @@ CHECK_CODEX_QUOTA --all-auth  % 输出所有账号额度信息
 检测并同步 CodexTOP 更新：
 
 ```bash
-CODEXTOP_UPDATE              % 有更新时自动从 GitHub 快进同步
-CODEXTOP_UPDATE --check-only % 只检测，不更新
+CODEXTOP_UPDATE               # 有更新时自动从 GitHub 快进同步
+CODEXTOP_UPDATE --check-only  # 只检测，不更新
 ```
 
-每天第一次打开 `CODEXTOP` 主界面时，会在后台自动检测一次 GitHub 更新；如果有新版本，侧栏版本号下面会显示类似：
+每天第一次打开 `CODEXTOP` 主界面时，会在后台读取一次 GitHub latest release。只有 Release 版本号高于当前版本时，侧栏最下方才会在作者和当前版本号后空一行显示黄色按钮：
 
 ```text
-v1.5.0 可用（F11）
+@JamesZhutheThird
+v3.0.0
+
+F11 / 新版本可用
 ```
 
-点击该行或按 `F11` 会显示确认提示；再次点击或按回车后，CodexTOP 会退出全屏界面并执行更新脚本，直接展示更新过程中的命令行输出。更新完成后需要手动重新打开 `CODEXTOP`。
+点击该按钮或按 `F11` 会打开更新日志悬浮窗，内容直接来自对应 GitHub Release；可用方向键上下滚动，按 `Backspace` 关闭，按 `Enter` 确认更新。确认后 CodexTOP 会退出全屏界面并执行更新脚本，直接展示更新过程中的命令行输出。更新完成后需要手动重新打开 `CODEXTOP`。
 
 默认更新源是当前仓库的 `origin`，分支默认使用当前分支。也可以通过环境变量覆盖：
 
@@ -227,11 +282,13 @@ src/ui/styles/icefire.json
 src/ui/styles/bright.json
 ```
 
-也可以通过 `CODEXTOP_COLOR_SCHEME_DIR` 指向其他样式目录。`percent` 可以写满 `0` 到 `100`，也可以只写关键点；未写出的百分比会按相邻关键点线性插值。
+内置方案的显示名称来自语言翻译文件。也可以通过 `CODEXTOP_COLOR_SCHEME_DIR` 指向其他
+样式目录；自定义方案可使用可选的 `label` 字段。`percent` 可以写满 `0` 到 `100`，也可以
+只写关键点；未写出的百分比会按相邻关键点线性插值。
 
 ```json
 {
-  "label": "经典",
+  "label": "自定义经典",
   "percent": {
     "0": "#e07b7b",
     "50": "#e0e07b",
@@ -242,20 +299,29 @@ src/ui/styles/bright.json
 
 ### 后台采样服务
 
-后台采样服务会在加载终端后自动启动，手动启动或停止后台采样：
+后台采样服务会在安装后自动启动，也可以手动启动或停止：
+
+```bash
+./scripts/start_codextop_backend.sh
+./scripts/stop_codextop_backend.sh
+```
 
 用量接口按右侧栏“更新间隔”查询；额度重置次数由独立后台任务刷新，默认每 60 秒查询
 一次，并按账号持久化缓存。重置次数查询失败不会丢弃同一时刻成功获取的用量数据，也
 不会在下一次用量采样时立即重试。5h/7d 用量遇到 429 时，会在配置的兜底时间内
 沿用上次成功结果；额度重置次数则永久沿用最后一次成功结果，只有成功查询明确返回 0
 时才显示为没有可用次数。
+
 这两个默认值可在项目的 `pyproject.toml` 中调整，修改后重启后台采样器和 CodexTOP 生效：
 
 ```toml
 [tool.codextop]
 reset_credits_interval_seconds = 60
 http_429_fallback_seconds = 600
+week_start = "monday"
 ```
+
+周统计默认以周一为第一天。`week_start` 可改为 `tuesday` 至 `sunday` 中的任意英文星期名。
 
 账号“使用总量”通过账号统计接口查询，并按账号持久化缓存 24 小时；查询失败也会等待
 下一周期，避免刷新风暴。CodexTOP 首次启动时会读取 `~/.codex/config.toml` 中的可信项目，并同步到
@@ -265,19 +331,15 @@ http_429_fallback_seconds = 600
 用量模式会聚合相应目录下根线程的本地 `token_count` 事件。程序先比较日志的修改时间和
 大小，只有变化时才读取追加内容，约每 200 毫秒检查活跃日志；没有新事件时当前速率记为
 0。输入、缓存输入、输出和总量速率经过轻量平滑后绘制为四条固定配色曲线；图例实时显示
-当前速率，并在括号内显示对应累计总量。“用量布局”
-可选择合并或拆分；拆分时根据绘图区自适应使用 1×4、2×2 或 4×1，每个子图独立缩放；
-高度足够时显示完整六档纵轴，空间不足时只标 0 和最高值，纵向子图之间不留空行。只有
-合并柱状和精细柱状模式将前三项累计堆叠；精细柱状使用 2×4 子字符填充。所有
-非柱状模式均将四条曲线分别独立绘制。合并图纵轴按数据范围自动选用
-`0/.5/1/1.5/2/2.5`、`0/1/2/3/4/5` 或 `0/2/4/6/8/10` 六档标签；绘图区每列覆盖时间
-严格大于 15 分钟时使用 `tok/h`，否则使用 `tok/min`。其余展示模式不扫描日志，只保留
-原有额度曲线和坐标轴。旧版 JSONL 中已有的 Token 字段可继续兼容，无需迁移。
+当前速率，并在括号内显示对应累计总量。“用量布局”可选择合并或拆分；拆分时根据绘图区
+自适应使用 1×4、2×2 或 4×1，每个子图独立缩放；高度足够时显示完整六档纵轴，空间不足时
+只标 0 和最高值，纵向子图之间不留空行。只有合并柱状和精细柱状模式将前三项累计堆叠；
+精细柱状使用 2×4 子字符填充。所有非柱状模式均将四条曲线分别独立绘制。
 
-```bash
-./scripts/start_codextop_backend.sh
-./scripts/stop_codextop_backend.sh
-```
+合并图纵轴按数据范围自动选用 `0/.5/1/1.5/2/2.5`、`0/1/2/3/4/5` 或
+`0/2/4/6/8/10` 六档标签；绘图区每列覆盖时间严格大于 15 分钟时使用 `tok/h`，否则使用
+`tok/min`。其余展示模式不扫描日志，只保留原有额度曲线和坐标轴。旧版 JSONL 中已有的
+Token 字段可继续兼容，无需迁移。
 
 ## License
 

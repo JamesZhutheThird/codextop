@@ -8,6 +8,7 @@ from typing import Any
 from quota import check_codex_quota as quota
 from quota.plans import account_plan_key, account_quota_multiplier
 from core.constants import *
+from core.i18n import t
 from ui.terminal_text import *
 
 def account_index(account: dict[str, Any]) -> int | str | None:
@@ -29,8 +30,16 @@ def account_error(account: dict[str, Any]) -> str | None:
     return rendered
 
 
-def account_email(account: dict[str, Any]) -> str:
-    return str(account.get("email") or "-")
+def account_email(account: dict[str, Any], hidden: bool = False) -> str:
+    email = str(account.get("email") or "-")
+    if not hidden:
+        return email
+    local, separator, domain = email.partition("@")
+    if not separator:
+        return email
+    if len(local) <= 2:
+        return f"{'*' * len(local)}@{domain}"
+    return f"{local[0]}{'*' * (len(local) - 2)}{local[-1]}@{domain}"
 
 
 def account_plan(account: dict[str, Any]) -> str:
@@ -90,7 +99,7 @@ def compact_token_count(value: Any) -> str:
 
 
 def token_usage_rows(total: Any, _width: int) -> list[str]:
-    return [f"{paint('使用总量', 'dim')} {format_token_count(total)}"]
+    return [f"{paint(t('quota.total_usage'), 'dim')} {format_token_count(total)}"]
 
 
 def window_info(account: dict[str, Any], key: str) -> dict[str, Any]:
@@ -125,9 +134,10 @@ def reset_rows(account: dict[str, Any], width: int) -> list[str]:
             credit for credit in reset.get("credits", [])
             if credit.get("status") == "available"
         ]
-        rows.append(center_ansi(f"剩余 {available if isinstance(available, int) else '-'} 次可用重置次数", width))
+        count = available if isinstance(available, int) else "-"
+        rows.append(center_ansi(t("quota.reset_available", count=count), width))
         if not credits:
-            detail = "无可用重置次数" if available == 0 else "额度详情暂无新数据"
+            detail = t("quota.no_reset_credits") if available == 0 else t("quota.details_unavailable")
             rows.append(center_ansi(paint(detail, "dim"), width))
             return rows
         reset_items: list[tuple[str, Any, Any]] = []
@@ -143,9 +153,9 @@ def reset_rows(account: dict[str, Any], width: int) -> list[str]:
 
     available = account.get("rc")
     credits = account.get("r", [])
-    rows.append(center_ansi(f"剩余 {available if isinstance(available, int) else '-'} 次可用重置次数", width))
+    rows.append(center_ansi(t("quota.reset_available", count=available if isinstance(available, int) else "-"), width))
     if not credits:
-        detail = "无可用重置次数" if available == 0 else "额度详情暂无新数据"
+        detail = t("quota.no_reset_credits") if available == 0 else t("quota.details_unavailable")
         rows.append(center_ansi(paint(detail, "dim"), width))
         return rows
     now = int(time.time())
@@ -165,7 +175,7 @@ def reset_rows(account: dict[str, Any], width: int) -> list[str]:
 
 def reset_credit_row(title: str, remaining_percent: Any, seconds: Any, width: int, day_width: int = 1) -> str:
     left_width = RESET_CREDIT_TITLE_WIDTH
-    right_text = f"于 {reset_credit_countdown(seconds, day_width)} 后过期"
+    right_text = t("quota.expires_after", countdown=reset_credit_countdown(seconds, day_width))
     right_width = min(
         reset_credit_right_width(day_width),
         max(0, width - left_width - RESET_CREDIT_MIN_BAR_WIDTH - 2),
@@ -200,7 +210,7 @@ def quota_rows(
         pct = paint(percent_text(left).rjust(4), percent_color(left))
         bar_width = max(8, width - visible_width(label_text) - 1 - 1 - 4)
         rows.append(f"{label} {progress_bar(left, bar_width)} {pct}")
-        reset_line = f"于 {countdown(info['reset_after'])} 后在 {info['reset_at']} 重置"
+        reset_line = t("quota.resets_after_at", countdown=countdown(info["reset_after"]), time=info["reset_at"])
         rows.append(right_ansi(paint_style(reset_line, quota.reset_after_style(info["reset_after"])), width))
         if key != keys[-1] and not compact:
             rows.append("")
@@ -430,7 +440,7 @@ def merged_quota_detail_reset_line(
     width: int,
     merged_quota_mode: str = DEFAULT_MERGED_QUOTA_MODE,
 ) -> str:
-    reset_text = f"于 {countdown(info['reset_after'])} 后在 {info['reset_at']} 重置"
+    reset_text = t("quota.resets_after_at", countdown=countdown(info["reset_after"]), time=info["reset_at"])
     reset = paint_style(reset_text, quota.reset_after_style(info["reset_after"]))
     reset_width = min(visible_width(reset), width)
     detail_width = max(0, width - reset_width - 1)

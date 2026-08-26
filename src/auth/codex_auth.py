@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -31,6 +32,7 @@ from core.paths import (
     now_iso,
     provider_config_payload,
 )
+from core.i18n import t
 
 
 REPO_DIR = Path(__file__).resolve().parents[2]
@@ -73,44 +75,44 @@ def auth_file_map() -> dict[str, Path]:
 
 
 def new_auth_hint(target: str) -> str:
-    return f"\n提示：可使用 CODEXAUTH --new {target} 添加该 provider。"
+    return t("auth.new_hint", target=target)
 
 
 def resolve_auth_target(target: str) -> str:
     value = normalize_auth_keyword(target)
     if value is None:
-        raise AuthError("missing auth target")
+        raise AuthError(t("auth.missing_target"))
     configs = auth_file_map()
     if value.isdigit():
         for keyword in (value, f"openai-{value}"):
             if keyword in configs:
                 return keyword
         raise AuthError(
-            f"target auth file not found: auth-{value}.json or auth-openai-{value}.json"
-            f"{new_auth_hint(value)}"
+            t("auth.target_files_not_found", target=value)
+            + new_auth_hint(value)
         )
     if value in configs:
         return value
     lower_map = {keyword.lower(): keyword for keyword in configs}
     if value.lower() in lower_map:
         return lower_map[value.lower()]
-    raise AuthError(f"target auth file not found: auth-{value}.json{new_auth_hint(value)}")
+    raise AuthError(t("auth.target_file_not_found", target=value) + new_auth_hint(value))
 
 
 def normalize_new_auth_target(target: str) -> str:
     value = normalize_auth_keyword(target)
     if value is None:
-        raise AuthError("missing new auth target")
+        raise AuthError(t("auth.missing_new_target"))
     numeric = re.fullmatch(r"(?:openai-)?(\d+)", value, re.IGNORECASE)
     if numeric:
         number = int(numeric.group(1))
         if number <= 0:
-            raise AuthError("new auth provider number must be greater than 0")
+            raise AuthError(t("auth.provider_number_positive"))
         value = f"openai-{number}"
     if AUTH_FILE_RE.fullmatch(f"auth-{value}.json") is None:
-        raise AuthError("invalid new auth target; use letters, numbers, dots, dashes, or underscores")
+        raise AuthError(t("auth.invalid_new_target"))
     if value.lower() in {"openai", *KNOWN_NON_OPENAI_PROVIDERS}:
-        raise AuthError(f"reserved provider name: {value}")
+        raise AuthError(t("auth.reserved_provider", provider=value))
     return value
 
 
@@ -118,12 +120,53 @@ def read_auth_payload(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise AuthError(f"auth file not found: {path}") from exc
+        raise AuthError(t("auth.file_not_found", path=path)) from exc
     except json.JSONDecodeError as exc:
-        raise AuthError(f"invalid auth json: {path}") from exc
+        raise AuthError(t("auth.invalid_json", path=path)) from exc
     if not isinstance(payload, dict):
-        raise AuthError(f"invalid auth json root: {path}")
+        raise AuthError(t("auth.invalid_json_root", path=path))
     return payload
+
+
+def decode_jwt_claims(token: Any) -> dict[str, Any]:
+    if not isinstance(token, str):
+        return {}
+    parts = token.split(".")
+    if len(parts) < 2 or not parts[1]:
+        return {}
+    encoded = parts[1]
+    try:
+        decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        payload = json.loads(decoded.decode("utf-8"))
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def normalize_email(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    email = value.strip()
+    return email.casefold() if email and "@" in email else None
+
+
+def auth_email(path: Path) -> str:
+    payload = read_auth_payload(path)
+    tokens = payload.get("tokens")
+    tokens = tokens if isinstance(tokens, dict) else {}
+    id_claims = decode_jwt_claims(tokens.get("id_token"))
+    access_claims = decode_jwt_claims(tokens.get("access_token"))
+    profile = access_claims.get("https://api.openai.com/profile")
+    profile = profile if isinstance(profile, dict) else {}
+    candidates = (id_claims.get("email"), access_claims.get("email"), profile.get("email"))
+    emails = {
+        normalized: value.strip()
+        for value in candidates
+        if (normalized := normalize_email(value)) is not None and isinstance(value, str)
+    }
+    if len(emails) != 1:
+        raise AuthError(t("auth.email_unverifiable", path=path))
+    return next(iter(emails.values()))
 
 
 def token_fingerprint(path: Path) -> str | None:
@@ -193,6 +236,15 @@ def read_current_provider() -> str | None:
     return infer_current_provider()
 
 
+def resolve_existing_auth_target(target: str | None) -> str:
+    if target is not None and target.strip():
+        return resolve_auth_target(target)
+    current_provider = read_current_provider()
+    if current_provider is None or not auth_file(current_provider).exists():
+        raise AuthError(t("auth.current_provider_missing"))
+    return current_provider
+
+
 def write_provider_config(provider: str, auth_keyword: str | None = None) -> dict[str, Any]:
     provider = "third-party-api" if provider == "api" else provider
     payload = provider_config_payload(provider, auth_keyword)
@@ -249,7 +301,7 @@ def provider_display(provider: str, current_provider: str | None) -> str:
     if provider == "openai":
         return current_provider if current_provider is not None else "openai"
     if provider in {"unset", "unknown"}:
-        return "未设置" if provider == "unset" else "未知"
+        return t("common.unset") if provider == "unset" else t("common.unknown")
     return provider
 
 
@@ -289,9 +341,9 @@ def backup_count(keyword: str) -> int:
 
 def save_active_auth(current_provider: str) -> None:
     if not current_provider:
-        raise AuthError("cannot persist current auth without an auth keyword")
+        raise AuthError(t("auth.persist_without_keyword"))
     if not ACTIVE_AUTH_FILE.exists():
-        raise AuthError(f"missing active auth file: {ACTIVE_AUTH_FILE}")
+        raise AuthError(t("auth.active_file_missing", path=ACTIVE_AUTH_FILE))
 
     current_auth_file = auth_file(current_provider)
     if current_auth_file.exists():
@@ -306,8 +358,8 @@ def switch_openai_auth(target_provider: str) -> None:
     target_auth_file = auth_file(target_provider)
     if not target_auth_file.exists():
         raise AuthError(
-            f"target auth file not found: {target_auth_file}"
-            f"{new_auth_hint(target_provider)}"
+            t("auth.target_path_not_found", path=target_auth_file)
+            + new_auth_hint(target_provider)
         )
 
     current_provider = read_current_provider()
@@ -410,31 +462,36 @@ def sync_registry() -> dict[str, Any]:
 
 
 def print_registry_summary(registry: dict[str, Any]) -> None:
-    print(f"当前服务【{registry['current_service']}】")
-    print(f"provider: {registry['current_provider_path']}")
-    print(f"registry: {registry['registry_path']}")
+    print(t("auth.current_service", service=registry["current_service"]))
+    print(t("auth.provider_path", path=registry["current_provider_path"]))
+    print(t("auth.registry_path", path=registry["registry_path"]))
     accounts = registry.get("accounts", [])
     if not accounts:
-        print("无可用 auth_list 账号")
+        print(t("auth.no_accounts"))
         return
     for account in accounts:
         marker = "*" if account.get("is_active_provider") else ("+" if account.get("is_current") else " ")
         refresh = account.get("meta", {}).get("last_refresh") or "-"
         print(
-            f"{marker} {account['label']}  "
-            f"refresh={refresh}  backups={account.get('backup_count', 0)}"
+            t(
+                "auth.account_summary",
+                marker=marker,
+                label=account["label"],
+                refresh=refresh,
+                backups=account.get("backup_count", 0),
+            )
         )
 
 
 def print_provider_change(before: dict[str, Any], after: dict[str, Any]) -> None:
-    before_service = before.get("current_service", "未知")
-    after_service = after.get("current_service", "未知")
+    before_service = before.get("current_service", t("common.unknown"))
+    after_service = after.get("current_service", t("common.unknown"))
     if before_service == after_service:
-        print(f"当前服务【{after_service}】")
+        print(t("auth.current_service", service=after_service))
     else:
-        print(f"原先服务【{before_service}】-> 当前服务【{after_service}】")
-    print(f"provider: {after['current_provider_path']}")
-    print(f"registry: {after['registry_path']}")
+        print(t("auth.service_changed", before=before_service, after=after_service))
+    print(t("auth.provider_path", path=after["current_provider_path"]))
+    print(t("auth.registry_path", path=after["registry_path"]))
 
 
 def command_for_pid(pid: int) -> list[str]:
@@ -489,8 +546,8 @@ def assert_no_running_codex_processes() -> None:
         return
     rendered = "; ".join(f"pid={item['pid']} {item['cmd']}" for item in processes[:5])
     if len(processes) > 5:
-        rendered += f"; ... and {len(processes) - 5} more"
-    raise AuthError(f"refusing to switch provider while Codex is running: {rendered}")
+        rendered += t("auth.more_processes", count=len(processes) - 5)
+    raise AuthError(t("auth.switch_refused_running", processes=rendered))
 
 
 def run_device_login(login_home: Path) -> str:
@@ -504,7 +561,7 @@ def run_device_login(login_home: Path) -> str:
         )
         return_code = process.wait()
     except FileNotFoundError as exc:
-        raise AuthError("codex command not found on PATH") from exc
+        raise AuthError(t("auth.codex_not_found")) from exc
     except KeyboardInterrupt as exc:
         if process is not None:
             process.terminate()
@@ -513,9 +570,9 @@ def run_device_login(login_home: Path) -> str:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-        raise AuthError("Codex device login cancelled") from exc
+        raise AuthError(t("auth.login_cancelled")) from exc
     if return_code != 0:
-        raise AuthError(f"Codex device login failed with exit code {return_code}")
+        raise AuthError(t("auth.login_failed", code=return_code))
 
     status = subprocess.run(
         ["codex", "login", "-c", FILE_AUTH_CONFIG, "status"],
@@ -526,7 +583,7 @@ def run_device_login(login_home: Path) -> str:
     )
     status_text = (status.stdout or status.stderr).strip()
     if status.returncode != 0 or not status_text:
-        raise AuthError("cannot verify Codex login status")
+        raise AuthError(t("auth.verify_login_failed"))
     return status_text
 
 
@@ -536,14 +593,14 @@ def validate_new_auth(path: Path, keyword: str) -> dict[str, Any]:
     try:
         _access_token, account_id = load_auth_credentials(path)
     except Exception as exc:
-        raise AuthError(f"cannot verify account information: {exc}") from exc
+        raise AuthError(t("auth.verify_account_info_detail", error=exc)) from exc
     report = collect_account(keyword, path, keyword, "Asia/Shanghai")
     if report.get("error"):
-        raise AuthError(f"cannot verify account status: {report['error']}")
+        raise AuthError(t("auth.verify_account_status_detail", error=report["error"]))
     if not any((account_id, report.get("email"), report.get("plan_type"))):
-        raise AuthError("cannot verify account information")
+        raise AuthError(t("auth.verify_account_info_failed"))
     if not isinstance(report.get("allowed"), bool):
-        raise AuthError("cannot verify account status")
+        raise AuthError(t("auth.verify_account_status_failed"))
     return report
 
 
@@ -576,8 +633,8 @@ def command_sync(as_json: bool) -> int:
     if as_json:
         print(json.dumps(registry, ensure_ascii=False, indent=2))
     else:
-        print(f"已更新 provider: {registry['current_provider_path']}")
-        print(f"已更新 auth registry: {registry['registry_path']}")
+        print(t("auth.provider_updated", path=registry["current_provider_path"]))
+        print(t("auth.registry_updated", path=registry["registry_path"]))
     return 0
 
 
@@ -585,13 +642,12 @@ def command_new(target: str, as_json: bool) -> int:
     keyword = normalize_new_auth_target(target)
     target_auth_file = auth_file(keyword)
     if target_auth_file.exists():
-        raise AuthError(f"provider already exists: {keyword}")
+        raise AuthError(t("auth.provider_exists", provider=keyword))
     assert_no_running_codex_processes()
 
     output = sys.stderr if as_json else sys.stdout
     print(
-        f"正在通过 device auth 登录新 provider【{keyword}】...\n\n"
-        "请按照下方登录信息在网页版完成登录；等待期间可按 Ctrl-C 取消。\n",
+        t("auth.login_intro", provider=keyword),
         file=output,
         flush=True,
     )
@@ -612,10 +668,108 @@ def command_new(target: str, as_json: bool) -> int:
         print(json.dumps(registry, ensure_ascii=False, indent=2))
     else:
         print()
-        print(f"已新增并切换 provider【{keyword}】")
-        print("Codex 登录状态、账号信息和额度状态验证通过")
-        print(f"provider: {registry['current_provider_path']}")
-        print(f"registry: {registry['registry_path']}")
+        print(t("auth.provider_added", provider=keyword))
+        print(t("auth.validation_passed"))
+        print(t("auth.provider_path", path=registry["current_provider_path"]))
+        print(t("auth.registry_path", path=registry["registry_path"]))
+    return 0
+
+
+def command_refresh(target: str | None, as_json: bool) -> int:
+    keyword = resolve_existing_auth_target(target)
+    target_auth_file = auth_file(keyword)
+    existing_email = auth_email(target_auth_file)
+    assert_no_running_codex_processes()
+
+    output = sys.stderr if as_json else sys.stdout
+    print(t("auth.refresh_intro", provider=keyword), file=output, flush=True)
+    with tempfile.TemporaryDirectory(prefix=".codexauth-refresh-", dir=PATHS.runtime_dir) as temp_dir:
+        login_home = Path(temp_dir)
+        if CONFIG_FILE.exists():
+            shutil.copy2(CONFIG_FILE, login_home / "config.toml")
+        run_device_login(login_home)
+        login_auth_file = login_home / "auth.json"
+        report = validate_new_auth(login_auth_file, keyword)
+        reported_email = normalize_email(report.get("email"))
+        token_email = normalize_email(auth_email(login_auth_file))
+        if reported_email is None or reported_email != token_email:
+            raise AuthError(t("auth.refresh_email_unverified", provider=keyword))
+        if normalize_email(existing_email) != reported_email:
+            raise AuthError(
+                t(
+                    "auth.refresh_email_mismatch",
+                    provider=keyword,
+                    expected=existing_email,
+                    actual=report.get("email"),
+                )
+            )
+        refreshed_payload = read_auth_payload(login_auth_file)
+
+    shutil.copy2(target_auth_file, backup_file(keyword))
+    prune_backups(keyword)
+    atomic_write_json(target_auth_file, refreshed_payload, 0o600)
+    if read_current_provider() == keyword:
+        atomic_write_json(ACTIVE_AUTH_FILE, refreshed_payload, 0o600)
+
+    registry = sync_registry()
+    request_sampler_refresh()
+    if as_json:
+        print(json.dumps(registry, ensure_ascii=False, indent=2))
+    else:
+        print()
+        print(t("auth.provider_refreshed", provider=keyword))
+        print(t("auth.refresh_validation_passed"))
+        print(t("auth.registry_path", path=registry["registry_path"]))
+    return 0
+
+
+def confirm_provider_deletion(keyword: str) -> None:
+    print(t("auth.delete_confirm", provider=keyword), end="", file=sys.stderr, flush=True)
+    try:
+        confirmation = sys.stdin.readline()
+    except KeyboardInterrupt as exc:
+        raise AuthError(t("auth.delete_cancelled")) from exc
+    if not confirmation:
+        raise AuthError(t("auth.delete_cancelled"))
+    if confirmation.strip() != keyword:
+        raise AuthError(t("auth.delete_confirmation_mismatch", provider=keyword))
+
+
+def command_delete(target: str | None, as_json: bool) -> int:
+    keyword = resolve_existing_auth_target(target)
+    target_auth_file = auth_file(keyword)
+    assert_no_running_codex_processes()
+    confirm_provider_deletion(keyword)
+
+    current_provider = read_current_provider()
+    if current_provider == keyword:
+        replacements = [item for item in discover_auth_files() if item[0] != keyword]
+        replacement = replacements[0][0] if replacements else None
+        current_config = read_provider_config()
+        configured_provider = current_config.get("provider")
+        if not isinstance(configured_provider, str) or configured_provider in {"", "unset", "unknown"}:
+            configured_provider = read_model_provider()
+        if configured_provider in {"unset", "unknown"}:
+            configured_provider = "openai"
+        if replacement is None:
+            ACTIVE_AUTH_FILE.unlink(missing_ok=True)
+        else:
+            atomic_write_json(ACTIVE_AUTH_FILE, read_auth_payload(auth_file(replacement)), 0o600)
+        write_provider_config(configured_provider, replacement)
+
+    provider_backup_dir = backup_dir_for(keyword)
+    if provider_backup_dir.exists():
+        shutil.rmtree(provider_backup_dir)
+    target_auth_file.unlink()
+
+    registry = sync_registry()
+    request_sampler_refresh()
+    if as_json:
+        print(json.dumps(registry, ensure_ascii=False, indent=2))
+    else:
+        print(t("auth.provider_deleted", provider=keyword))
+        print(t("auth.current_service", service=registry["current_service"]))
+        print(t("auth.registry_path", path=registry["registry_path"]))
     return 0
 
 
@@ -651,13 +805,26 @@ def command_switch(target: str, as_json: bool) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Manage CodexTOP auth slots, provider state, and provider switching."
+    parser = argparse.ArgumentParser(description=t("auth.arg.description"))
+    parser.add_argument("--json", action="store_true", help=t("auth.arg.json"))
+    parser.add_argument("--new", metavar="TARGET", help=t("auth.arg.new"))
+    parser.add_argument(
+        "--refresh",
+        nargs="?",
+        const="",
+        metavar="PROVIDER",
+        help=t("auth.arg.refresh"),
     )
-    parser.add_argument("--json", action="store_true", help="Print JSON output.")
-    parser.add_argument("--new", metavar="TARGET", help="Add a provider with Codex device authentication.")
-    parser.add_argument("command", nargs="?", help="current, list, sync, switch, or legacy provider target.")
-    parser.add_argument("target", nargs="?", help="Target provider for `switch`, or legacy switch value.")
+    parser.add_argument(
+        "--delete",
+        dest="delete_target",
+        nargs="?",
+        const="",
+        metavar="PROVIDER",
+        help=t("auth.arg.delete"),
+    )
+    parser.add_argument("command", nargs="?", help=t("auth.arg.command"))
+    parser.add_argument("target", nargs="?", help=t("auth.arg.target"))
     return parser
 
 
@@ -665,10 +832,20 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     try:
+        action_count = sum(
+            option is not None
+            for option in (args.new, args.refresh, args.delete_target)
+        )
+        if action_count > 1:
+            raise AuthError(t("auth.action_conflict"))
+        if action_count and (args.command is not None or args.target is not None):
+            raise AuthError(t("auth.action_conflict"))
         if args.new is not None:
-            if args.command is not None or args.target is not None:
-                raise AuthError("--new cannot be combined with another command")
             return command_new(args.new, args.json)
+        if args.refresh is not None:
+            return command_refresh(args.refresh or None, args.json)
+        if args.delete_target is not None:
+            return command_delete(args.delete_target or None, args.json)
         if not args.command:
             return command_current(args.json)
         if args.command == "current":
@@ -679,14 +856,14 @@ def main(argv: list[str] | None = None) -> int:
             return command_sync(args.json)
         if args.command == "switch":
             if not args.target:
-                raise AuthError("missing switch target")
+                raise AuthError(t("auth.missing_switch_target"))
             return command_switch(args.target, args.json)
 
         if args.target is not None:
-            raise AuthError(f"unexpected extra argument: {args.target}")
+            raise AuthError(t("auth.unexpected_argument", argument=args.target))
         return command_switch(args.command, args.json)
     except AuthError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(t("common.error_message", error=exc), file=sys.stderr)
         return 1
 
 

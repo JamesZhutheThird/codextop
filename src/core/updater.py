@@ -11,6 +11,8 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -19,6 +21,8 @@ if __package__ in {None, ""}:
 else:
     from .paths import default_paths
     from .version import APP_VERSION, PACKAGE_VERSION
+
+from core.i18n import t
 
 
 DEFAULT_REMOTE = "origin"
@@ -30,13 +34,21 @@ GITHUB_URL_RE = re.compile(
     r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
     r"(?P<owner>[^/\s:]+)/(?P<repo>[^/\s]+?)(?:\.git)?/?$"
 )
-VERSION_TAG_RE = re.compile(
-    r"refs/tags/v?(?P<version>\d+(?:\.\d+){0,3}(?:[-+][0-9A-Za-z_.-]+)?)$"
+RELEASE_TAG_RE = re.compile(
+    r"^v?(?P<version>\d+(?:\.\d+){0,3}(?:[-+][0-9A-Za-z_.-]+)?)$"
 )
 
 
 class UpdateError(RuntimeError):
     """Raised when update detection or synchronization cannot continue safely."""
+
+
+@dataclass(frozen=True)
+class GitHubRelease:
+    tag_name: str
+    version: str
+    name: str
+    body: str
 
 
 @dataclass(frozen=True)
@@ -48,6 +60,8 @@ class UpdateStatus:
     github_repo: str | None
     current_version: str
     latest_version: str | None
+    release_name: str | None
+    release_notes: str | None
     local_revision: str | None
     remote_revision: str | None
     dirty: bool
@@ -85,7 +99,7 @@ def run_git(
             check=False,
         )
         if check and proc.returncode != 0:
-            raise UpdateError(f"git {' '.join(args)} failed with exit code {proc.returncode}")
+            raise UpdateError(t("update.git_failed", command=" ".join(args), code=proc.returncode))
         return ""
     proc = subprocess.run(
         ["git", *args],
@@ -98,7 +112,7 @@ def run_git(
     )
     if check and proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip()
-        raise UpdateError(detail or f"git {' '.join(args)} failed with exit code {proc.returncode}")
+        raise UpdateError(detail or t("update.git_failed", command=" ".join(args), code=proc.returncode))
     return proc.stdout.strip()
 
 
@@ -107,7 +121,7 @@ def discover_repo_root(start: Path | None = None) -> Path:
     try:
         root = run_git(["rev-parse", "--show-toplevel"], start)
     except UpdateError as exc:
-        raise UpdateError(f"not a git checkout: {start}") from exc
+        raise UpdateError(t("update.not_checkout", path=start)) from exc
     return Path(root)
 
 
@@ -156,19 +170,41 @@ def version_is_newer(candidate: str, current: str) -> bool:
     return candidate_numbers > current_numbers
 
 
-def latest_remote_version(repo_root: Path, remote_ref: str) -> str | None:
-    output = run_git(["ls-remote", "--tags", "--refs", remote_ref, "v*"], repo_root, timeout=30)
-    versions: list[str] = []
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        match = VERSION_TAG_RE.search(parts[1])
-        if match:
-            versions.append(match.group("version"))
-    if not versions:
+def latest_github_release(github_repo: str, *, timeout: int = 15) -> GitHubRelease | None:
+    request = Request(
+        f"https://api.github.com/repos/{github_repo}/releases/latest",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"CodexTOP/{PACKAGE_VERSION}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise UpdateError(t("update.release_request_failed", error=exc.reason or exc.code)) from exc
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
+        raise UpdateError(t("update.release_request_failed", error=exc)) from exc
+
+    if not isinstance(payload, dict):
+        raise UpdateError(t("update.release_invalid"))
+    tag_name = payload.get("tag_name")
+    match = RELEASE_TAG_RE.fullmatch(tag_name.strip()) if isinstance(tag_name, str) else None
+    if match is None:
+        raise UpdateError(t("update.release_tag_invalid", tag=tag_name or "-"))
+    if payload.get("draft") or payload.get("prerelease"):
         return None
-    return sorted(versions, key=normalize_version)[-1]
+    name = payload.get("name")
+    body = payload.get("body")
+    return GitHubRelease(
+        tag_name=tag_name,
+        version=match.group("version"),
+        name=name.strip() if isinstance(name, str) and name.strip() else tag_name,
+        body=body if isinstance(body, str) else "",
+    )
 
 
 def remote_branch_revision(repo_root: Path, remote_ref: str, branch: str) -> str | None:
@@ -200,27 +236,25 @@ def check_update(
     remote_ref, remote_url = resolve_remote(root, remote)
     github_repo = github_repo_from_url(remote_url)
     if github_repo is None and not allow_non_github:
-        raise UpdateError(f"update source is not a GitHub repository: {remote_url}")
+        raise UpdateError(t("update.source_not_github", url=remote_url))
 
     selected_branch = branch or os.environ.get(BRANCH_ENV) or current_branch(root)
     selected_branch = selected_branch.strip() or DEFAULT_BRANCH
     current_rev = local_revision(root)
     remote_rev = remote_branch_revision(root, remote_ref, selected_branch)
-    latest_version = latest_remote_version(root, remote_ref)
+    release = latest_github_release(github_repo) if github_repo is not None else None
+    latest_version = release.version if release is not None else None
     dirty = has_dirty_worktree(root)
 
     if remote_rev is None:
-        raise UpdateError(f"remote branch not found: {remote_ref}/{selected_branch}")
+        raise UpdateError(t("update.branch_not_found", remote=remote_ref, branch=selected_branch))
 
     version_update = latest_version is not None and version_is_newer(latest_version, PACKAGE_VERSION)
-    revision_update = current_rev is not None and current_rev != remote_rev
-    update_available = bool(version_update or revision_update)
+    update_available = bool(version_update)
     if version_update:
-        reason = f"remote version v{latest_version} is newer than {APP_VERSION}"
-    elif revision_update:
-        reason = "remote branch revision differs from local HEAD"
+        reason = t("update.remote_version_newer", latest=latest_version, current=APP_VERSION)
     else:
-        reason = "already up to date"
+        reason = t("update.up_to_date_reason")
 
     return UpdateStatus(
         repo_root=str(root),
@@ -230,6 +264,8 @@ def check_update(
         github_repo=github_repo,
         current_version=PACKAGE_VERSION,
         latest_version=latest_version,
+        release_name=release.name if release is not None else None,
+        release_notes=release.body if release is not None else None,
         local_revision=current_rev,
         remote_revision=remote_rev,
         dirty=dirty,
@@ -262,9 +298,9 @@ def apply_update(
     root = Path(status.repo_root)
     before = status.local_revision
     if not status.update_available:
-        return UpdateResult(status, False, before, before, "CodexTOP is already up to date.")
+        return UpdateResult(status, False, before, before, t("update.already_current"))
     if status.dirty and not allow_dirty:
-        raise UpdateError("working tree has uncommitted changes; commit or stash them before auto-update")
+        raise UpdateError(t("update.dirty_refused"))
 
     fetch_args = ["fetch", "--progress", status.remote, status.branch] if stream else [
         "fetch",
@@ -276,12 +312,12 @@ def apply_update(
     fetched = run_git(["rev-parse", "FETCH_HEAD"], root)
     current = run_git(["rev-parse", "HEAD"], root)
     if current == fetched:
-        return UpdateResult(status, False, before, current, "CodexTOP is already up to date after fetch.")
+        return UpdateResult(status, False, before, current, t("update.current_after_fetch"))
     if not is_ancestor(root, current, fetched):
-        raise UpdateError("remote update is not a fast-forward from local HEAD; refusing automatic merge")
+        raise UpdateError(t("update.not_fast_forward"))
     run_git(["merge", "--ff-only", "--stat", "FETCH_HEAD"], root, timeout=90, stream=stream)
     after = run_git(["rev-parse", "HEAD"], root)
-    return UpdateResult(status, True, before, after, f"CodexTOP updated to {after[:12]}.")
+    return UpdateResult(status, True, before, after, t("update.updated_to", revision=after[:12]))
 
 
 def short_rev(value: str | None) -> str:
@@ -292,13 +328,13 @@ def status_lines(status: UpdateStatus) -> list[str]:
     lines = [
         f"CodexTOP {APP_VERSION}",
         f"GitHub: {status.github_repo or '-'}",
-        f"Branch: {status.branch}",
-        f"Local:  {short_rev(status.local_revision)}",
-        f"Remote: {short_rev(status.remote_revision)}",
-        f"Latest version: {('v' + status.latest_version) if status.latest_version else '-'}",
-        f"Dirty worktree: {'yes' if status.dirty else 'no'}",
-        f"Update: {'available' if status.update_available else 'none'}",
-        f"Reason: {status.reason}",
+        f"{t('update.label.branch')}: {status.branch}",
+        f"{t('update.label.local')}:  {short_rev(status.local_revision)}",
+        f"{t('update.label.remote')}: {short_rev(status.remote_revision)}",
+        f"{t('update.label.latest_version')}: {('v' + status.latest_version) if status.latest_version else '-'}",
+        f"{t('update.label.dirty')}: {t('common.yes') if status.dirty else t('common.no')}",
+        f"{t('update.label.update')}: {t('common.available') if status.update_available else t('common.none')}",
+        f"{t('update.label.reason')}: {status.reason}",
     ]
     return lines
 
@@ -323,25 +359,23 @@ def clear_daily_update_cache() -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Check GitHub for CodexTOP updates and fast-forward automatically."
-    )
+    parser = argparse.ArgumentParser(description=t("update.arg.description"))
     parser.add_argument(
         "--repo-root",
         type=Path,
         default=None,
-        help="CodexTOP git checkout root; defaults to this package.",
+        help=t("update.arg.repo_root"),
     )
     parser.add_argument(
         "--remote",
         default=None,
-        help=f"Git remote name or GitHub URL; defaults to {REMOTE_ENV} or origin.",
+        help=t("update.arg.remote", env=REMOTE_ENV),
     )
-    parser.add_argument("--branch", default=None, help=f"Git branch; defaults to {BRANCH_ENV} or the current branch.")
-    parser.add_argument("--check-only", action="store_true", help="Only report whether an update exists.")
-    parser.add_argument("--allow-dirty", action="store_true", help="Allow update with a dirty worktree. Use with care.")
-    parser.add_argument("--allow-non-github", action="store_true", help="Allow a non-GitHub remote for local testing.")
-    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    parser.add_argument("--branch", default=None, help=t("update.arg.branch", env=BRANCH_ENV))
+    parser.add_argument("--check-only", action="store_true", help=t("update.arg.check_only"))
+    parser.add_argument("--allow-dirty", action="store_true", help=t("update.arg.allow_dirty"))
+    parser.add_argument("--allow-non-github", action="store_true", help=t("update.arg.allow_non_github"))
+    parser.add_argument("--json", action="store_true", help=t("update.arg.json"))
     args = parser.parse_args()
 
     try:
@@ -377,7 +411,7 @@ def main() -> int:
         if args.json:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2))
         else:
-            print(f"CodexTOP update failed: {exc}")
+            print(t("update.failed", error=exc))
         return 1
 
 

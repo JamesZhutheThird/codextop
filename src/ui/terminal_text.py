@@ -10,6 +10,7 @@ from typing import Any
 from quota import check_codex_quota as quota
 from . import color_schemes
 from core.constants import *
+from core.i18n import t
 
 def char_width(char: str) -> int:
     if unicodedata.combining(char):
@@ -298,7 +299,7 @@ def reset_credit_day_width(seconds_values: list[Any]) -> int:
 
 def reset_credit_right_width(day_width: int) -> int:
     digits = "9" * max(1, day_width)
-    return visible_width(f"于 {digits}d 23h 后过期")
+    return visible_width(t("quota.expires_after", countdown=f"{digits}d 23h"))
 
 
 def format_time(ts: int | float | None) -> str:

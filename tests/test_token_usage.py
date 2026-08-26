@@ -33,12 +33,17 @@ from quota.quota_format import (
 from quota.reset_credits_cache import read_reset_credits_cache
 from quota.token_usage_cache import DailyTokenUsageCacheReader
 from core.constants import HTTP_401_CREDENTIAL_HINT, HTTP_429_FALLBACK_SECONDS
+from core.i18n import t
+from core.paths import monthly_log_path
 from core.project_config import (
     DEFAULT_HTTP_429_FALLBACK_SECONDS,
     DEFAULT_RESET_CREDITS_INTERVAL_SECONDS,
     load_project_config,
 )
 from core.state import (
+    saved_dashboard_density,
+    saved_display_scope,
+    saved_hide_account_info,
     saved_merged_quota_mode,
     saved_usage_axis_scale,
     saved_usage_directory_scope,
@@ -55,7 +60,13 @@ from ui.session_tokens import (
     TokenUsageBreakdown,
     TrustedDirectoryTokenUsageMonitor,
 )
-from ui.settings import render_sidebar, setting_items
+from ui.settings import (
+    handle_click,
+    handle_setting_key,
+    render_sidebar,
+    setting_categories,
+    setting_items,
+)
 from ui.panels import (
     account_summary_body,
     current_account_border_color,
@@ -66,6 +77,7 @@ from ui.panels import (
     merged_value_at,
 )
 from ui.terminal_text import plain_wrap, strip_ansi, visible_width
+from ui.terminal_io import parse_input
 from ui.token_charts import (
     TOKEN_KEYS,
     TOKEN_MARKERS,
@@ -106,6 +118,63 @@ def quota_payload() -> dict:
 
 
 class CollectionTests(unittest.TestCase):
+    def test_initial_history_load_sorts_small_disorder_without_rereading(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir) / "quota_snapshots.jsonl"
+            monthly = monthly_log_path(base, time.time(), "Asia/Shanghai")
+            timestamps = [1_000, 1_120, 1_060]
+            records = [
+                {
+                    "t": timestamp,
+                    "a": [{"i": "openai-1", "q": {"5h": [80, 20_000, 19_000, 18_000]}}],
+                }
+                for timestamp in timestamps
+            ]
+            monthly.write_text(
+                "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            cache = IncrementalHistoryCache(base, "Asia/Shanghai")
+            loaded, changed = cache.read("7d")
+
+            self.assertTrue(changed)
+            self.assertEqual([record["t"] for record in loaded], sorted(timestamps))
+            self.assertEqual(cache.bytes_read, monthly.stat().st_size)
+
+    def test_missing_five_hour_window_defaults_only_when_weekly_window_exists(self) -> None:
+        weekly_only = quota_payload()
+        weekly_only["rate_limit"]["primary_window"] = weekly_only["rate_limit"].pop(
+            "secondary_window"
+        )
+        quota_windows = quota.normalize_quota_report(
+            weekly_only,
+            {},
+            "Asia/Shanghai",
+        )["quota"]
+        self.assertEqual(quota_windows["5h"]["remaining_percent"], 100)
+        self.assertEqual(quota_windows["5h"]["reset_after_seconds"], 5 * 3_600)
+        self.assertEqual(quota_windows["5h"]["limit_window_seconds"], 5 * 3_600)
+        self.assertEqual(quota_windows["7d"]["remaining_percent"], 60)
+        compact = compact_account({"index": "openai-1", "quota": quota_windows}, 1_000)
+        self.assertEqual(compact["q"]["5h"], [100, 19_000, 18_000, 18_000])
+
+        normal = quota.normalize_quota_report(
+            quota_payload(),
+            {},
+            "Asia/Shanghai",
+        )["quota"]
+        self.assertEqual(normal["5h"]["remaining_percent"], 80)
+        self.assertEqual(normal["5h"]["reset_after_seconds"], 17_000)
+
+        missing = quota.normalize_quota_report(
+            {"rate_limit": {"allowed": True}},
+            {},
+            "Asia/Shanghai",
+        )["quota"]
+        self.assertIsNone(missing["5h"]["remaining_percent"])
+        self.assertIsNone(missing["7d"]["remaining_percent"])
+
     def test_plan_labels_and_actual_quota_multipliers(self) -> None:
         self.assertEqual(account_plan({"plan": "plus"}), "Plus")
         self.assertEqual(account_plan({"plan": "pro"}), "Pro(20x)")
@@ -280,7 +349,7 @@ class CollectionTests(unittest.TestCase):
         output = StringIO()
         with redirect_stdout(output):
             quota.print_text({"token_usage": {"lifetime_tokens": 1_234_567}})
-        self.assertIn("total_usage: 1,234,567 Tokens", output.getvalue())
+        self.assertIn(f"{t('quota.plain.total_usage')}: 1,234,567 Tokens", output.getvalue())
 
     def test_plain_error_output_keeps_identity_above_error(self) -> None:
         output = StringIO()
@@ -298,8 +367,11 @@ class CollectionTests(unittest.TestCase):
                 }
             )
         rendered = output.getvalue()
-        self.assertLess(rendered.index("email: codex@example.com"), rendered.index("error: quota unavailable"))
-        self.assertLess(rendered.index("plan_type: plus"), rendered.index("error: quota unavailable"))
+        email = f"{t('quota.plain.email')}: codex@example.com"
+        plan = f"{t('quota.plain.plan_type')}: plus"
+        error = f"{t('common.error')}: quota unavailable"
+        self.assertLess(rendered.index(email), rendered.index(error))
+        self.assertLess(rendered.index(plan), rendered.index(error))
 
     def test_http_401_error_adds_codexauth_refresh_hint_on_a_new_line(self) -> None:
         denied = HTTPError(quota.USAGE_URL, 401, "Unauthorized", None, None)
@@ -310,8 +382,8 @@ class CollectionTests(unittest.TestCase):
             quota.get_json(quota.USAGE_URL, "secret")
 
         self.assertEqual(
-            str(raised.exception).splitlines(),
-            ["request denied with HTTP 401", HTTP_401_CREDENTIAL_HINT],
+            str(raised.exception),
+            t("quota.error.request_401", hint=HTTP_401_CREDENTIAL_HINT),
         )
         self.assertEqual(
             account_error({"err": "request denied with HTTP 401"}).splitlines(),
@@ -835,10 +907,11 @@ class CollectionTests(unittest.TestCase):
             raw_accounts,
             now=101 + HTTP_429_FALLBACK_SECONDS,
         )[0]
-        self.assertEqual(account_error(stale), "已持续 10分钟 未获取到新数据")
+        stale_message = t("history.stale", duration=t("duration.minutes", minutes=10))
+        self.assertEqual(account_error(stale), stale_message)
         self.assertEqual(merged_window_info([stale], "7d")["contributors"], 0)
         rendered = "\n".join(strip_ansi(line) for line in merged_account_reset_body([stale], "openai-1", 48, "7d"))
-        self.assertIn("openai-1: 已持续 10分钟 未获取到新数据", rendered)
+        self.assertIn(f"openai-1: {stale_message}", rendered)
 
     def test_current_quota_and_429_fallback_do_not_reuse_smoothed_old_value(self) -> None:
         cache = IncrementalHistoryCache(Path("quota_snapshots.jsonl"), "Asia/Shanghai")
@@ -1123,7 +1196,7 @@ class ProjectTokenMonitorTests(unittest.TestCase):
     def test_account_card_usage_row_only_contains_online_total(self) -> None:
         rows = token_usage_rows(1_234_000, 80)
         plain = [strip_ansi(row) for row in rows]
-        self.assertEqual(plain[0], "使用总量 1,234,000 Tokens")
+        self.assertEqual(plain[0], f"{t('quota.total_usage')} 1,234,000 Tokens")
         self.assertEqual(len(plain), 1)
 
 
@@ -1279,6 +1352,11 @@ class TrustedDirectoryMonitorTests(unittest.TestCase):
             self.assertEqual(monitor.latest.total_tokens, 620)
 
     def test_usage_directory_scope_state_validation(self) -> None:
+        self.assertEqual(saved_dashboard_density({"dashboard_density": "default"}), "default")
+        self.assertEqual(saved_dashboard_density({"dashboard_density": "fill"}), "fill")
+        self.assertIsNone(saved_dashboard_density({"dashboard_density": "invalid"}))
+        self.assertFalse(saved_hide_account_info({"hide_account_info": False}))
+        self.assertIsNone(saved_hide_account_info({"hide_account_info": "false"}))
         self.assertEqual(saved_usage_directory_scope({"usage_directory_scope": "all"}), "all")
         self.assertIsNone(saved_usage_directory_scope({"usage_directory_scope": "invalid"}))
         self.assertEqual(saved_usage_panel_layout({"usage_panel_layout": "split"}), "split")
@@ -1325,27 +1403,59 @@ class SettingsTests(unittest.TestCase):
         state = SimpleNamespace(display_scope=display_scope)
         return [key for key, _title, _choices in setting_items(state)]
 
-    def test_display_scope_is_third_and_mode_specific_items_are_last(self) -> None:
-        usage = self.keys("usage")
-        self.assertEqual(usage[:3], ["interval", "period", "display_scope"])
-        self.assertEqual(
-            usage[-3:],
-            ["usage_directory_scope", "usage_panel_layout", "usage_axis_scale"],
-        )
-        self.assertNotIn("window_scope", usage)
-
-        for display_scope in ("all", "current", "merged"):
+    def test_setting_items_follow_the_documented_hierarchy_without_mode_annotations(self) -> None:
+        expected = [
+            "interval",
+            "period",
+            "display_scope",
+            "language",
+            "hide_account_info",
+            "window_scope",
+            "dashboard_density",
+            "merged_quota_mode",
+            "usage_directory_scope",
+            "usage_panel_layout",
+            "usage_axis_scale",
+            "curve_mode",
+            "color_scheme",
+        ]
+        for display_scope in ("list", "focus", "merged", "usage"):
             with self.subTest(display_scope=display_scope):
-                quota = self.keys(display_scope)
-                self.assertEqual(quota[:3], ["interval", "period", "display_scope"])
-                self.assertEqual(quota[-1], "window_scope")
-                self.assertNotIn("usage_directory_scope", quota)
-                self.assertNotIn("usage_panel_layout", quota)
-                self.assertNotIn("usage_axis_scale", quota)
+                self.assertEqual(self.keys(display_scope), expected)
+
+        state = SimpleNamespace(display_scope="list")
+        titles = {key: title for key, title, _choices in setting_items(state)}
+        self.assertEqual(titles["hide_account_info"], t("setting.hide_account_info"))
+        self.assertEqual(titles["usage_axis_scale"], t("setting.usage_axis_scale"))
+        menu_keys = {
+            key
+            for _category, _title, items in setting_categories(state)
+            for key, _item_title, _choices in items
+        }
+        self.assertNotIn("period", menu_keys)
+        self.assertNotIn("display_scope", menu_keys)
         self.assertEqual(
-            self.keys("merged")[-2:],
-            ["merged_quota_mode", "window_scope"],
+            {
+                category: [key for key, _title, _choices in items]
+                for category, _title, items in setting_categories(state)
+            },
+            {
+                "general": ["interval", "language", "hide_account_info"],
+                "display": [
+                    "window_scope",
+                    "dashboard_density",
+                    "merged_quota_mode",
+                    "usage_directory_scope",
+                    "usage_panel_layout",
+                    "usage_axis_scale",
+                ],
+                "appearance": ["curve_mode", "color_scheme"],
+            },
         )
+        self.assertEqual(saved_display_scope({"display_scope": "list"}), "list")
+        self.assertEqual(saved_display_scope({"display_scope": "focus"}), "focus")
+        self.assertEqual(saved_display_scope({"display_scope": "all"}), "list")
+        self.assertEqual(saved_display_scope({"display_scope": "current"}), "focus")
 
     def test_merged_quota_mode_state_validation(self) -> None:
         self.assertEqual(saved_merged_quota_mode({"merged_quota_mode": "actual"}), "actual")
@@ -1366,16 +1476,19 @@ class SettingsTests(unittest.TestCase):
             color_scheme="classic",
             merged_quota_mode="actual",
         )
+        handle_setting_key(state, "f9")
+        handle_setting_key(state, "down")
+        handle_setting_key(state, "enter")
         plain = "\n".join(strip_ansi(line) for line in render_sidebar(state, 21, 35, 100, []))
-        self.assertIn("额度叠加", plain)
-        self.assertIn("实际额度叠加", plain)
+        self.assertIn(t("setting.merged_quota_mode"), plain)
+        self.assertIn(t("choice.merged.actual"), plain)
 
     def test_usage_axis_scale_choices_are_available(self) -> None:
         state = SimpleNamespace(display_scope="usage")
         choices = next(
             choices for key, _title, choices in setting_items(state) if key == "usage_axis_scale"
         )
-        self.assertEqual(choices, [("默认", "default"), ("对数坐标轴", "log")])
+        self.assertEqual(choices, [(t("choice.axis.default"), "default"), (t("choice.axis.log"), "log")])
 
     def test_usage_axis_scale_is_visible_in_a_standard_height_sidebar(self) -> None:
         state = MonitorState(
@@ -1390,17 +1503,184 @@ class SettingsTests(unittest.TestCase):
             window_scope="both",
             color_scheme="classic",
         )
+        handle_setting_key(state, "f9")
+        handle_setting_key(state, "down")
+        handle_setting_key(state, "enter")
         plain = "\n".join(strip_ansi(line) for line in render_sidebar(state, 21, 35, 100, []))
-        self.assertIn("坐标轴", plain)
-        self.assertIn("默认", plain)
+        self.assertIn(t("setting.usage_axis_scale"), plain)
+        self.assertIn(t("choice.axis.default"), plain)
+
+    def test_only_quick_settings_are_visible_until_activation_and_use_three_levels(self) -> None:
+        state = MonitorState(
+            period="5m",
+            interval=60,
+            tz="Asia/Shanghai",
+            log_path=Path("/tmp/codextop-test/quota.jsonl"),
+            restore_interval=60,
+            state_path=Path("/tmp/codextop-test/state.json"),
+            curve_mode="connected",
+            display_scope="list",
+            window_scope="both",
+            color_scheme="classic",
+        )
+        zones = []
+        normal_lines = render_sidebar(state, 21, 35, 100, zones)
+        normal = "\n".join(strip_ansi(line) for line in normal_lines)
+        self.assertNotIn(t("setting.interval"), normal)
+        self.assertNotIn(t("setting.color_scheme"), normal)
+        self.assertIn(f"F1 / {t('setting.period')}", normal)
+        self.assertIn(f"F2 / {t('setting.display_scope')}", normal)
+
+        session = SimpleNamespace(buffer=b"", read=lambda: b"\x1bOP\x1bOQ")
+        keep_running, clicks, keys = parse_input(session)
+        self.assertTrue(keep_running)
+        self.assertEqual(clicks, [])
+        self.assertEqual(keys, ["f1", "f2"])
+        back_session = SimpleNamespace(buffer=b"", read=lambda: b"\x7f\x08\x1b")
+        keep_running, clicks, back_keys = parse_input(back_session)
+        self.assertTrue(keep_running)
+        self.assertEqual(clicks, [])
+        self.assertEqual(back_keys, ["backspace", "backspace"])
+        for shortcut, setting_index in zip(keys, (1, 2)):
+            handle_setting_key(state, shortcut)
+            self.assertEqual((state.settings_mode, state.settings_focus), ("options", setting_index))
+            handle_setting_key(state, "backspace")
+            self.assertEqual(state.settings_mode, "normal")
+
+        statistics = next(zone for zone in zones if zone.kind == "statistics_open")
+        settings = next(zone for zone in zones if zone.kind == "settings_activate")
+        exit_app = next(zone for zone in zones if zone.kind == "exit")
+        quick_settings = [zone for zone in zones if zone.kind == "settings_item"]
+        self.assertEqual([zone.value for zone in quick_settings], [1, 2])
+        self.assertEqual((statistics.y, settings.y, exit_app.y), (27, 29, 31))
+        for button in (statistics, settings, exit_app):
+            self.assertIn("\x1b[7m", normal_lines[button.y - 1])
+        for gap_y in (28, 30, 32):
+            self.assertFalse(strip_ansi(normal_lines[gap_y - 1]).strip("│ "))
+        self.assertEqual(
+            [strip_ansi(line).strip("│ ") for line in normal_lines[31:34]],
+            ["", "@JamesZhutheThird", APP_VERSION],
+        )
+        self.assertEqual(strip_ansi(normal_lines[3]).strip("│ "), t("settings.status"))
+
+        handle_click(state, zones, quick_settings[1].x1, quick_settings[1].y)
+        self.assertEqual((state.settings_mode, state.settings_focus), ("options", 2))
+        handle_setting_key(state, "backspace")
+        self.assertEqual(state.settings_mode, "normal")
+        zones = []
+        render_sidebar(state, 21, 35, 100, zones)
+        settings = next(zone for zone in zones if zone.kind == "settings_activate")
+        handle_click(state, zones, settings.x1, settings.y)
+        self.assertEqual(state.settings_mode, "categories")
+        category_lines = render_sidebar(state, 21, 35, 100, zones := [])
+        category_text = "\n".join(strip_ansi(line) for line in category_lines)
+        self.assertIn(t("settings.types"), category_text)
+        self.assertIn("<-", category_text)
+        self.assertNotIn(t("setting.interval"), category_text)
+        self.assertEqual(
+            [key for key, _title, _items in setting_categories(state)],
+            ["general", "display", "appearance"],
+        )
+        category_plain = [strip_ansi(line).strip("│ ") for line in category_lines]
+        self.assertEqual(category_plain[1:6], ["CodexTOP", "", t("settings.types"), "", ""])
+        self.assertEqual(
+            category_plain[6:11],
+            [
+                t("settings.category.general"),
+                "",
+                t("settings.category.display"),
+                "",
+                t("settings.category.appearance"),
+            ],
+        )
+
+        lower = [strip_ansi(line).strip("│ ") for line in category_lines[18:-1]]
+        self.assertEqual(
+            [line for line in lower if line],
+            [t("settings.back").strip(), t("settings.exit_mode").strip(), "@JamesZhutheThird", APP_VERSION],
+        )
+        back = next(zone for zone in zones if zone.kind == "settings_back")
+        exit_settings = next(zone for zone in zones if zone.kind == "settings_exit")
+        self.assertEqual((back.y, exit_settings.y), (statistics.y, settings.y))
+        for button in (back, exit_settings):
+            self.assertIn("\x1b[7m", category_lines[button.y - 1])
+        self.assertFalse(strip_ansi(category_lines[exit_app.y - 1]).strip("│ "))
+        self.assertFalse(
+            {"statistics_open", "settings_activate", "exit", "update_action", "summary_scroll"}
+            & {zone.kind for zone in zones}
+        )
+
+        handle_setting_key(state, "enter")
+        self.assertEqual(state.settings_mode, "items")
+        items = "\n".join(strip_ansi(line) for line in render_sidebar(state, 21, 35, 100, []))
+        self.assertIn(t("setting.interval"), items)
+        self.assertIn("60s", items)
+        self.assertNotIn(t("setting.color_scheme"), items)
+        item_lines = [strip_ansi(line).strip("│ ") for line in render_sidebar(state, 21, 35, 100, [])]
+        self.assertEqual(item_lines[8], "")
+        self.assertEqual(item_lines[9], t("setting.language"))
+
+        handle_setting_key(state, "enter")
+        self.assertEqual(state.settings_mode, "options")
+        options = "\n".join(strip_ansi(line) for line in render_sidebar(state, 21, 35, 100, []))
+        self.assertIn("5s", options)
+        self.assertIn("5m", options)
+        for expected_mode in ("items", "categories"):
+            handle_setting_key(state, "backspace")
+            self.assertEqual(state.settings_mode, expected_mode)
+        handle_setting_key(state, "enter")
+        self.assertEqual(state.settings_mode, "items")
+        handle_setting_key(state, "f9")
+        self.assertEqual(state.settings_mode, "normal")
+
+    def test_settings_pages_follow_arrow_focus_and_clickable_page_buttons(self) -> None:
+        state = MonitorState(
+            period="5m",
+            interval=60,
+            tz="Asia/Shanghai",
+            log_path=Path("/tmp/codextop-test/quota.jsonl"),
+            restore_interval=60,
+            state_path=Path("/tmp/codextop-test/state.json"),
+            curve_mode="connected",
+            display_scope="list",
+            window_scope="both",
+            color_scheme="classic",
+        )
+        for key in ("f9", "enter", "enter"):
+            handle_setting_key(state, key)
+        state.settings_option_focus = 0
+
+        zones = []
+        first_page = "\n".join(
+            strip_ansi(line) for line in render_sidebar(state, 21, 18, 100, zones)
+        )
+        self.assertIn("5s", first_page)
+        first_page_rows = [line.strip("│ ") for line in first_page.splitlines()]
+        self.assertEqual(first_page_rows.index("10s"), first_page_rows.index("5s") + 1)
+        self.assertNotIn("15s", first_page)
+        next_page = next(zone for zone in zones if zone.kind == "settings_page")
+        handle_click(state, zones, next_page.x1, next_page.y)
+        self.assertEqual(state.settings_option_focus, 2)
+
+        second_page = "\n".join(
+            strip_ansi(line) for line in render_sidebar(state, 21, 18, 100, [])
+        )
+        self.assertIn("15s", second_page)
+        self.assertNotIn("\n│         5s", second_page)
+        handle_setting_key(state, "up")
+        self.assertEqual(state.settings_option_focus, 1)
+        previous_page = "\n".join(
+            strip_ansi(line) for line in render_sidebar(state, 21, 18, 100, [])
+        )
+        self.assertIn("5s", previous_page)
 
     def test_fine_bar_style_and_release_version_are_available(self) -> None:
         state = SimpleNamespace(display_scope="usage")
         curve_choices = next(
             choices for key, _title, choices in setting_items(state) if key == "curve_mode"
         )
-        self.assertIn(("精细柱状", "fine_bar"), curve_choices)
-        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("2.4.0", "v2.4.0"))
+        self.assertIn((t("choice.curve.fine_bar"), "fine_bar"), curve_choices)
+        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("3.0.0", "v3.0.0"))
 
 
 class TokenChartTests(unittest.TestCase):
@@ -1475,9 +1755,9 @@ class TokenChartTests(unittest.TestCase):
             )
         plain = [strip_ansi(line) for line in lines]
         self.assertTrue(plain[0].startswith("╭"))
-        self.assertIn("Token 用量", plain[0])
+        self.assertIn(t("app.token_usage"), plain[0])
         self.assertTrue(plain[-1].startswith("╰"))
-        self.assertEqual((len(lines), width, height), (35, 99, 35))
+        self.assertEqual((len(lines), width, height), (35, 97, 35))
 
     def test_current_account_controls_focus_merged_and_usage_border_colors(self) -> None:
         accounts = [
@@ -1502,7 +1782,7 @@ class TokenChartTests(unittest.TestCase):
             latest=TokenUsageBreakdown(3_000, 2_000, 500, 100, 3_500),
             rate_series=self.rate_series(),
         )
-        for display_scope in ("current", "merged", "usage"):
+        for display_scope in ("focus", "merged", "usage"):
             with self.subTest(display_scope=display_scope):
                 state = SimpleNamespace(
                     token_monitor=token_monitor,
@@ -1587,7 +1867,7 @@ class TokenChartTests(unittest.TestCase):
             )
         plain = "\n".join(strip_ansi(line) for line in split_lines)
         self.assertEqual(plain.count("┌"), 4)
-        for label in ("输入", "缓存", "输出", "总量"):
+        for label in (t("token.input"), t("token.cached"), t("token.output"), t("token.total")):
             self.assertIn(label, plain)
 
     def test_only_bar_mode_uses_stacked_values(self) -> None:
@@ -1665,7 +1945,7 @@ class TokenChartTests(unittest.TestCase):
         for exponent in range(8):
             self.assertEqual(plain.count(f"10^{exponent}"), 4)
         self.assertNotIn("10^8", plain)
-        self.assertEqual(plain.count("tok/min 对数"), 4)
+        self.assertEqual(plain.count(t("token.axis_log", unit="tok/min")), 4)
 
     def test_logarithmic_combined_chart_starts_at_ten_to_zero(self) -> None:
         with patch("ui.token_charts.time.time", return_value=1_120):
@@ -1684,7 +1964,7 @@ class TokenChartTests(unittest.TestCase):
         axis_lines = [line for line in plain if "│" in line]
         self.assertTrue(axis_lines[0].lstrip().startswith("10^6 "))
         self.assertTrue(axis_lines[-1].lstrip().startswith("10^0 "))
-        self.assertIn("tok/min 对数", "\n".join(plain))
+        self.assertIn(t("token.axis_log", unit="tok/min"), "\n".join(plain))
 
     def test_logarithmic_axis_uses_the_true_visible_total_maximum(self) -> None:
         series = {
@@ -1742,7 +2022,7 @@ class TokenChartTests(unittest.TestCase):
         plain = [strip_ansi(line) for line in lines]
         self.assertEqual(plain[0].strip(), "")
         self.assertEqual(plain[1].find("tok/min ×10^3"), 4)
-        self.assertTrue(plain[1].rstrip().endswith("■ 总量 0 (0)"))
+        self.assertTrue(plain[1].rstrip().endswith(f"■ {t('token.total')} 0 (0)"))
 
     def test_token_legend_shows_current_rate_and_cumulative_total(self) -> None:
         current_series = {
@@ -1762,14 +2042,18 @@ class TokenChartTests(unittest.TestCase):
                 "classic",
             )
         header = strip_ansi(lines[1])
-        self.assertIn("● 输入 600 (1.0K)", header)
-        self.assertIn("◆ 缓存 1.2K (2.0K)", header)
-        self.assertIn("▲ 输出 300 (500)", header)
-        self.assertIn("■ 总量 2.1K (3.5K)", header)
-        self.assertNotIn("●输入", header)
-        self.assertLess(header.index("输入"), header.index("缓存"))
-        self.assertLess(header.index("缓存"), header.index("输出"))
-        self.assertLess(header.index("输出"), header.index("总量"))
+        input_label = t("token.input")
+        cached_label = t("token.cached")
+        output_label = t("token.output")
+        total_label = t("token.total")
+        self.assertIn(f"● {input_label} 600 (1.0K)", header)
+        self.assertIn(f"◆ {cached_label} 1.2K (2.0K)", header)
+        self.assertIn(f"▲ {output_label} 300 (500)", header)
+        self.assertIn(f"■ {total_label} 2.1K (3.5K)", header)
+        self.assertNotIn(f"●{input_label}", header)
+        self.assertLess(header.index(input_label), header.index(cached_label))
+        self.assertLess(header.index(cached_label), header.index(output_label))
+        self.assertLess(header.index(output_label), header.index(total_label))
 
     def test_unit_boundary_is_strictly_greater_than_fifteen_minutes(self) -> None:
         self.assertEqual(token_rate_unit(899.9), (60, "tok/min"))
@@ -1795,10 +2079,10 @@ class TokenChartTests(unittest.TestCase):
                         self.rate_series(), latest, "5m", 100, 22, mode, "classic"
                     )
                     plain = "\n".join(strip_ansi(line) for line in lines)
-                    self.assertIn("输入", plain)
-                    self.assertIn("缓存", plain)
-                    self.assertIn("输出", plain)
-                    self.assertIn("总量", plain)
+                    self.assertIn(t("token.input"), plain)
+                    self.assertIn(t("token.cached"), plain)
+                    self.assertIn(t("token.output"), plain)
+                    self.assertIn(t("token.total"), plain)
                     self.assertNotIn("5h", plain)
                     self.assertNotIn("7d", plain)
                     self.assertTrue(all(visible_width(line) <= 100 for line in lines))

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from core.constants import *
+from core.i18n import t
 from .history import period_bounds, period_context_timestamp, records_for_period, value_at, window_points
 from .terminal_text import *
 
@@ -95,9 +96,9 @@ def braille_series_chart_lines(
     nice_axis_ticks: bool = False,
 ) -> list[str]:
     if width <= 10 or height <= 3:
-        return [paint("暂无历史数据", "dim")]
+        return [paint(t("common.no_history"), "dim")]
     if not any(points.values()) or max_value <= 0:
-        return [paint("暂无历史数据", "dim")]
+        return [paint(t("common.no_history"), "dim")]
 
     chart_height = max(1, height - 3)
     tick_values = axis_tick_values(max_value, chart_height, nice_axis_ticks)
@@ -225,9 +226,9 @@ def bar_series_chart_lines(
     nice_axis_ticks: bool = False,
 ) -> list[str]:
     if width <= 10 or height <= 3:
-        return [paint("暂无历史数据", "dim")]
+        return [paint(t("common.no_history"), "dim")]
     if not any(points.values()) or max_value <= 0:
-        return [paint("暂无历史数据", "dim")]
+        return [paint(t("common.no_history"), "dim")]
 
     chart_height = max(2, height - 3)
     tick_values = axis_tick_values(max_value, chart_height, nice_axis_ticks)
@@ -316,9 +317,9 @@ def fine_bar_series_chart_lines(
     nice_axis_ticks: bool = False,
 ) -> list[str]:
     if width <= 10 or height <= 3:
-        return [paint("暂无历史数据", "dim")]
+        return [paint(t("common.no_history"), "dim")]
     if not any(points.values()) or max_value <= 0:
-        return [paint("暂无历史数据", "dim")]
+        return [paint(t("common.no_history"), "dim")]
 
     chart_height = max(2, height - 3)
     tick_values = axis_tick_values(max_value, chart_height, nice_axis_ticks)
@@ -409,9 +410,9 @@ def series_chart_lines(
     nice_axis_ticks: bool = False,
 ) -> list[str]:
     if width <= 10 or height <= 3:
-        return [paint("暂无历史数据", "dim")]
+        return [paint(t("common.no_history"), "dim")]
     if not any(points.values()) or max_value <= 0:
-        return [paint("暂无历史数据", "dim")]
+        return [paint(t("common.no_history"), "dim")]
     if curve_mode == "braille":
         return braille_series_chart_lines(
             points,
@@ -611,7 +612,7 @@ def chart_lines(
     window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> list[str]:
     if not records:
-        return [paint("暂无历史数据", "dim")]
+        return [paint(t("common.no_history"), "dim")]
     series_index = getattr(records, "series_index", None)
     if series_index is not None:
         start_ts, end_ts = period_bounds(records, period)
