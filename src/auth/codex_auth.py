@@ -12,15 +12,21 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.paths import (
-    CodexTopPaths,
     atomic_write_json,
     atomic_write_text,
     auth_keyword_from_path,
@@ -32,7 +38,7 @@ from core.paths import (
     now_iso,
     provider_config_payload,
 )
-from core.i18n import t
+from core.i18n import activate_saved_language, t
 
 
 REPO_DIR = Path(__file__).resolve().parents[2]
@@ -46,9 +52,9 @@ REGISTRY_FILE = PATHS.registry_file
 AUTH_BACKUP_DIR = PATHS.auth_backup_dir
 BACKUPS_PER_PROVIDER = 10
 AUTH_FILE_RE = re.compile(r"auth-([A-Za-z0-9][A-Za-z0-9_.-]*)\.json$")
-MODEL_PROVIDER_RE = re.compile(r'(?m)^(\s*model_provider\s*=\s*)"([^"]+)"(\s*)$')
 KNOWN_NON_OPENAI_PROVIDERS = {"third-party-api","api"}
 FILE_AUTH_CONFIG = 'cli_auth_credentials_store="file"'
+DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
 
 
 class AuthError(Exception):
@@ -126,6 +132,80 @@ def read_auth_payload(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise AuthError(t("auth.invalid_json_root", path=path))
     return payload
+
+
+def is_api_auth(payload: dict[str, Any]) -> bool:
+    return payload.get("auth_mode") == "apikey" or bool(payload.get("OPENAI_API_KEY"))
+
+
+def api_provider_id(keyword: str) -> str:
+    return f"codextop-api-{keyword}"
+
+
+def validate_api_key(value: Any) -> str:
+    if (
+        not isinstance(value, str) or not value.strip()
+        or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value.strip())
+    ):
+        raise AuthError(t("auth.api_invalid_key"))
+    return value.strip()
+
+
+def api_auth_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    source = payload.get("codextop_api", {})
+    key = payload.get("OPENAI_API_KEY")
+    if "key_env" in source:
+        name = source["key_env"]
+        if not isinstance(name, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+            raise AuthError(t("auth.api_invalid_env"))
+        key = os.environ.get(name)
+        if not key or not key.strip():
+            raise AuthError(t("auth.api_env_missing", name=name))
+    return {"auth_mode": "apikey", "OPENAI_API_KEY": validate_api_key(key)}
+
+
+def prompt_api_source(keyword: str) -> dict[str, Any]:
+    from rich.console import Console
+    from rich.prompt import Prompt
+    from rich.text import Text
+
+    if not sys.stdin.isatty():
+        raise AuthError(t("auth.api_terminal_required"))
+    console = Console(stderr=True)
+    console.print(Text(t("auth.api_intro", provider=keyword)))
+    try:
+        choice = Prompt.ask(t("auth.api_source"), choices=["1", "2"], default="1", console=console)
+        source: dict[str, Any] = {}
+        payload: dict[str, Any] = {"auth_mode": "apikey", "codextop_api": source}
+        while True:
+            if choice == "1":
+                payload["OPENAI_API_KEY"] = Prompt.ask(t("auth.api_key"), password=True, console=console).strip()
+            else:
+                source["key_env"] = Prompt.ask(t("auth.api_key_env"), console=console).strip()
+            try:
+                key = api_auth_payload(payload)["OPENAI_API_KEY"]
+                break
+            except AuthError as exc:
+                console.print(Text(t("common.error_message", error=exc)))
+        masked_key = key[:4] + "******" + key[-1] if len(key) > 5 else "******"
+        console.print(Text(t("auth.api_key_detected", masked_key=masked_key)))
+        base_url = Prompt.ask(t("auth.api_base_url"), default=DEFAULT_API_BASE_URL, console=console).strip()
+        source["base_url"] = validate_api_base_url(base_url or DEFAULT_API_BASE_URL)
+        return payload
+    except (KeyboardInterrupt, EOFError) as exc:
+        raise AuthError(t("auth.api_cancelled")) from exc
+
+
+def validate_api_base_url(value: str) -> str:
+    try:
+        url = urlsplit(value)
+        valid = url.scheme in {"http", "https"} and url.hostname and url.port != 0
+        valid = valid and not (url.username or url.password or url.query or url.fragment)
+    except ValueError:
+        valid = False
+    if not valid or any(c.isspace() for c in value):
+        raise AuthError(t("auth.api_invalid_url"))
+    return value.rstrip("/")
 
 
 def decode_jwt_claims(token: Any) -> dict[str, Any]:
@@ -248,6 +328,8 @@ def resolve_existing_auth_target(target: str | None) -> str:
 def write_provider_config(provider: str, auth_keyword: str | None = None) -> dict[str, Any]:
     provider = "third-party-api" if provider == "api" else provider
     payload = provider_config_payload(provider, auth_keyword)
+    if auth_keyword and provider == api_provider_id(auth_keyword):
+        payload["service"] = auth_keyword
     payload["codex_dir"] = str(CODEX_DIR)
     payload["auth_list_dir"] = str(AUTH_LIST_DIR)
     payload["config_path"] = str(CONFIG_FILE)
@@ -258,30 +340,86 @@ def write_provider_config(provider: str, auth_keyword: str | None = None) -> dic
 def read_model_provider() -> str:
     if not CONFIG_FILE.exists():
         return "unset"
-    content = CONFIG_FILE.read_text(encoding="utf-8")
-    match = MODEL_PROVIDER_RE.search(content)
-    if not match:
-        return "unknown"
-    return match.group(2).strip() or "unknown"
+    return str(parse_config(CONFIG_FILE.read_text(encoding="utf-8")).get("model_provider", "unknown"))
 
 
-def set_model_provider(provider: str) -> None:
-    if CONFIG_FILE.exists():
-        old_mode = CONFIG_FILE.stat().st_mode
-        content = CONFIG_FILE.read_text(encoding="utf-8")
-    else:
-        old_mode = 0o600
-        content = ""
+def parse_config(content: str) -> dict[str, Any]:
+    try:
+        return tomllib.loads(content)
+    except tomllib.TOMLDecodeError as exc:
+        raise AuthError(t("auth.invalid_config")) from exc
 
-    line = f'model_provider = "{provider}"'
-    if MODEL_PROVIDER_RE.search(content):
-        content = MODEL_PROVIDER_RE.sub(rf'\1"{provider}"\3', content, count=1)
-    elif content:
-        content = line + "\n" + content
-    else:
-        content = line + "\n"
 
-    atomic_write_text(CONFIG_FILE, content, old_mode)
+def set_root_config(content: str, key: str, value: str) -> str:
+    # Only edit the root table, preserving profiles and unrelated user settings.
+    table = re.search(r"(?m)^[ \t]*\[", content)
+    end = table.start() if table else len(content)
+    root, rest = content[:end], content[end:]
+    pattern = re.compile(rf"(?m)^[ \t]*(?:{key}|\"{key}\"|'{key}')[ \t]*=.*$")
+    line = f"{key} = {json.dumps(value)}"
+    root = pattern.sub(lambda _: line, root, count=1) if pattern.search(root) else line + "\n" + root
+    return root + rest
+
+
+def provider_block(keyword: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"(?ms)^# BEGIN CODEXAUTH {re.escape(keyword)}\n.*?^# END CODEXAUTH {re.escape(keyword)}\n?"
+    )
+
+
+def set_model_provider(provider: str, api_payload: dict[str, Any] | None = None, *, remove: str | None = None) -> None:
+    content = CONFIG_FILE.read_text(encoding="utf-8") if CONFIG_FILE.exists() else ""
+    config = parse_config(content)
+    if remove is not None:
+        content = provider_block(remove).sub("", content)
+    if api_payload is not None:
+        keyword = provider.removeprefix("codextop-api-")
+        block = provider_block(keyword)
+        if provider in config.get("model_providers", {}) and not block.search(content):
+            raise AuthError(t("auth.api_config_collision", provider=provider))
+        content = block.sub("", content)
+        source = api_payload.get("codextop_api", {})
+        base_url = validate_api_base_url(source.get("base_url", DEFAULT_API_BASE_URL))
+        content = content.rstrip() + (
+            f'\n\n# BEGIN CODEXAUTH {keyword}\n[model_providers.{json.dumps(provider)}]\n'
+            f'name = {json.dumps(keyword)}\nbase_url = {json.dumps(base_url)}\n'
+            'wire_api = "responses"\nrequires_openai_auth = true\n'
+            f'# END CODEXAUTH {keyword}\n'
+        )
+    content = set_root_config(content, "model_provider", provider)
+    content = set_root_config(content, "cli_auth_credentials_store", "file")
+    updated = parse_config(content)
+    if updated.get("model_provider") != provider or updated.get("cli_auth_credentials_store") != "file":
+        raise AuthError(t("auth.invalid_config"))
+    # Reject unusual TOML layouts if a textual edit changed any unrelated value.
+    for parsed in (config, updated):
+        parsed.pop("model_provider", None)
+        parsed.pop("cli_auth_credentials_store", None)
+        providers = parsed.pop("model_providers", {})
+        if remove is not None:
+            providers.pop(api_provider_id(remove), None)
+        if api_payload is not None:
+            providers.pop(provider, None)
+        if providers:
+            parsed["model_providers"] = providers
+    if config != updated:
+        raise AuthError(t("auth.invalid_config"))
+    atomic_write_text(CONFIG_FILE, content, CONFIG_FILE.stat().st_mode if CONFIG_FILE.exists() else 0o600)
+
+
+@contextmanager
+def preserve_auth_state(*extra_paths: Path):
+    paths = (CONFIG_FILE, ACTIVE_AUTH_FILE, CURRENT_PROVIDER_FILE, *extra_paths)
+    saved = {path: (path.read_text(encoding="utf-8"), path.stat().st_mode) if path.exists() else None for path in paths}
+    try:
+        yield
+    except BaseException:
+        for path, previous in saved.items():
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write_text(path, *previous)
+        raise
 
 
 def normalize_provider_from_config(model_provider: str, current_provider: str | None) -> dict[str, Any]:
@@ -346,6 +484,11 @@ def save_active_auth(current_provider: str) -> None:
         raise AuthError(t("auth.active_file_missing", path=ACTIVE_AUTH_FILE))
 
     current_auth_file = auth_file(current_provider)
+    # API slots store a source definition; never replace it with active credentials.
+    if current_auth_file.exists() and is_api_auth(read_auth_payload(current_auth_file)):
+        return
+    if is_api_auth(read_auth_payload(ACTIVE_AUTH_FILE)):
+        return
     if current_auth_file.exists():
         shutil.copy2(current_auth_file, backup_file(current_provider))
         prune_backups(current_provider)
@@ -354,7 +497,7 @@ def save_active_auth(current_provider: str) -> None:
     shutil.copy2(ACTIVE_AUTH_FILE, current_auth_file)
 
 
-def switch_openai_auth(target_provider: str) -> None:
+def switch_auth(target_provider: str) -> None:
     target_auth_file = auth_file(target_provider)
     if not target_auth_file.exists():
         raise AuthError(
@@ -362,13 +505,20 @@ def switch_openai_auth(target_provider: str) -> None:
             + new_auth_hint(target_provider)
         )
 
-    current_provider = read_current_provider()
-    if current_provider is not None and auth_file(current_provider).exists():
-        save_active_auth(current_provider)
-
-    shutil.copy2(target_auth_file, ACTIVE_AUTH_FILE)
-    set_model_provider("openai")
-    write_provider_config("openai", target_provider)
+    payload = read_auth_payload(target_auth_file)
+    api = is_api_auth(payload)
+    active_payload = api_auth_payload(payload) if api else payload
+    provider = api_provider_id(target_provider) if api else "openai"
+    with preserve_auth_state():
+        current_provider = read_current_provider()
+        if current_provider is not None and auth_file(current_provider).exists() and ACTIVE_AUTH_FILE.exists():
+            save_active_auth(current_provider)
+        if not api:
+            # Saving the current slot may have persisted a token refreshed by Codex.
+            active_payload = read_auth_payload(target_auth_file)
+        set_model_provider(provider, payload if api else None)
+        atomic_write_json(ACTIVE_AUTH_FILE, active_payload, 0o600)
+        write_provider_config(provider, target_provider)
 
 
 def safe_scalar(value: Any) -> Any:
@@ -380,7 +530,7 @@ def safe_scalar(value: Any) -> Any:
 def sanitized_auth_meta(payload: dict[str, Any]) -> dict[str, Any]:
     meta: dict[str, Any] = {}
     for key, value in payload.items():
-        if key == "tokens":
+        if key not in {"auth_mode", "last_refresh"}:
             continue
         scalar = safe_scalar(value)
         if scalar is not None:
@@ -405,10 +555,13 @@ def account_meta(
     stat = path.stat()
     payload = read_auth_payload(path)
     is_current = keyword == current_provider
-    is_active_provider = current_config.get("provider") == "openai" and is_current
+    api = is_api_auth(payload)
+    provider = api_provider_id(keyword) if api else "openai"
+    is_active_provider = current_config.get("provider") == provider and is_current
     provider_number = auth_keyword_number(keyword)
     return {
-        "provider": "openai",
+        "provider": provider,
+        "auth_type": "api" if api else "chatgpt",
         "auth_keyword": keyword,
         "provider_number": provider_number,
         "label": keyword,
@@ -544,9 +697,7 @@ def assert_no_running_codex_processes() -> None:
     processes = running_codex_processes()
     if not processes:
         return
-    rendered = "; ".join(f"pid={item['pid']} {item['cmd']}" for item in processes[:5])
-    if len(processes) > 5:
-        rendered += t("auth.more_processes", count=len(processes) - 5)
+    rendered = "\n".join(f"【pid={item['pid']}】 {item['cmd']}" for item in processes)
     raise AuthError(t("auth.switch_refused_running", processes=rendered))
 
 
@@ -641,8 +792,7 @@ def command_sync(as_json: bool) -> int:
 def command_new(target: str, as_json: bool) -> int:
     keyword = normalize_new_auth_target(target)
     target_auth_file = auth_file(keyword)
-    if target_auth_file.exists():
-        raise AuthError(t("auth.provider_exists", provider=keyword))
+    assert_available_target(keyword)
     assert_no_running_codex_processes()
 
     output = sys.stderr if as_json else sys.stdout
@@ -661,7 +811,7 @@ def command_new(target: str, as_json: bool) -> int:
         shutil.copy2(login_auth_file, target_auth_file)
         target_auth_file.chmod(0o600)
 
-    switch_openai_auth(keyword)
+    switch_auth(keyword)
     registry = sync_registry()
     request_sampler_refresh()
     if as_json:
@@ -675,9 +825,70 @@ def command_new(target: str, as_json: bool) -> int:
     return 0
 
 
+def assert_available_target(keyword: str) -> None:
+    if keyword.casefold() in {name.casefold() for name, _ in discover_auth_files()}:
+        raise AuthError(t("auth.provider_exists", provider=keyword))
+
+
+def command_new_api(target: str, as_json: bool) -> int:
+    keyword = normalize_new_auth_target(target)
+    assert_available_target(keyword)
+    assert_no_running_codex_processes()
+    payload = prompt_api_source(keyword)
+    # Validate all input before persisting the new slot or changing active credentials.
+    api_auth_payload(payload)
+    target_path = auth_file(keyword)
+    assert_no_running_codex_processes()
+    with preserve_auth_state(target_path):
+        assert_available_target(keyword)
+        atomic_write_json(target_path, payload, 0o600)
+        switch_auth(keyword)
+    registry = sync_registry()
+    request_sampler_refresh()
+    if as_json:
+        print(json.dumps(registry, ensure_ascii=False, indent=2))
+    else:
+        print(t("auth.provider_added", provider=keyword))
+    return 0
+
+
+def command_rename(target: str, new_target: str, as_json: bool) -> int:
+    keyword = resolve_auth_target(target)
+    new_keyword = normalize_new_auth_target(new_target)
+    assert_available_target(new_keyword)
+    if backup_dir_for(new_keyword).exists():
+        raise AuthError(t("auth.provider_exists", provider=new_keyword))
+    assert_no_running_codex_processes()
+    old_path, new_path = auth_file(keyword), auth_file(new_keyword)
+    current = read_current_provider()
+    provider = read_model_provider()
+    payload = read_auth_payload(old_path)
+    api = is_api_auth(payload)
+    with preserve_auth_state(old_path, new_path):
+        old_path.rename(new_path)
+        if api and provider == api_provider_id(keyword):
+            set_model_provider(api_provider_id(new_keyword), payload, remove=keyword)
+            provider = api_provider_id(new_keyword)
+        elif api:
+            set_model_provider(provider, remove=keyword)
+        if current == keyword:
+            write_provider_config(provider, new_keyword)
+        if backup_dir_for(keyword).exists():
+            backup_dir_for(keyword).rename(backup_dir_for(new_keyword))
+    registry = sync_registry()
+    request_sampler_refresh()
+    if as_json:
+        print(json.dumps(registry, ensure_ascii=False, indent=2))
+    else:
+        print(t("auth.provider_renamed", before=keyword, after=new_keyword))
+    return 0
+
+
 def command_refresh(target: str | None, as_json: bool) -> int:
     keyword = resolve_existing_auth_target(target)
     target_auth_file = auth_file(keyword)
+    if is_api_auth(read_auth_payload(target_auth_file)):
+        raise AuthError(t("auth.api_refresh_unsupported"))
     existing_email = auth_email(target_auth_file)
     assert_no_running_codex_processes()
 
@@ -708,7 +919,7 @@ def command_refresh(target: str | None, as_json: bool) -> int:
     shutil.copy2(target_auth_file, backup_file(keyword))
     prune_backups(keyword)
     atomic_write_json(target_auth_file, refreshed_payload, 0o600)
-    if read_current_provider() == keyword:
+    if read_current_provider() == keyword and read_model_provider() == "openai":
         atomic_write_json(ACTIVE_AUTH_FILE, refreshed_payload, 0o600)
 
     registry = sync_registry()
@@ -741,26 +952,34 @@ def command_delete(target: str | None, as_json: bool) -> int:
     assert_no_running_codex_processes()
     confirm_provider_deletion(keyword)
 
-    current_provider = read_current_provider()
-    if current_provider == keyword:
-        replacements = [item for item in discover_auth_files() if item[0] != keyword]
-        replacement = replacements[0][0] if replacements else None
-        current_config = read_provider_config()
-        configured_provider = current_config.get("provider")
-        if not isinstance(configured_provider, str) or configured_provider in {"", "unset", "unknown"}:
-            configured_provider = read_model_provider()
-        if configured_provider in {"unset", "unknown"}:
-            configured_provider = "openai"
-        if replacement is None:
-            ACTIVE_AUTH_FILE.unlink(missing_ok=True)
-        else:
-            atomic_write_json(ACTIVE_AUTH_FILE, read_auth_payload(auth_file(replacement)), 0o600)
-        write_provider_config(configured_provider, replacement)
+    with preserve_auth_state(target_auth_file):
+        current_provider = read_current_provider()
+        if current_provider == keyword:
+            replacements = [item for item in discover_auth_files() if item[0] != keyword]
+            replacement = replacements[0][0] if replacements else None
+            current_config = read_provider_config()
+            configured_provider = current_config.get("provider")
+            if not isinstance(configured_provider, str) or configured_provider in {"", "unset", "unknown"}:
+                configured_provider = read_model_provider()
+            if configured_provider in {"unset", "unknown"}:
+                configured_provider = "openai"
+            if replacement is None:
+                ACTIVE_AUTH_FILE.unlink(missing_ok=True)
+                if configured_provider == api_provider_id(keyword):
+                    set_model_provider("openai", remove=keyword)
+                    configured_provider = "openai"
+                write_provider_config(configured_provider, None)
+            else:
+                switch_auth(replacement)
+
+        if is_api_auth(read_auth_payload(target_auth_file)):
+            set_model_provider(read_model_provider(), remove=keyword)
+
+        target_auth_file.unlink()
 
     provider_backup_dir = backup_dir_for(keyword)
     if provider_backup_dir.exists():
         shutil.rmtree(provider_backup_dir)
-    target_auth_file.unlink()
 
     registry = sync_registry()
     request_sampler_refresh()
@@ -788,13 +1007,22 @@ def command_switch(target: str, as_json: bool) -> int:
         set_model_provider("third-party-api")
         write_provider_config("third-party-api", current_provider)
     elif value == "openai":
+        if (
+            current_provider and auth_file(current_provider).exists()
+            and is_api_auth(read_auth_payload(auth_file(current_provider)))
+        ):
+            current_provider = next(
+                (name for name, path in discover_auth_files() if not is_api_auth(read_auth_payload(path))), None
+            )
+            if current_provider is None:
+                raise AuthError(t("auth.no_chatgpt_accounts"))
         if current_provider is not None and auth_file(current_provider).exists():
-            switch_openai_auth(current_provider)
+            switch_auth(current_provider)
         else:
             set_model_provider("openai")
             write_provider_config("openai", current_provider)
     else:
-        switch_openai_auth(target_provider or value)
+        switch_auth(target_provider or value)
 
     after = sync_registry()
     if as_json:
@@ -808,6 +1036,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=t("auth.arg.description"))
     parser.add_argument("--json", action="store_true", help=t("auth.arg.json"))
     parser.add_argument("--new", metavar="TARGET", help=t("auth.arg.new"))
+    parser.add_argument("--api", action="store_true", help=t("auth.arg.api"))
+    parser.add_argument("--rename", nargs=2, metavar=("PROVIDER", "NEW_NAME"), help=t("auth.arg.rename"))
     parser.add_argument(
         "--refresh",
         nargs="?",
@@ -829,19 +1059,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    activate_saved_language(PATHS.log_dir / "codextop_state.json")
     args = build_parser().parse_args(argv)
 
     try:
         action_count = sum(
             option is not None
-            for option in (args.new, args.refresh, args.delete_target)
+            for option in (args.new, args.refresh, args.delete_target, args.rename)
         )
         if action_count > 1:
             raise AuthError(t("auth.action_conflict"))
         if action_count and (args.command is not None or args.target is not None):
             raise AuthError(t("auth.action_conflict"))
+        if args.api and args.new is None:
+            raise AuthError(t("auth.api_requires_new"))
         if args.new is not None:
+            if args.api:
+                return command_new_api(args.new, args.json)
             return command_new(args.new, args.json)
+        if args.rename is not None:
+            return command_rename(*args.rename, args.json)
         if args.refresh is not None:
             return command_refresh(args.refresh or None, args.json)
         if args.delete_target is not None:
@@ -863,7 +1100,15 @@ def main(argv: list[str] | None = None) -> int:
             raise AuthError(t("auth.unexpected_argument", argument=args.target))
         return command_switch(args.command, args.json)
     except AuthError as exc:
-        print(t("common.error_message", error=exc), file=sys.stderr)
+        from rich.console import Console
+        from rich.text import Text
+
+        message = Text(t("common.error_message", error=exc))
+        message.stylize("red", 0, len(message.plain.split("\n", 1)[0]))
+        Console(stderr=True).print(message, soft_wrap=True)
+        return 1
+    except OSError as exc:
+        print(t("common.error_message", error=t("auth.io_error", error=exc.strerror)), file=sys.stderr)
         return 1
 
 

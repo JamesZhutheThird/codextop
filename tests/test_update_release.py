@@ -197,7 +197,8 @@ class UpdateReleaseInterfaceTests(unittest.TestCase):
             close = next(zone for zone in zones if zone.kind == "version_close")
             panel_bottom = check.y - 2
             self.assertIn("╰", plain[panel_bottom])
-            self.assertFalse(plain[panel_bottom - 1].strip(" │"))
+            left, right = plain[panel_bottom].index("╰"), plain[panel_bottom].index("╯")
+            self.assertFalse(plain[panel_bottom - 1][left : right + 1].strip(" │"))
             self.assertIn("\x1b[33m", lines[check.y - 1])
             self.assertIn("\x1b[31m", lines[close.y - 1])
             handle_click(state, zones, close.x1, close.y)

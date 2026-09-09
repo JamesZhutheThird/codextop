@@ -179,9 +179,10 @@ CODEXAUTH list
 ```bash
 CODEXAUTH --new 4                 # 新增并切换到 openai-4
 CODEXAUTH --new name_of_provider  # 使用自定义 provider 名称
+CODEXAUTH --new my-api --api      # 交互导入 API 源并切换
 ```
 
-`--new` 会启动并维护一个 `codex login --device-auth` 子进程，登录网址、设备码和进度会
+`--new` 不带 `--api` 时，会启动并维护一个 `codex login --device-auth` 子进程，登录网址、设备码和进度会
 原样输出到当前终端。系统提示与 Codex 登录信息之间会保留空行；等待登录时可按 `Ctrl-C` 取消。
 按照屏幕提示在网页版完成登录后，CodexTOP 会检查 `codex login status`、
 账号信息和额度 status；全部通过后才会保存 `auth-{provider}.json`、切换到新 provider、
@@ -209,6 +210,24 @@ CODEXAUTH --delete openai-2
 删除该 provider 的 auth 文件及其凭据备份；若删除当前 provider，会改用另一个已注册
 provider，没有剩余 provider 时则移除当前 `auth.json`。已有额度历史记录不会被删除。
 
+重命名已有账号或 API 源：
+
+```bash
+CODEXAUTH --rename openai-2 work
+CODEXAUTH --rename my-api proxy
+```
+
+重命名会更新账号文件、备份目录和当前 provider 标记；已有额度历史记录保留原名称。
+
+添加 API 源时，`CODEXAUTH --new my-api --api` 会打开终端交互界面，选择手动输入 API Key
+（隐藏输入），或在 PATH 中填写环境变量名（如 `OPENAI_API_KEY`，需先在当前终端 export）。
+输入后检查变量是否存在且非空，并显示脱敏密钥（如 `sk-a******z`）；每次切换到该源时
+都会重新读取环境变量。交互界面无外框，与普通 `--new` 风格一致。Base URL 留空默认
+`https://api.openai.com/v1`，第三方源填写其兼容 Responses API 的地址。
+导入后自动切换，后续使用 `CODEXAUTH switch my-api`。凭证以 `0600` 权限保存，API Key
+不写入列表或 JSON 摘要。导入检查本地配置与密钥格式，不发送在线验证请求；API 源不提供
+ChatGPT 订阅额度查询，也不使用 `--refresh` 设备登录流程。
+
 切换 provider：
 
 ```bash
@@ -216,6 +235,7 @@ CODEXAUTH switch 1
 CODEXAUTH switch 2
 CODEXAUTH switch 3
 CODEXAUTH switch openai-1
+CODEXAUTH switch my-api
 CODEXAUTH switch third-party-api
 ```
 
@@ -232,7 +252,7 @@ wire_api = "responses"
 env_key = "API_AUTH_TOKEN"
 ```
 
-如果有命令名以 `codex` 开头的 Codex 主程序正在运行，会拒绝新增、刷新、删除或切换 provider。
+如果有命令名以 `codex` 开头的 Codex 主程序正在运行，会拒绝新增、重命名、刷新、删除或切换 provider。
 
 ### 命令行查询
 
@@ -256,7 +276,7 @@ CODEXTOP_UPDATE --check-only  # 只检测，不更新
 
 ```text
 @JamesZhutheThird
-v3.0.0
+v3.1.0
 
 F11 / 新版本可用
 ```

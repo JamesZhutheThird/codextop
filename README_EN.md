@@ -174,9 +174,10 @@ Add a provider through Codex device authentication:
 ```bash
 CODEXAUTH --new 4                 # Add and switch to openai-4
 CODEXAUTH --new name_of_provider  # Use a custom provider name
+CODEXAUTH --new my-api --api      # Interactively import and switch to an API source
 ```
 
-`--new` starts and manages a `codex login --device-auth` subprocess. The login URL, device code, and progress are streamed unchanged to the current terminal, with a blank line separating CodexTOP messages from the Codex login output. Press `Ctrl-C` to cancel while waiting.
+Without `--api`, `--new` starts and manages a `codex login --device-auth` subprocess. The login URL, device code, and progress are streamed unchanged to the current terminal, with a blank line separating CodexTOP messages from the Codex login output. Press `Ctrl-C` to cancel while waiting.
 
 After you complete the browser flow, CodexTOP checks `codex login status`, account information, and quota status. Only after every check passes does it save `auth-{provider}.json`, switch to the new provider, update the auth registry, and request an immediate background refresh. A numeric target such as `4` is normalized to `openai-4`.
 
@@ -198,6 +199,19 @@ CODEXAUTH --delete openai-2
 
 Before deletion, you must type the complete, exact provider ID again, such as `openai-2`. After confirmation, CodexTOP removes the provider auth file and its credential backups. If it was current, another registered provider becomes current; if none remain, the active `auth.json` is removed. Existing quota history is retained.
 
+Rename a saved account or API source:
+
+```bash
+CODEXAUTH --rename openai-2 work
+CODEXAUTH --rename my-api proxy
+```
+
+Renaming updates the auth file, backup directory, and current provider marker. Existing quota history keeps its original name.
+
+`CODEXAUTH --new my-api --api` opens a borderless terminal form matching ordinary `--new`. Choose hidden manual API Key input or enter an environment variable name in PATH (e.g. `OPENAI_API_KEY`, exported in the current terminal). The variable is checked for a nonempty value and the key is shown masked (e.g. `sk-a******z`). Each switch to that source rereads the environment variable. Leave Base URL blank for `https://api.openai.com/v1`, or enter a third-party Responses-compatible endpoint.
+
+Import switches to the new source immediately; use `CODEXAUTH switch my-api` for later switches. Credential files use `0600` permissions, and keys are excluded from list and JSON summaries. Import validates local configuration and key format without an online request. API sources do not expose ChatGPT subscription quotas or use the `--refresh` device login flow.
+
 Switch providers with:
 
 ```bash
@@ -205,6 +219,7 @@ CODEXAUTH switch 1
 CODEXAUTH switch 2
 CODEXAUTH switch 3
 CODEXAUTH switch openai-1
+CODEXAUTH switch my-api
 CODEXAUTH switch third-party-api
 ```
 
@@ -220,7 +235,7 @@ wire_api = "responses"
 env_key = "API_AUTH_TOKEN"
 ```
 
-CodexTOP refuses to add, refresh, delete, or switch providers while a Codex process whose command name starts with `codex` is running.
+CodexTOP refuses to add, rename, refresh, delete, or switch providers while a Codex process whose command name starts with `codex` is running.
 
 ### Command-line queries
 
@@ -244,7 +259,7 @@ The first time you open `CODEXTOP` each day, it reads the GitHub latest release 
 
 ```text
 @JamesZhutheThird
-v3.0.0
+v3.1.0
 
 F11 / New version
 ```

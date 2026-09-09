@@ -73,6 +73,17 @@ def set_language(language: str | None) -> str:
     return selected
 
 
+def activate_saved_language(state_path: Path) -> None:
+    """Apply the saved UI language before building translated command output."""
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    language = payload.get("language") if isinstance(payload, dict) else None
+    if language in available_languages():
+        set_language(language)
+
+
 @lru_cache(maxsize=None)
 def _catalog(language: str) -> dict[str, str]:
     path = LOCALES_DIR / f"{normalize_language(language)}.json"

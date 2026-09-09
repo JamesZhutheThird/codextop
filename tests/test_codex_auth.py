@@ -7,7 +7,7 @@ import stat
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from pathlib import Path
 from subprocess import CompletedProcess
 from types import SimpleNamespace
@@ -447,6 +447,250 @@ class CodexAuthProviderMutationTests(unittest.TestCase):
         with patch.object(codex_auth, "command_delete", return_value=0) as delete:
             self.assertEqual(codex_auth.main(["--json", "--delete", "openai-2"]), 0)
         delete.assert_called_once_with("openai-2", True)
+
+
+class CodexAuthApiAndRenameTests(unittest.TestCase):
+    def setUp(self) -> None:
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        self.enter_context = stack.enter_context
+        temp = self.enter_context(tempfile.TemporaryDirectory())
+        self.paths = codex_auth.ensure_runtime_layout(codex_auth.default_paths(Path(temp)), migrate=False)
+        self.enter_context(patch.multiple(codex_auth, **path_globals(self.paths)))
+        self.enter_context(patch.object(codex_auth, "assert_no_running_codex_processes"))
+        self.enter_context(patch.object(codex_auth, "request_sampler_refresh"))
+        self.output = self.enter_context(redirect_stdout(io.StringIO()))
+        self.enter_context(redirect_stderr(io.StringIO()))
+        self.chatgpt = auth_payload("owner@example.com", "original")
+        codex_auth.atomic_write_json(codex_auth.auth_file("openai-1"), self.chatgpt)
+        codex_auth.atomic_write_json(self.paths.active_auth_file, self.chatgpt)
+        self.original_config = (
+            '# keep this comment\nmodel_provider = \'openai\' # active\n'
+            'model = "example-model"\n[profiles.work]\nmodel_provider = "other"\n'
+        )
+        self.paths.config_file.write_text(self.original_config)
+        codex_auth.write_provider_config("openai", "openai-1")
+
+    def add_api(self, name: str = "my-api", *, key_env: str | None = None) -> dict:
+        payload = {"auth_mode": "apikey", "codextop_api": {"base_url": "https://example.com/v1"}}
+        if key_env:
+            payload["codextop_api"]["key_env"] = key_env
+        else:
+            payload["OPENAI_API_KEY"] = "test-secret-key"
+        with patch.object(codex_auth, "prompt_api_source", return_value=payload):
+            self.assertEqual(codex_auth.main(["--new", name, "--api", "--json"]), 0)
+        return payload
+
+    def test_api_round_trip_preserves_source_chatgpt_and_config_and_redacts_key(self) -> None:
+        payload = self.add_api()
+        config = codex_auth.parse_config(self.paths.config_file.read_text())
+        self.assertEqual(config["model_provider"], "codextop-api-my-api")
+        self.assertEqual(config["profiles"]["work"]["model_provider"], "other")
+        self.assertEqual(config["model"], "example-model")
+        self.assertTrue(config["model_providers"]["codextop-api-my-api"]["requires_openai_auth"])
+        self.assertEqual(config["cli_auth_credentials_store"], "file")
+        registry = codex_auth.sync_registry()
+        self.assertEqual(registry["current_service"], "my-api")
+        self.assertTrue(next(a for a in registry["accounts"] if a["label"] == "my-api")["is_active_provider"])
+        for path in (self.paths.registry_file, self.paths.config_file, self.paths.current_provider_file):
+            self.assertNotIn("test-secret-key", path.read_text())
+        self.assertNotIn("test-secret-key", self.output.getvalue())
+        for path in (self.paths.active_auth_file, codex_auth.auth_file("my-api")):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(codex_auth.main(["switch", "openai"]), 0)
+        self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file), self.chatgpt)
+        self.assertEqual(codex_auth.read_auth_payload(codex_auth.auth_file("my-api")), payload)
+        self.assertEqual(codex_auth.main(["switch", "my-api"]), 0)
+        self.assertEqual(codex_auth.read_auth_payload(codex_auth.auth_file("openai-1")), self.chatgpt)
+        self.assertEqual(self.paths.config_file.read_text().count('[model_providers."codextop-api-my-api"]'), 1)
+
+    def test_env_source_is_reread_and_failure_keeps_active_credentials(self) -> None:
+        env = self.enter_context(patch.dict(codex_auth.os.environ, {"CODEXAUTH_TEST_KEY": "first-key"}))
+        payload = self.add_api(key_env="CODEXAUTH_TEST_KEY")
+        self.assertNotIn("OPENAI_API_KEY", payload)
+        codex_auth.command_switch("1", False)
+        env["CODEXAUTH_TEST_KEY"] = "rotated-key"
+        codex_auth.command_switch("my-api", False)
+        self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file)["OPENAI_API_KEY"], "rotated-key")
+        self.assertEqual(codex_auth.read_auth_payload(codex_auth.auth_file("my-api")), payload)
+        codex_auth.command_switch("1", False)
+        before = self.paths.config_file.read_text()
+        del env["CODEXAUTH_TEST_KEY"]
+        with self.assertRaises(codex_auth.AuthError):
+            codex_auth.command_switch("my-api", False)
+        self.assertEqual(self.paths.config_file.read_text(), before)
+        self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file), self.chatgpt)
+        self.assertEqual(codex_auth.read_current_provider(), "openai-1")
+        for path in (codex_auth.auth_file("my-api"), self.paths.registry_file, self.paths.config_file):
+            self.assertNotIn("rotated-key", path.read_text())
+
+    def test_switch_to_current_chatgpt_keeps_refreshed_tokens(self) -> None:
+        refreshed = auth_payload("owner@example.com", "refreshed")
+        codex_auth.atomic_write_json(self.paths.active_auth_file, refreshed)
+        codex_auth.command_switch("1", False)
+        self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file), refreshed)
+        self.assertEqual(codex_auth.read_auth_payload(codex_auth.auth_file("openai-1")), refreshed)
+
+    def test_rename_current_chatgpt_moves_backups_and_rejects_collision(self) -> None:
+        codex_auth.save_active_auth("openai-1")
+        self.assertEqual(codex_auth.main(["--rename", "1", "Work"]), 0)
+        self.assertFalse(codex_auth.auth_file("openai-1").exists())
+        self.assertEqual(codex_auth.read_auth_payload(codex_auth.auth_file("Work")), self.chatgpt)
+        self.assertEqual(codex_auth.read_current_provider(), "Work")
+        self.assertEqual(codex_auth.backup_count("Work"), 1)
+        self.assertEqual(codex_auth.main(["--new", "work", "--api"]), 1)
+        self.assertEqual(codex_auth.main(["--rename", "Work", "../bad"]), 1)
+        self.assertEqual(codex_auth.read_current_provider(), "Work")
+
+    def test_rename_active_and_inactive_api_then_delete(self) -> None:
+        self.add_api()
+        self.assertEqual(codex_auth.main(["--rename", "my-api", "New.API"]), 0)
+        self.assertEqual(codex_auth.read_model_provider(), "codextop-api-New.API")
+        self.assertEqual(codex_auth.read_current_provider(), "New.API")
+        self.assertNotIn("codextop-api-my-api", self.paths.config_file.read_text())
+        codex_auth.command_switch("1", False)
+        codex_auth.command_rename("New.API", "final-api", False)
+        self.assertEqual(codex_auth.read_model_provider(), "openai")
+        codex_auth.command_switch("final-api", False)
+        with patch.object(codex_auth, "confirm_provider_deletion"):
+            codex_auth.command_delete(None, False)
+        self.assertEqual(codex_auth.read_current_provider(), "openai-1")
+        self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file), self.chatgpt)
+        self.assertNotIn("codextop-api-final-api", self.paths.config_file.read_text())
+
+    def test_delete_chatgpt_selects_api_and_delete_last_does_not_bootstrap_it(self) -> None:
+        self.add_api()
+        codex_auth.command_switch("1", False)
+        with patch.object(codex_auth, "confirm_provider_deletion"):
+            codex_auth.command_delete(None, False)
+            self.assertEqual(codex_auth.read_model_provider(), "codextop-api-my-api")
+            codex_auth.command_delete(None, False)
+        self.assertFalse(self.paths.active_auth_file.exists())
+        self.assertEqual(codex_auth.discover_auth_files(), [])
+        self.assertEqual(codex_auth.read_model_provider(), "openai")
+
+    def test_import_config_collision_and_write_failure_roll_back(self) -> None:
+        self.paths.config_file.write_text(self.original_config + '[model_providers.codextop-api-my-api]\nname="custom"\n')
+        before = self.paths.config_file.read_text()
+        payload = {"auth_mode": "apikey", "OPENAI_API_KEY": "secret"}
+        with patch.object(codex_auth, "prompt_api_source", return_value=payload):
+            self.assertEqual(codex_auth.main(["--new", "my-api", "--api"]), 1)
+        self.assertEqual(self.paths.config_file.read_text(), before)
+        self.assertFalse(codex_auth.auth_file("my-api").exists())
+        self.paths.config_file.write_text(self.original_config)
+        with (
+            patch.object(codex_auth, "prompt_api_source", return_value=payload),
+            patch.object(codex_auth, "write_provider_config", side_effect=OSError("write failed")),
+        ):
+            self.assertEqual(codex_auth.main(["--new", "my-api", "--api"]), 1)
+        self.assertFalse(codex_auth.auth_file("my-api").exists())
+        self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file), self.chatgpt)
+        self.assertEqual(self.paths.config_file.read_text(), self.original_config)
+
+    def test_prompt_manual_default_url_path_and_cancellation(self) -> None:
+        from rich.prompt import Prompt
+
+        with (
+            patch.object(codex_auth.sys.stdin, "isatty", return_value=True),
+            redirect_stderr(io.StringIO()) as manual_output,
+            patch.object(Prompt, "ask", side_effect=["1", "sk-abcdefghijz", ""]) as ask,
+        ):
+            payload = codex_auth.prompt_api_source("demo")
+        self.assertEqual(payload["codextop_api"]["base_url"], codex_auth.DEFAULT_API_BASE_URL)
+        self.assertTrue(ask.call_args_list[1].kwargs["password"])
+        self.assertIn("sk-a******z", manual_output.getvalue())
+        self.assertNotIn("sk-abcdefghijz", manual_output.getvalue())
+        with (
+            patch.object(codex_auth.sys.stdin, "isatty", return_value=True),
+            patch.dict(codex_auth.os.environ, {"OEPNAI_API_KEY": "sk-abcdefghijz"}),
+            redirect_stderr(io.StringIO()) as output,
+            patch.object(Prompt, "ask", side_effect=["2", " OEPNAI_API_KEY ", "https://example.com/v1/"]),
+        ):
+            payload = codex_auth.prompt_api_source("demo")
+        self.assertEqual(payload["codextop_api"]["key_env"], "OEPNAI_API_KEY")
+        self.assertEqual(payload["codextop_api"]["base_url"], "https://example.com/v1")
+        self.assertNotIn("OPENAI_API_KEY", payload)
+        self.assertIn("sk-a******z", output.getvalue())
+        self.assertNotIn("sk-abcdefghijz", output.getvalue())
+        self.assertFalse(any(c in output.getvalue() for c in "╭╮╰╯│─┌┐└┘"))
+        with (
+            patch.object(codex_auth.sys.stdin, "isatty", return_value=True),
+            patch.object(Prompt, "ask", side_effect=KeyboardInterrupt),
+        ):
+            self.assertEqual(codex_auth.main(["--new", "demo", "--api"]), 1)
+        self.assertFalse(codex_auth.auth_file("demo").exists())
+
+    def test_env_prompt_rejects_missing_empty_invalid_keys_and_masks_short_keys(self) -> None:
+        from rich.prompt import Prompt
+
+        for value in (None, "", "  ", "key\nheader", "short"):
+            with (
+                self.subTest(value=value),
+                patch.dict(codex_auth.os.environ, {} if value is None else {"CODEXAUTH_TEST_KEY": value}, clear=True),
+                patch.object(codex_auth.sys.stdin, "isatty", return_value=True),
+                patch.object(Prompt, "ask", side_effect=["2", "CODEXAUTH_TEST_KEY", "" if value == "short" else KeyboardInterrupt]),
+                redirect_stderr(io.StringIO()) as output,
+            ):
+                result = codex_auth.main(["--new", "demo", "--api"])
+                if value == "short":
+                    self.assertEqual(result, 0)
+                    self.assertIn("******", output.getvalue())
+                    self.assertNotIn("short", output.getvalue())
+                else:
+                    self.assertEqual(result, 1)
+                    self.assertFalse(codex_auth.auth_file("demo").exists())
+                    self.assertEqual(self.paths.config_file.read_text(), self.original_config)
+                    self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file), self.chatgpt)
+                    if value is None or not value.strip():
+                        self.assertIn(
+                            t("auth.api_env_missing", name="CODEXAUTH_TEST_KEY"),
+                            " ".join(output.getvalue().split()),
+                        )
+
+    def test_env_prompt_retries_until_a_nonempty_variable_is_entered(self) -> None:
+        from rich.prompt import Prompt
+
+        with (
+            patch.dict(codex_auth.os.environ, {"EMPTY": "", "BLANK": "  ", "VALID": "sk-abcdefghijz"}, clear=True),
+            patch.object(codex_auth.sys.stdin, "isatty", return_value=True),
+            patch.object(Prompt, "ask", side_effect=["2", "MISSING", "EMPTY", "BLANK", "VALID", ""]) as ask,
+            redirect_stderr(io.StringIO()) as output,
+        ):
+            self.assertEqual(codex_auth.main(["--new", "demo", "--api"]), 0)
+        for name in ("MISSING", "EMPTY", "BLANK"):
+            self.assertIn(t("auth.api_env_missing", name=name), " ".join(output.getvalue().split()))
+        self.assertEqual([c.args[0] for c in ask.call_args_list[1:5]], [t("auth.api_key_env")] * 4)
+        self.assertIn("sk-a******z", output.getvalue())
+        self.assertNotIn("sk-abcdefghijz", output.getvalue())
+        payload = codex_auth.read_auth_payload(codex_auth.auth_file("demo"))
+        self.assertEqual(payload["codextop_api"]["key_env"], "VALID")
+        self.assertEqual(codex_auth.read_current_provider(), "demo")
+
+    def test_api_credentials_never_reach_chatgpt_quota_or_device_login(self) -> None:
+        from quota import check_codex_quota as quota
+
+        self.add_api()
+        with patch.object(quota, "get_json") as get_json:
+            bundle = quota.collect_accounts([("my-api", codex_auth.auth_file("my-api"))], "my-api", "UTC")
+        get_json.assert_not_called()
+        self.assertEqual(bundle["accounts"][0]["error"], t("quota.error.api_not_supported"))
+        with patch.object(codex_auth, "run_device_login") as login:
+            self.assertEqual(codex_auth.main(["--refresh"]), 1)
+        login.assert_not_called()
+
+    def test_invalid_flags_and_input_do_not_change_state(self) -> None:
+        for args in (["--api"], ["--refresh", "--api"], ["--new", "x", "--rename", "1", "y"]):
+            self.assertEqual(codex_auth.main(args), 1)
+        for key in ("", " \n ", "key\nheader", "key\x00", None):
+            with self.assertRaises(codex_auth.AuthError):
+                codex_auth.validate_api_key(key)
+        for url in ("file:///tmp/key", "https://user:pass@example.com", "https://example.com/?key=secret", "https://"):
+            with self.assertRaises(codex_auth.AuthError):
+                codex_auth.validate_api_base_url(url)
+        self.assertEqual(self.paths.config_file.read_text(), self.original_config)
+        for name in ("", "1KEY", "$OPENAI_API_KEY", "/tmp/key", None):
+            with self.assertRaises(codex_auth.AuthError):
+                codex_auth.api_auth_payload({"codextop_api": {"key_env": name}})
 
 
 if __name__ == "__main__":

@@ -1,5 +1,10 @@
 # 更新日志
 
+## v3.1.0 - 2026-09-09
+
+- 新增 `CODEXAUTH --rename`，支持重命名账号。
+- 新增 `CODEXAUTH --new <provider-name> --api`，添加API账号。支持手动输入 API Key，或在 PATH 中填写环境变量名读取密钥；支持自定义 Base URL，默认 OpenAI 官方地址，添加后自动切换。
+
 ## v3.0.0 - 2026-08-31
 
 - 更新界面。

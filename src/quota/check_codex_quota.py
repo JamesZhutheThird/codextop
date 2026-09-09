@@ -73,6 +73,8 @@ def load_auth_credentials(auth_path: Path) -> tuple[str, str | None]:
     except json.JSONDecodeError as exc:
         raise RuntimeError(t("quota.error.auth_json_invalid", path=auth_path)) from exc
 
+    if isinstance(data, dict) and (data.get("auth_mode") == "apikey" or data.get("OPENAI_API_KEY")):
+        raise RuntimeError(t("quota.error.api_not_supported"))
     tokens = data.get("tokens", {})
     token = tokens.get("access_token") if isinstance(tokens, dict) else None
     if not isinstance(token, str) or not token:

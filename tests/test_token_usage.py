@@ -1680,7 +1680,7 @@ class SettingsTests(unittest.TestCase):
             choices for key, _title, choices in setting_items(state) if key == "curve_mode"
         )
         self.assertIn((t("choice.curve.fine_bar"), "fine_bar"), curve_choices)
-        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("3.0.0", "v3.0.0"))
+        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("3.1.0", "v3.1.0"))
 
 
 class TokenChartTests(unittest.TestCase):

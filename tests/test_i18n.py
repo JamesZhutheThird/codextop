@@ -193,6 +193,36 @@ class TranslationTests(unittest.TestCase):
             self.assertIn(t("app.arg.description", _language="zh_CN"), result.stdout)
             self.assertNotIn(t("app.arg.description", _language="en"), result.stdout)
 
+    def test_auth_commands_follow_saved_language_and_fall_back_without_valid_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_path = root / "codextop" / "log" / "codextop_state.json"
+            state_path.parent.mkdir(parents=True)
+            cases = [
+                ('{"language":"zh_CN"}', "en", "zh_CN"),
+                ('{"language":"en"}', "zh_CN", "en"),
+                ('{"language":"invalid"}', "zh_CN", "zh_CN"),
+                ('{broken', "en", "en"),
+                (None, "zh_CN", "zh_CN"),
+            ]
+            for content, inherited, expected in cases:
+                with self.subTest(content=content):
+                    if content is None:
+                        state_path.unlink(missing_ok=True)
+                    else:
+                        state_path.write_text(content, encoding="utf-8")
+                    env = dict(os.environ, CODEXTOP_CODEX_DIR=str(root), CODEXTOP_LANG=inherited)
+                    for args, exit_code, translation in (
+                        (["--help"], 0, "auth.arg.description"),
+                        (["--api"], 1, "auth.api_requires_new"),
+                    ):
+                        result = subprocess.run(
+                            [sys.executable, str(SRC / "auth" / "codex_auth.py"), *args],
+                            cwd=ROOT, env=env, capture_output=True, text=True, check=False,
+                        )
+                        self.assertEqual(result.returncode, exit_code, result.stderr)
+                        self.assertIn(t(translation, _language=expected), result.stdout + result.stderr)
+
 class InstallerLanguageTests(unittest.TestCase):
     def run_installer(self, system_language: str) -> tuple[str, str, str]:
         with tempfile.TemporaryDirectory() as temp_dir:
