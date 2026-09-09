@@ -4,12 +4,12 @@
 <tr>
 <td>
 <pre>
-   ██████╗ ██████╗ ██████╗ ███████╗██╗  ██╗████████╗ ██████╗ ██████╗
-  ██╔════╝██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝╚══██╔══╝██╔═══██╗██╔══██╗
-  ██║     ██║   ██║██║  ██║█████╗   ╚███╔╝    ██║   ██║   ██║██████╔╝
-  ██║     ██║   ██║██║  ██║██╔══╝   ██╔██╗    ██║   ██║   ██║██╔═══╝
-  ╚██████╗╚██████╔╝██████╔╝███████╗██╔╝ ██╗   ██║   ╚██████╔╝██║
-   ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝
+   ██████╗ ██████╗ ██████╗ ███████╗██╗  ██╗████████╗ ██████╗ ██████╗  
+  ██╔════╝██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝╚══██╔══╝██╔═══██╗██╔══██╗ 
+  ██║     ██║   ██║██║  ██║█████╗   ╚███╔╝    ██║   ██║   ██║██████╔╝ 
+  ██║     ██║   ██║██║  ██║██╔══╝   ██╔██╗    ██║   ██║   ██║██╔═══╝  
+  ╚██████╗╚██████╔╝██████╔╝███████╗██╔╝ ██╗   ██║   ╚██████╔╝██║      
+   ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝      
 </pre>
 </td>
 </tr>
@@ -236,21 +236,13 @@ CODEXAUTH switch 2
 CODEXAUTH switch 3
 CODEXAUTH switch openai-1
 CODEXAUTH switch my-api
-CODEXAUTH switch third-party-api
+CODEXAUTH 5                       # API account number
 ```
 
 输入数字时会先找 `auth-1.json`，再找 `auth-openai-1.json`。
 如果目标不存在，错误信息会给出对应的 `CODEXAUTH --new ...` 添加命令。
 
-在 `config.toml` 中添加下列配置（还需要修改 `base_url`，并在系统环境变量中注册 API key）即可切换并使用第三方 API provider：
-
-```toml
-[model_providers.third-party-api]
-name = "third-party-api"
-base_url = "https://api.thirdparty.com/v1"
-wire_api = "responses"
-env_key = "API_AUTH_TOKEN"
-```
+API 账号接在已有数字账号之后编号，可用 `CODEXAUTH list` 查看，并通过 `CODEXAUTH 5` 切换。API 账号的配置与凭证仅保存在 `auth_registry.json` 的 `meta` 中，不再使用独立的 API 账号文件，切换时将当前 API 配置写到 `config.toml` 末尾的 `[model_providers.codexauth-third-party-api]`，并清除 CODEXAUTH 管理的其他 API provider 配置；切回 ChatGPT 时清除这些 API 配置，账号数据仍保留。
 
 如果有命令名以 `codex` 开头的 Codex 主程序正在运行，会拒绝新增、重命名、刷新、删除或切换 provider。
 
@@ -276,7 +268,7 @@ CODEXTOP_UPDATE --check-only  # 只检测，不更新
 
 ```text
 @JamesZhutheThird
-v3.1.0
+v3.1.1
 
 F11 / 新版本可用
 ```

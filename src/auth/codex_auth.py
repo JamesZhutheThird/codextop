@@ -52,7 +52,6 @@ REGISTRY_FILE = PATHS.registry_file
 AUTH_BACKUP_DIR = PATHS.auth_backup_dir
 BACKUPS_PER_PROVIDER = 10
 AUTH_FILE_RE = re.compile(r"auth-([A-Za-z0-9][A-Za-z0-9_.-]*)\.json$")
-KNOWN_NON_OPENAI_PROVIDERS = {"third-party-api","api"}
 FILE_AUTH_CONFIG = 'cli_auth_credentials_store="file"'
 DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
 
@@ -71,13 +70,60 @@ def discover_auth_files() -> list[tuple[str, Path]]:
         return configs
     for path in AUTH_LIST_DIR.glob("auth-*.json"):
         keyword = auth_keyword_from_path(path)
-        if keyword is not None:
+        if keyword is not None and not is_api_auth(read_auth_payload(path)):
             configs.append((keyword, path))
     return sorted(configs, key=lambda item: auth_sort_key(item[0]))
 
 
 def auth_file_map() -> dict[str, Path]:
     return {keyword: path for keyword, path in discover_auth_files()}
+
+
+def registry_api_accounts() -> list[dict[str, Any]]:
+    if not REGISTRY_FILE.exists():
+        return []
+    return [
+        account for account in read_auth_payload(REGISTRY_FILE).get("accounts", [])
+        if account.get("auth_type") == "api"
+    ]
+
+
+def numbered_accounts() -> dict[str, int]:
+    keywords = list(auth_file_map())
+    keywords.extend(a["auth_keyword"] for a in registry_api_accounts() if a["auth_keyword"] not in keywords)
+    numbers = {key: auth_keyword_number(key) for key in keywords if auth_keyword_number(key) is not None}
+    next_number = max(numbers.values(), default=0) + 1
+    for key in keywords:
+        if key not in numbers:
+            numbers[key] = next_number
+            next_number += 1
+    return numbers
+
+
+def write_api_account(keyword: str, account: dict[str, Any] | None) -> None:
+    registry = read_auth_payload(REGISTRY_FILE) if REGISTRY_FILE.exists() else {}
+    accounts = registry.setdefault("accounts", [])
+    for index, existing in enumerate(accounts):
+        if existing.get("auth_keyword") == keyword:
+            if account is None:
+                accounts.pop(index)
+            else:
+                accounts[index] = account
+            break
+    else:
+        if account is not None:
+            accounts.append(account)
+    atomic_write_json(REGISTRY_FILE, registry, 0o600)
+
+
+def read_auth_account(keyword: str) -> dict[str, Any]:
+    for account in registry_api_accounts():
+        if account["auth_keyword"] == keyword:
+            return account
+    payload = read_auth_payload(auth_file(keyword))
+    if is_api_auth(payload):
+        raise AuthError(t("auth.target_file_not_found", target=keyword) + new_auth_hint(keyword))
+    return {"auth_type": "chatgpt", "meta": sanitized_auth_meta(payload)}
 
 
 def new_auth_hint(target: str) -> str:
@@ -88,10 +134,13 @@ def resolve_auth_target(target: str) -> str:
     value = normalize_auth_keyword(target)
     if value is None:
         raise AuthError(t("auth.missing_target"))
-    configs = auth_file_map()
+    configs = numbered_accounts()
     if value.isdigit():
         for keyword in (value, f"openai-{value}"):
             if keyword in configs:
+                return keyword
+        for keyword, number in configs.items():
+            if number == int(value):
                 return keyword
         raise AuthError(
             t("auth.target_files_not_found", target=value)
@@ -117,7 +166,7 @@ def normalize_new_auth_target(target: str) -> str:
         value = f"openai-{number}"
     if AUTH_FILE_RE.fullmatch(f"auth-{value}.json") is None:
         raise AuthError(t("auth.invalid_new_target"))
-    if value.lower() in {"openai", *KNOWN_NON_OPENAI_PROVIDERS}:
+    if value.lower() == "openai":
         raise AuthError(t("auth.reserved_provider", provider=value))
     return value
 
@@ -139,7 +188,7 @@ def is_api_auth(payload: dict[str, Any]) -> bool:
 
 
 def api_provider_id(keyword: str) -> str:
-    return f"codextop-api-{keyword}"
+    return "codexauth-third-party-api"
 
 
 def validate_api_key(value: Any) -> str:
@@ -151,11 +200,10 @@ def validate_api_key(value: Any) -> str:
     return value.strip()
 
 
-def api_auth_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    source = payload.get("codextop_api", {})
-    key = payload.get("OPENAI_API_KEY")
-    if "key_env" in source:
-        name = source["key_env"]
+def api_auth_payload(meta: dict[str, Any]) -> dict[str, Any]:
+    key = meta.get("api_key")
+    if meta.get("env_key") is not None:
+        name = meta["env_key"]
         if not isinstance(name, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
             raise AuthError(t("auth.api_invalid_env"))
         key = os.environ.get(name)
@@ -175,23 +223,22 @@ def prompt_api_source(keyword: str) -> dict[str, Any]:
     console.print(Text(t("auth.api_intro", provider=keyword)))
     try:
         choice = Prompt.ask(t("auth.api_source"), choices=["1", "2"], default="1", console=console)
-        source: dict[str, Any] = {}
-        payload: dict[str, Any] = {"auth_mode": "apikey", "codextop_api": source}
+        meta: dict[str, Any] = {"auth_mode": "apikey", "wire_api": "responses"}
         while True:
             if choice == "1":
-                payload["OPENAI_API_KEY"] = Prompt.ask(t("auth.api_key"), password=True, console=console).strip()
+                meta["api_key"] = Prompt.ask(t("auth.api_key"), password=True, console=console).strip()
             else:
-                source["key_env"] = Prompt.ask(t("auth.api_key_env"), console=console).strip()
+                meta["env_key"] = Prompt.ask(t("auth.api_key_env"), console=console).strip()
             try:
-                key = api_auth_payload(payload)["OPENAI_API_KEY"]
+                key = api_auth_payload(meta)["OPENAI_API_KEY"]
                 break
             except AuthError as exc:
                 console.print(Text(t("common.error_message", error=exc)))
         masked_key = key[:4] + "******" + key[-1] if len(key) > 5 else "******"
         console.print(Text(t("auth.api_key_detected", masked_key=masked_key)))
         base_url = Prompt.ask(t("auth.api_base_url"), default=DEFAULT_API_BASE_URL, console=console).strip()
-        source["base_url"] = validate_api_base_url(base_url or DEFAULT_API_BASE_URL)
-        return payload
+        meta["base_url"] = validate_api_base_url(base_url or DEFAULT_API_BASE_URL)
+        return meta
     except (KeyboardInterrupt, EOFError) as exc:
         raise AuthError(t("auth.api_cancelled")) from exc
 
@@ -320,13 +367,12 @@ def resolve_existing_auth_target(target: str | None) -> str:
     if target is not None and target.strip():
         return resolve_auth_target(target)
     current_provider = read_current_provider()
-    if current_provider is None or not auth_file(current_provider).exists():
+    if current_provider is None or current_provider not in numbered_accounts():
         raise AuthError(t("auth.current_provider_missing"))
     return current_provider
 
 
 def write_provider_config(provider: str, auth_keyword: str | None = None) -> dict[str, Any]:
-    provider = "third-party-api" if provider == "api" else provider
     payload = provider_config_payload(provider, auth_keyword)
     if auth_keyword and provider == api_provider_id(auth_keyword):
         payload["service"] = auth_keyword
@@ -361,25 +407,26 @@ def set_root_config(content: str, key: str, value: str) -> str:
     return root + rest
 
 
-def provider_block(keyword: str) -> re.Pattern[str]:
-    return re.compile(
-        rf"(?ms)^# BEGIN CODEXAUTH {re.escape(keyword)}\n.*?^# END CODEXAUTH {re.escape(keyword)}\n?"
-    )
-
-
-def set_model_provider(provider: str, api_payload: dict[str, Any] | None = None, *, remove: str | None = None) -> None:
+def set_model_provider(provider: str, api_meta: dict[str, Any] | None = None, *, remove: str | None = None) -> None:
     content = CONFIG_FILE.read_text(encoding="utf-8") if CONFIG_FILE.exists() else ""
     config = parse_config(content)
-    if remove is not None:
-        content = provider_block(remove).sub("", content)
-    if api_payload is not None:
-        keyword = provider.removeprefix("codextop-api-")
-        block = provider_block(keyword)
-        if provider in config.get("model_providers", {}) and not block.search(content):
-            raise AuthError(t("auth.api_config_collision", provider=provider))
-        content = block.sub("", content)
-        source = api_payload.get("codextop_api", {})
-        base_url = validate_api_base_url(source.get("base_url", DEFAULT_API_BASE_URL))
+    removed_providers = set()
+    managed_blocks = list(re.finditer(
+        r"(?ms)^# BEGIN CODEXAUTH ([A-Za-z0-9][A-Za-z0-9_.-]*)\n.*?^# END CODEXAUTH \1\n?", content
+    ))
+    managed_ids = set()
+    for match in managed_blocks:
+        managed_ids.update(parse_config(match.group()).get("model_providers", {}))
+    if api_meta is not None and provider in config.get("model_providers", {}) and provider not in managed_ids:
+        raise AuthError(t("auth.api_config_collision", provider=provider))
+    for match in managed_blocks:
+        ids = set(parse_config(match.group()).get("model_providers", {}))
+        if api_meta is not None or provider == "openai" or provider not in ids or match[1] == remove:
+            content = content.replace(match.group(), "", 1)
+            removed_providers.update(ids)
+    if api_meta is not None:
+        keyword = provider
+        base_url = validate_api_base_url(api_meta.get("base_url", DEFAULT_API_BASE_URL))
         content = content.rstrip() + (
             f'\n\n# BEGIN CODEXAUTH {keyword}\n[model_providers.{json.dumps(provider)}]\n'
             f'name = {json.dumps(keyword)}\nbase_url = {json.dumps(base_url)}\n'
@@ -396,9 +443,9 @@ def set_model_provider(provider: str, api_payload: dict[str, Any] | None = None,
         parsed.pop("model_provider", None)
         parsed.pop("cli_auth_credentials_store", None)
         providers = parsed.pop("model_providers", {})
-        if remove is not None:
-            providers.pop(api_provider_id(remove), None)
-        if api_payload is not None:
+        for removed_provider in removed_providers:
+            providers.pop(removed_provider, None)
+        if api_meta is not None:
             providers.pop(provider, None)
         if providers:
             parsed["model_providers"] = providers
@@ -409,7 +456,7 @@ def set_model_provider(provider: str, api_payload: dict[str, Any] | None = None,
 
 @contextmanager
 def preserve_auth_state(*extra_paths: Path):
-    paths = (CONFIG_FILE, ACTIVE_AUTH_FILE, CURRENT_PROVIDER_FILE, *extra_paths)
+    paths = (CONFIG_FILE, ACTIVE_AUTH_FILE, CURRENT_PROVIDER_FILE, REGISTRY_FILE, *extra_paths)
     saved = {path: (path.read_text(encoding="utf-8"), path.stat().st_mode) if path.exists() else None for path in paths}
     try:
         yield
@@ -429,7 +476,6 @@ def normalize_provider_from_config(model_provider: str, current_provider: str | 
         provider = model_provider
     if not isinstance(provider, str) or not provider:
         provider = "openai" if current_provider is not None else model_provider
-    provider = "third-party-api" if provider == "api" else provider
     if provider == "openai":
         return write_provider_config("openai", current_provider)
     return write_provider_config(provider, current_provider)
@@ -480,13 +526,12 @@ def backup_count(keyword: str) -> int:
 def save_active_auth(current_provider: str) -> None:
     if not current_provider:
         raise AuthError(t("auth.persist_without_keyword"))
+    if current_provider in numbered_accounts() and read_auth_account(current_provider)["auth_type"] == "api":
+        return
     if not ACTIVE_AUTH_FILE.exists():
         raise AuthError(t("auth.active_file_missing", path=ACTIVE_AUTH_FILE))
 
     current_auth_file = auth_file(current_provider)
-    # API slots store a source definition; never replace it with active credentials.
-    if current_auth_file.exists() and is_api_auth(read_auth_payload(current_auth_file)):
-        return
     if is_api_auth(read_auth_payload(ACTIVE_AUTH_FILE)):
         return
     if current_auth_file.exists():
@@ -499,16 +544,14 @@ def save_active_auth(current_provider: str) -> None:
 
 def switch_auth(target_provider: str) -> None:
     target_auth_file = auth_file(target_provider)
-    if not target_auth_file.exists():
-        raise AuthError(
-            t("auth.target_path_not_found", path=target_auth_file)
-            + new_auth_hint(target_provider)
-        )
-
-    payload = read_auth_payload(target_auth_file)
-    api = is_api_auth(payload)
-    active_payload = api_auth_payload(payload) if api else payload
+    account = read_auth_account(target_provider)
+    api = account["auth_type"] == "api"
+    active_payload = api_auth_payload(account["meta"]) if api else read_auth_payload(target_auth_file)
     provider = api_provider_id(target_provider) if api else "openai"
+    auth_type_changed = (
+        ACTIVE_AUTH_FILE.exists()
+        and is_api_auth(read_auth_payload(ACTIVE_AUTH_FILE)) != api
+    )
     with preserve_auth_state():
         current_provider = read_current_provider()
         if current_provider is not None and auth_file(current_provider).exists() and ACTIVE_AUTH_FILE.exists():
@@ -516,9 +559,11 @@ def switch_auth(target_provider: str) -> None:
         if not api:
             # Saving the current slot may have persisted a token refreshed by Codex.
             active_payload = read_auth_payload(target_auth_file)
-        set_model_provider(provider, payload if api else None)
+        set_model_provider(provider, account["meta"] if api else None)
         atomic_write_json(ACTIVE_AUTH_FILE, active_payload, 0o600)
         write_provider_config(provider, target_provider)
+    if auth_type_changed:
+        print(f"\033[33m{t('auth.session_resume_warning')}\033[0m", file=sys.stderr)
 
 
 def safe_scalar(value: Any) -> Any:
@@ -582,10 +627,22 @@ def build_registry() -> dict[str, Any]:
     current_provider = read_current_provider()
     model_provider = read_model_provider()
     current_config = normalize_provider_from_config(model_provider, current_provider)
+    api_accounts = registry_api_accounts()
+    registered_api = {a["auth_keyword"] for a in api_accounts}
     accounts = [
         account_meta(keyword, path, current_provider, current_config)
-        for keyword, path in configs
+        for keyword, path in configs if keyword not in registered_api
     ]
+    for account in api_accounts:
+        keyword = account["auth_keyword"]
+        account["provider"] = api_provider_id(keyword)
+        account["is_current"] = keyword == current_provider
+        account["is_active_provider"] = account["is_current"] and model_provider == api_provider_id(keyword)
+        accounts.append(account)
+    numbers = numbered_accounts()
+    for account in accounts:
+        account["provider_number"] = numbers[account["auth_keyword"]]
+    accounts.sort(key=lambda account: account["provider_number"])
     return {
         "updated_at": now_iso(),
         "repo_dir": str(REPO_DIR),
@@ -602,7 +659,7 @@ def build_registry() -> dict[str, Any]:
         "model_provider": model_provider,
         "current_provider": current_config,
         "current_provider_keyword": current_provider,
-        "current_provider_number": auth_keyword_number(current_provider),
+        "current_provider_number": numbers.get(current_provider),
         "current_service": current_config.get("service") or provider_display(model_provider, current_provider),
         "accounts": accounts,
     }
@@ -611,6 +668,8 @@ def build_registry() -> dict[str, Any]:
 def sync_registry() -> dict[str, Any]:
     registry = build_registry()
     atomic_write_json(REGISTRY_FILE, registry, 0o600)
+    for account in registry["accounts"]:
+        account.get("meta", {}).pop("api_key", None)
     return registry
 
 
@@ -629,7 +688,7 @@ def print_registry_summary(registry: dict[str, Any]) -> None:
             t(
                 "auth.account_summary",
                 marker=marker,
-                label=account["label"],
+                label=f'{account["provider_number"]}. {account["label"]}',
                 refresh=refresh,
                 backups=account.get("backup_count", 0),
             )
@@ -826,7 +885,7 @@ def command_new(target: str, as_json: bool) -> int:
 
 
 def assert_available_target(keyword: str) -> None:
-    if keyword.casefold() in {name.casefold() for name, _ in discover_auth_files()}:
+    if keyword.casefold() in {name.casefold() for name in numbered_accounts()}:
         raise AuthError(t("auth.provider_exists", provider=keyword))
 
 
@@ -834,14 +893,15 @@ def command_new_api(target: str, as_json: bool) -> int:
     keyword = normalize_new_auth_target(target)
     assert_available_target(keyword)
     assert_no_running_codex_processes()
-    payload = prompt_api_source(keyword)
-    # Validate all input before persisting the new slot or changing active credentials.
-    api_auth_payload(payload)
-    target_path = auth_file(keyword)
+    meta = prompt_api_source(keyword)
+    api_auth_payload(meta)
+    meta["base_url"] = validate_api_base_url(meta.get("base_url", DEFAULT_API_BASE_URL))
     assert_no_running_codex_processes()
-    with preserve_auth_state(target_path):
+    with preserve_auth_state():
         assert_available_target(keyword)
-        atomic_write_json(target_path, payload, 0o600)
+        write_api_account(keyword, {"auth_keyword": keyword, "label": keyword,
+                                   "provider": api_provider_id(keyword), "auth_type": "api",
+                                   "path": None, "backup_dir": None, "backup_count": 0, "meta": meta})
         switch_auth(keyword)
     registry = sync_registry()
     request_sampler_refresh()
@@ -862,12 +922,16 @@ def command_rename(target: str, new_target: str, as_json: bool) -> int:
     old_path, new_path = auth_file(keyword), auth_file(new_keyword)
     current = read_current_provider()
     provider = read_model_provider()
-    payload = read_auth_payload(old_path)
-    api = is_api_auth(payload)
+    account = read_auth_account(keyword)
+    api = account["auth_type"] == "api"
     with preserve_auth_state(old_path, new_path):
-        old_path.rename(new_path)
-        if api and provider == api_provider_id(keyword):
-            set_model_provider(api_provider_id(new_keyword), payload, remove=keyword)
+        if api:
+            account.update(auth_keyword=new_keyword, label=new_keyword, provider=api_provider_id(new_keyword))
+            write_api_account(keyword, account)
+        else:
+            old_path.rename(new_path)
+        if api and current == keyword and provider == api_provider_id(keyword):
+            set_model_provider(api_provider_id(new_keyword), account["meta"], remove=keyword)
             provider = api_provider_id(new_keyword)
         elif api:
             set_model_provider(provider, remove=keyword)
@@ -887,7 +951,7 @@ def command_rename(target: str, new_target: str, as_json: bool) -> int:
 def command_refresh(target: str | None, as_json: bool) -> int:
     keyword = resolve_existing_auth_target(target)
     target_auth_file = auth_file(keyword)
-    if is_api_auth(read_auth_payload(target_auth_file)):
+    if read_auth_account(keyword)["auth_type"] == "api":
         raise AuthError(t("auth.api_refresh_unsupported"))
     existing_email = auth_email(target_auth_file)
     assert_no_running_codex_processes()
@@ -951,12 +1015,12 @@ def command_delete(target: str | None, as_json: bool) -> int:
     target_auth_file = auth_file(keyword)
     assert_no_running_codex_processes()
     confirm_provider_deletion(keyword)
+    api = read_auth_account(keyword)["auth_type"] == "api"
 
     with preserve_auth_state(target_auth_file):
         current_provider = read_current_provider()
         if current_provider == keyword:
-            replacements = [item for item in discover_auth_files() if item[0] != keyword]
-            replacement = replacements[0][0] if replacements else None
+            replacement = next((name for name in numbered_accounts() if name != keyword), None)
             current_config = read_provider_config()
             configured_provider = current_config.get("provider")
             if not isinstance(configured_provider, str) or configured_provider in {"", "unset", "unknown"}:
@@ -972,10 +1036,11 @@ def command_delete(target: str | None, as_json: bool) -> int:
             else:
                 switch_auth(replacement)
 
-        if is_api_auth(read_auth_payload(target_auth_file)):
+        if api:
             set_model_provider(read_model_provider(), remove=keyword)
-
-        target_auth_file.unlink()
+            write_api_account(keyword, None)
+        else:
+            target_auth_file.unlink()
 
     provider_backup_dir = backup_dir_for(keyword)
     if provider_backup_dir.exists():
@@ -995,24 +1060,17 @@ def command_delete(target: str | None, as_json: bool) -> int:
 def command_switch(target: str, as_json: bool) -> int:
     value = target.strip().lower()
     target_provider = None
-    if value not in {"0", "openai", *KNOWN_NON_OPENAI_PROVIDERS}:
+    if value != "openai":
         target_provider = resolve_auth_target(value)
     assert_no_running_codex_processes()
     before = sync_registry()
     current_provider = read_current_provider()
 
-    if value in {"0", *KNOWN_NON_OPENAI_PROVIDERS}:
-        if current_provider is not None and ACTIVE_AUTH_FILE.exists() and auth_file(current_provider).exists():
-            save_active_auth(current_provider)
-        set_model_provider("third-party-api")
-        write_provider_config("third-party-api", current_provider)
-    elif value == "openai":
-        if (
-            current_provider and auth_file(current_provider).exists()
-            and is_api_auth(read_auth_payload(auth_file(current_provider)))
-        ):
+    if value == "openai":
+        if current_provider in numbered_accounts() and read_auth_account(current_provider)["auth_type"] == "api":
             current_provider = next(
-                (name for name, path in discover_auth_files() if not is_api_auth(read_auth_payload(path))), None
+                (name for name, _ in discover_auth_files()
+                 if read_auth_account(name)["auth_type"] == "chatgpt"), None
             )
             if current_provider is None:
                 raise AuthError(t("auth.no_chatgpt_accounts"))

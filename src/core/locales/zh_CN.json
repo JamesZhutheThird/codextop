@@ -352,6 +352,7 @@
   "auth.current_service": "当前服务【{service}】",
   "auth.no_accounts": "无可用 auth_list 账号",
   "auth.service_changed": "原先服务【{before}】-> 当前服务【{after}】",
+  "auth.session_resume_warning": "注意：ChatGPT 与 API Key 认证方式互相切换后，历史 session 可能无法恢复。如果遇到该情况，请切换回原始认证方式。",
   "auth.provider_path": "provider：{path}",
   "auth.registry_path": "registry：{path}",
   "auth.account_summary": "{marker} {label}  刷新={refresh}  备份={backups}",

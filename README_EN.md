@@ -4,12 +4,12 @@
 <tr>
 <td>
 <pre>
-   ██████╗ ██████╗ ██████╗ ███████╗██╗  ██╗████████╗ ██████╗ ██████╗
-  ██╔════╝██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝╚══██╔══╝██╔═══██╗██╔══██╗
-  ██║     ██║   ██║██║  ██║█████╗   ╚███╔╝    ██║   ██║   ██║██████╔╝
-  ██║     ██║   ██║██║  ██║██╔══╝   ██╔██╗    ██║   ██║   ██║██╔═══╝
-  ╚██████╗╚██████╔╝██████╔╝███████╗██╔╝ ██╗   ██║   ╚██████╔╝██║
-   ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝
+   ██████╗ ██████╗ ██████╗ ███████╗██╗  ██╗████████╗ ██████╗ ██████╗  
+  ██╔════╝██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝╚══██╔══╝██╔═══██╗██╔══██╗ 
+  ██║     ██║   ██║██║  ██║█████╗   ╚███╔╝    ██║   ██║   ██║██████╔╝ 
+  ██║     ██║   ██║██║  ██║██╔══╝   ██╔██╗    ██║   ██║   ██║██╔═══╝  
+  ╚██████╗╚██████╔╝██████╔╝███████╗██╔╝ ██╗   ██║   ╚██████╔╝██║      
+   ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝      
 </pre>
 </td>
 </tr>
@@ -220,20 +220,12 @@ CODEXAUTH switch 2
 CODEXAUTH switch 3
 CODEXAUTH switch openai-1
 CODEXAUTH switch my-api
-CODEXAUTH switch third-party-api
+CODEXAUTH 5                       # API account number
 ```
 
 For a numeric target, CodexTOP looks for `auth-1.json` first and then `auth-openai-1.json`. If the target does not exist, the error includes the matching `CODEXAUTH --new ...` command.
 
-To use a third-party API provider, add the following configuration to `config.toml` and replace `base_url`. You must also register the API key in the named system environment variable.
-
-```toml
-[model_providers.third-party-api]
-name = "third-party-api"
-base_url = "https://api.thirdparty.com/v1"
-wire_api = "responses"
-env_key = "API_AUTH_TOKEN"
-```
+API accounts are numbered after existing numeric accounts. Run `CODEXAUTH list` to see the numbers and `CODEXAUTH 5` to switch. API sources store configuration and credentials only in the `meta` fields of `auth_registry.json`, without separate API account files; switching writes the active API configuration to `[model_providers.codexauth-third-party-api]` at the end of `config.toml` and removes other CODEXAUTH-managed API provider blocks. Switching back to ChatGPT removes those API blocks while retaining account data.
 
 CodexTOP refuses to add, rename, refresh, delete, or switch providers while a Codex process whose command name starts with `codex` is running.
 
@@ -259,7 +251,7 @@ The first time you open `CODEXTOP` each day, it reads the GitHub latest release 
 
 ```text
 @JamesZhutheThird
-v3.1.0
+v3.1.1
 
 F11 / New version
 ```

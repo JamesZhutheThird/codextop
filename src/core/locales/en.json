@@ -352,6 +352,7 @@
   "auth.current_service": "Current service [{service}]",
   "auth.no_accounts": "No auth_list accounts available",
   "auth.service_changed": "Previous service [{before}] -> current service [{after}]",
+  "auth.session_resume_warning": "Warning: After switching between ChatGPT and API Key authentication, historical sessions may not resume. If this happens, switch back to the original authentication method.",
   "auth.provider_path": "provider: {path}",
   "auth.registry_path": "registry: {path}",
   "auth.account_summary": "{marker} {label}  refresh={refresh}  backups={backups}",
