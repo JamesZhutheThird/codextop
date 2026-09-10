@@ -251,7 +251,7 @@ The first time you open `CODEXTOP` each day, it reads the GitHub latest release 
 
 ```text
 @JamesZhutheThird
-v3.1.1
+v3.1.2
 
 F11 / New version
 ```

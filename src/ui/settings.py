@@ -11,9 +11,9 @@ from . import color_schemes
 from core.constants import *
 from core.i18n import available_languages, language_name, set_language, t
 from core.update_check import start_daily_update_check
-from .history import current_accounts
+from .history import current_accounts, current_index
 from .models import ClickZone, MonitorState
-from .panels import dashboard_grid_layout, focus_page_layout, panel
+from .panels import account_index, dashboard_grid_layout, focus_history_account, focus_page_layout, panel
 from core.state import sampler_status, send_sampler_interval
 from .statistics_summary import close_statistics, open_statistics, set_statistics_granularity, shift_statistics
 from .terminal_text import *
@@ -944,6 +944,7 @@ def render_sidebar(state: MonitorState, width: int, height: int, x_origin: int, 
         return [fit_ansi(line, width) for line in lines[:height]]
 
     navigation = None
+    chart_navigation = None
     records = getattr(state, "records", None) or []
     accounts = current_accounts(state, records)
     if accounts and state.display_scope == "list":
@@ -968,6 +969,16 @@ def render_sidebar(state: MonitorState, width: int, height: int, x_origin: int, 
                 min(last_page_start, state.summary_offset + page_size),
             )
     elif accounts and state.display_scope == "focus":
+        active = focus_history_account(state, accounts, current_index(state, records))
+        chart_index = accounts.index(active)
+        chart_navigation = (
+            t("nav.previous_chart_short"),
+            t("nav.next_chart_short"),
+            chart_index > 0,
+            chart_index + 1 < len(accounts),
+            account_index(accounts[max(0, chart_index - 1)]),
+            account_index(accounts[min(len(accounts) - 1, chart_index + 1)]),
+        )
         main_width = x_origin - 1
         left_width = min(50, max(20, main_width // 3))
         right_width = max(12, main_width - left_width)
@@ -1015,12 +1026,16 @@ def render_sidebar(state: MonitorState, width: int, height: int, x_origin: int, 
         add_plain("")
 
     navigation_rows = 2 if navigation and content_end - len(lines) >= 2 else 0
-    content_before_navigation = content_end - navigation_rows
+    chart_rows = 2 if chart_navigation and content_end - len(lines) - navigation_rows >= 2 else 0
+    content_before_navigation = content_end - navigation_rows - chart_rows
     lines = lines[:content_before_navigation]
     zones[:] = [zone for zone in zones if zone.x1 < x_origin or zone.y <= content_before_navigation]
     while len(lines) < content_before_navigation:
         add_plain("")
 
+    if chart_rows:
+        add_navigation_row(*chart_navigation, "focus_chart")
+        add_plain("")
     if navigation_rows:
         (
             previous_text,
@@ -1270,6 +1285,9 @@ def handle_click(state: MonitorState, zones: list[ClickZone], x: int, y: int) ->
                 apply_setting_value(state, zone.kind, zone.value)
             elif zone.kind == "summary_scroll":
                 state.summary_offset = max(0, int(zone.value))
+                state.main_cache_key = None
+            elif zone.kind == "focus_chart":
+                state.focus_account = zone.value
                 state.main_cache_key = None
             return True
     return True

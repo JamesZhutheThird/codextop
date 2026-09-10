@@ -142,7 +142,7 @@ class CollectionTests(unittest.TestCase):
             self.assertEqual([record["t"] for record in loaded], sorted(timestamps))
             self.assertEqual(cache.bytes_read, monthly.stat().st_size)
 
-    def test_missing_five_hour_window_defaults_only_when_weekly_window_exists(self) -> None:
+    def test_missing_five_hour_window_is_marked_as_synthetic(self) -> None:
         weekly_only = quota_payload()
         weekly_only["rate_limit"]["primary_window"] = weekly_only["rate_limit"].pop(
             "secondary_window"
@@ -153,11 +153,13 @@ class CollectionTests(unittest.TestCase):
             "Asia/Shanghai",
         )["quota"]
         self.assertEqual(quota_windows["5h"]["remaining_percent"], 100)
-        self.assertEqual(quota_windows["5h"]["reset_after_seconds"], 5 * 3_600)
-        self.assertEqual(quota_windows["5h"]["limit_window_seconds"], 5 * 3_600)
+        self.assertEqual(quota_windows["5h"]["reset_after_seconds"], 18_000)
+        self.assertEqual(quota_windows["5h"]["limit_window_seconds"], 18_000)
+        self.assertTrue(quota_windows["5h"]["synthetic"])
         self.assertEqual(quota_windows["7d"]["remaining_percent"], 60)
         compact = compact_account({"index": "openai-1", "quota": quota_windows}, 1_000)
         self.assertEqual(compact["q"]["5h"], [100, 19_000, 18_000, 18_000])
+        self.assertEqual(compact["synthetic_windows"], ["5h"])
 
         normal = quota.normalize_quota_report(
             quota_payload(),
@@ -1680,7 +1682,7 @@ class SettingsTests(unittest.TestCase):
             choices for key, _title, choices in setting_items(state) if key == "curve_mode"
         )
         self.assertIn((t("choice.curve.fine_bar"), "fine_bar"), curve_choices)
-        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("3.1.1", "v3.1.1"))
+        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("3.1.2", "v3.1.2"))
 
 
 class TokenChartTests(unittest.TestCase):

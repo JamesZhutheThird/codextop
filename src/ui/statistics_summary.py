@@ -246,6 +246,7 @@ def build_statistics_summary(
     period: StatisticsPeriod,
     *,
     local_tokens_ready: bool,
+    window_scope: str = "both",
 ) -> StatisticsSummary:
     index = _history_index(records)
     weights = {
@@ -259,6 +260,12 @@ def build_statistics_summary(
         multiple = 0.0
         observed = False
         points = index.merged_window(window) if index is not None else {}
+        if window_scope == "auto":
+            eligible = {
+                str(account_index(account)) for account in accounts
+                if isinstance(window_info(account, window, window_scope).get("left"), (int, float))
+            }
+            points = {account_id: series for account_id, series in points.items() if account_id in eligible}
         for account_id, series in points.items():
             used_percent, used_multiple, found = _quota_consumed(
                 series,
@@ -279,8 +286,8 @@ def build_statistics_summary(
     current_quota: dict[str, QuotaAmount] = {}
     reset_epochs: dict[str, int | None] = {}
     for window in ("5h", "7d"):
-        percent = merged_window_info(accounts, window, "percent").get("left")
-        multiple = merged_window_info(accounts, window, "actual").get("left")
+        percent = merged_window_info(accounts, window, "percent", window_scope).get("left")
+        multiple = merged_window_info(accounts, window, "actual", window_scope).get("left")
         current_quota[window] = QuotaAmount(
             float(percent) if isinstance(percent, (int, float)) else None,
             float(multiple) if isinstance(multiple, (int, float)) else None,
@@ -288,7 +295,7 @@ def build_statistics_summary(
         window_resets = [
             reset_epoch
             for account in valid_quota_accounts(accounts)
-            for reset_epoch in [window_info(account, window).get("reset_epoch")]
+            for reset_epoch in [window_info(account, window, window_scope).get("reset_epoch")]
             if isinstance(reset_epoch, int)
         ]
         reset_epochs[window] = min(window_resets) if window_resets else None
@@ -328,6 +335,7 @@ def summary_for_state(
         period.end,
         state.records_version,
         state.token_version,
+        state.window_scope,
         local_tokens_ready,
     )
     if state.statistics_cache_key != key or not isinstance(state.statistics_cache, StatisticsSummary):
@@ -337,6 +345,7 @@ def summary_for_state(
             state.token_monitor,
             period,
             local_tokens_ready=local_tokens_ready,
+            window_scope=state.window_scope,
         )
         state.statistics_cache_key = key
     return state.statistics_cache
@@ -469,7 +478,11 @@ def render_statistics_overlay(
     right_gap = nav_gap - left_gap
     body = [f"◀ {' ' * left_gap}{nav_label}{' ' * right_gap} ▶"]
     body.append(section_rule(t("statistics.quota_used"), inner))
-    body.extend(_amount_line(window, summary.quota_used[window]) for window in ("5h", "7d"))
+    body.extend(
+        _amount_line(window, summary.quota_used[window])
+        for window in ("5h", "7d")
+        if state.window_scope != "auto" or summary.quota_used[window].percent is not None
+    )
     body.append(t("statistics.system_tokens", value=_tokens(summary.system_tokens, increase=True)))
     body.append("")
     body.append(section_rule(t("statistics.local_tokens"), inner))
@@ -500,6 +513,7 @@ def render_statistics_overlay(
     body.extend(
         _current_amount_line(window, summary.current_quota[window], summary.reset_epochs[window])
         for window in ("5h", "7d")
+        if state.window_scope != "auto" or summary.current_quota[window].percent is not None
     )
     body.append(
         t(

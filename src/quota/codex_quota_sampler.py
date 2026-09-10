@@ -96,6 +96,10 @@ def compact_account(account: dict[str, Any], observed_ts: int) -> dict[str, Any]
             window.get("limit_window_seconds"),
         ]
     item["q"] = q
+    # Listed windows are compatibility defaults; unlisted values came from the API.
+    synthetic_windows = [key for key in q if account.get("quota", {}).get(key, {}).get("synthetic")]
+    if synthetic_windows:
+        item["synthetic_windows"] = synthetic_windows
 
     reset = account.get("reset_credits", {})
     item["rc"] = reset.get("available_count")

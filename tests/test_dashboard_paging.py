@@ -4,15 +4,18 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from core.constants import SIDEBAR_WIDTH
+from core.constants import CURVE_MODE_CHOICES, SIDEBAR_WIDTH
 from core.i18n import t
-from core.state import saved_dashboard_density, saved_hide_account_info
-from quota.quota_format import account_email
+from core.state import saved_dashboard_density, saved_hide_account_info, saved_window_scope
+from quota.quota_format import account_email, current_account_quota_summary, merged_quota_rows, merged_window_info, quota_rows
+from ui.history import HistoryRecordList, HistorySeriesIndex
+from ui.charts import chart_lines
 from ui.app import _render_main_content
 from ui.models import MonitorState
 from ui.panels import (
@@ -21,9 +24,10 @@ from ui.panels import (
     account_lines,
     dashboard_grid_layout,
     focus_page_layout,
+    merged_chart_lines,
 )
 from ui.settings import apply_setting_value, handle_click, render_sidebar, setting_items
-from ui.terminal_text import strip_ansi
+from ui.terminal_text import chart_series_color, percent_color, strip_ansi
 
 
 def account(number: int, now: int) -> dict:
@@ -361,6 +365,51 @@ class DashboardPagingTests(unittest.TestCase):
         self.assertEqual((both_heights, both_starts), ([16] * 4, [0, 2]))
         self.assertEqual((single_heights, single_starts), ([14] * 4, [0, 3]))
 
+    def test_focus_chart_manual_navigation_and_provider_following(self) -> None:
+        accounts, records = self.records(4)
+        state = monitor_state(records, "focus")
+
+        def render(current: str) -> list:
+            records[-1]["current"] = current
+            lines, _, _ = _render_main_content(state, records, accounts, current, 120, 52, [])
+            self.assertIn(str(state.focus_account), strip_ansi(lines[0])[32:])
+            zones = []
+            render_sidebar(state, SIDEBAR_WIDTH, 51, 98, zones)
+            return zones
+
+        zones = render("openai-1")
+        charts = [zone for zone in zones if zone.kind == "focus_chart"]
+        paging = next(zone for zone in zones if zone.kind == "summary_scroll")
+        self.assertEqual([(zone.y, zone.value) for zone in charts], [(paging.y - 2, "openai-2")])
+        state.main_cache_key = ("cached",)
+        handle_click(state, zones, charts[0].x1, charts[0].y)
+        self.assertIsNone(state.main_cache_key)
+        zones = render("openai-1")
+        self.assertEqual((state.focus_account, state.summary_offset), ("openai-2", 0))
+        charts = [zone for zone in zones if zone.kind == "focus_chart"]
+        self.assertEqual([zone.value for zone in charts], ["openai-1", "openai-3"])
+        handle_click(state, zones, charts[0].x1, charts[0].y)
+        render("openai-1")
+        self.assertEqual(state.focus_account, "openai-1")
+
+        # API providers are absent from quota accounts; keep the displayed chart.
+        render("api-provider")
+        self.assertEqual(state.focus_account, "openai-1")
+        zones = render("openai-4")
+        self.assertEqual(state.focus_account, "openai-4")
+        charts = [zone for zone in zones if zone.kind == "focus_chart"]
+        self.assertEqual([zone.value for zone in charts], ["openai-3"])
+        handle_click(state, zones, charts[0].x1, charts[0].y)
+        render("api-provider")
+        self.assertEqual(state.focus_account, "openai-3")
+        render("openai-4")
+        self.assertEqual(state.focus_account, "openai-4")
+
+        # Removing the viewed account falls back to an available chart.
+        accounts.pop()
+        render("openai-4")
+        self.assertEqual(state.focus_account, "openai-1")
+
     def test_small_dashboard_preserves_minimum_chart_height(self) -> None:
         accounts, records = self.records(4)
         state = monitor_state(records, "list")
@@ -372,6 +421,80 @@ class DashboardPagingTests(unittest.TestCase):
         chart_bottom = next(index for index, line in enumerate(plain) if "└" in line)
         self.assertEqual((len(lines), width, height), (19, 97, 19))
         self.assertGreaterEqual(chart_bottom - chart_top + 1, 4)
+
+    def test_auto_window_shows_available_quotas_and_uses_primary_color(self) -> None:
+        state = monitor_state([], "focus")
+        choices = next(choices for key, _, choices in setting_items(state) if key == "window_scope")
+        self.assertIn((t("choice.window.auto"), "auto"), choices)
+        apply_setting_value(state, "window_scope", "auto")
+        self.assertEqual(state.window_scope, "auto")
+        self.assertEqual(saved_window_scope({"window_scope": "auto"}), "auto")
+
+        for windows in ((), ("5h",), ("7d",), ("5h", "7d")):
+            active = account(1, self.now)
+            active["q"] = {key: value for key, value in active["q"].items() if key in windows}
+            records = [{"t": self.now - 60, "a": [active]}]
+            with self.subTest(windows=windows):
+                for rows in (
+                    quota_rows(active, 60, window_scope="auto"),
+                    merged_quota_rows([active], "openai-1", 60, window_scope="auto"),
+                    [current_account_quota_summary([active], "openai-1", "auto")],
+                ):
+                    text = strip_ansi("\n".join(rows))
+                    for key in ("5h", "7d"):
+                        self.assertEqual(key in text, key in windows)
+                for _, curve in CURVE_MODE_CHOICES:
+                    for merged in (False, True):
+                        with self.subTest(curve=curve, merged=merged), patch(
+                            "ui.charts.chart_series_color", wraps=chart_series_color
+                        ) as colors:
+                            if merged:
+                                lines = merged_chart_lines(records, "5m", 60, 18, curve, "auto", [active])
+                            else:
+                                lines = chart_lines(records, "openai-1", "5m", 60, 18, curve, "auto")
+                            self.assertTrue(lines)
+                            self.assertEqual({call.args[0] for call in colors.call_args_list}, set(windows))
+                            self.assertTrue(all(
+                                call.kwargs.get("primary") == (len(windows) == 1)
+                                for call in colors.call_args_list
+                            ))
+        self.assertEqual(chart_series_color("7d", 50, primary=True), percent_color(50))
+        self.assertEqual(chart_series_color("5h", 50), percent_color(50))
+        self.assertNotEqual(chart_series_color("7d", 50), chart_series_color("5h", 50))
+
+    def test_auto_excludes_synthetic_pro_quota_from_panels_and_merged_history(self) -> None:
+        accounts, records = self.records(4)
+        pro = accounts[-1]
+        pro.update(plan="pro-20x", synthetic_windows=["5h"])
+        pro["q"]["5h"][0] = 100
+        pro["q"]["7d"][0] = 98
+        accounts[0]["q"]["5h"][0] = 100  # A real 100% must still count.
+        for scope, five_hour_max in (("auto", 3), ("both", 23), ("5h", 23), ("7d", 23)):
+            self.assertEqual(merged_window_info(accounts, "5h", "actual", scope)["max_left"], five_hour_max)
+            self.assertEqual(merged_window_info(accounts, "7d", "actual", scope)["max_left"], 23)
+        cached = HistoryRecordList(HistorySeriesIndex())
+        for record in records:
+            cached.series_index.append_record(record)
+            cached.append(record)
+        for history in (records, cached):
+            with patch("ui.panels.series_chart_lines", return_value=[]) as chart:
+                merged_chart_lines(history, "5m", 60, 18, "connected", "auto", accounts, "actual")
+                points = chart.call_args.args[0]
+                self.assertNotIn("openai-4", points["5h"])
+                self.assertEqual(set(points["5h"]), {"openai-1", "openai-2", "openai-3"})
+                self.assertEqual(len(points["7d"]), 4)
+            for scope, expected in (("auto", {"7d"}), ("both", {"5h", "7d"}), ("5h", {"5h"}), ("7d", {"7d"})):
+                with patch("ui.charts.chart_series_color", wraps=chart_series_color) as colors:
+                    chart_lines(history, "openai-4", "5m", 60, 18, "connected", scope)
+                    self.assertEqual({call.args[0] for call in colors.call_args_list}, expected)
+        pro_records = [{"t": self.now - 60, "current": "openai-4", "a": [pro]}]
+        for mode in ("list", "focus", "merged"):
+            state = monitor_state(pro_records, mode)
+            state.window_scope = "auto"
+            lines, _, _ = _render_main_content(state, pro_records, [pro], "openai-4", 160, 61, [])
+            plain = strip_ansi("\n".join(lines))
+            self.assertIn("7d", plain)
+            self.assertNotIn("5h", plain)
 
     def test_dashboard_height_at_most_15_omits_upper_blank_rows(self) -> None:
         accounts, records = self.records(1)

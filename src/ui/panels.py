@@ -482,6 +482,17 @@ def merged_chart_lines(
             key: merged_account_window_points(relevant, key)
             for key in window_keys(window_scope)
         }
+    if window_scope == "auto":
+        current_accounts = accounts if accounts is not None else records[-1].get("a", [])
+        points = {
+            key: {
+                str(account_index(account)): series[str(account_index(account))]
+                for account in current_accounts
+                if isinstance(window_info(account, key, window_scope).get("left"), (int, float))
+                and str(account_index(account)) in series
+            }
+            for key, series in points.items()
+        }
     account_weights = None
     if merged_quota_mode == "actual":
         account_weights = {
@@ -553,7 +564,7 @@ def border_color(
     if account_error(account):
         return "dim"
     for key in window_keys(window_scope):
-        left = window_info(account, key).get("left")
+        left = window_info(account, key, window_scope).get("left")
         if isinstance(left, (int, float)):
             return percent_color(left)
     return "dim"
@@ -607,6 +618,21 @@ def selected_account(accounts: list[dict[str, Any]], current: int | str | None) 
         if is_current(account):
             return account
     return accounts[0]
+
+
+def focus_history_account(state, accounts: list[dict[str, Any]], current: int | str | None) -> dict[str, Any]:
+    """Keep a manual chart selection until the active quota provider changes."""
+    if current != getattr(state, "focus_last_current", None):
+        state.focus_last_current = current
+        # API providers have no account in quota snapshots.
+        if any(account_index(account) == current for account in accounts):
+            state.focus_account = current
+    selected = getattr(state, "focus_account", None)
+    active = next((account for account in accounts if account_index(account) == selected), None)
+    if active is None:
+        active = selected_account(accounts, current)
+        state.focus_account = account_index(active)
+    return active
 
 
 def _even_sizes(total: int, count: int) -> list[int]:

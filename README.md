@@ -268,7 +268,7 @@ CODEXTOP_UPDATE --check-only  # 只检测，不更新
 
 ```text
 @JamesZhutheThird
-v3.1.1
+v3.1.2
 
 F11 / 新版本可用
 ```

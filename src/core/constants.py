@@ -71,6 +71,7 @@ USAGE_AXIS_SCALE_CHOICES = [
     (t("choice.axis.log"), "log"),
 ]
 WINDOW_SCOPE_CHOICES = [
+    (t("choice.window.auto"), "auto"),
     (t("choice.window.both"), "both"),
     (t("choice.window.5h"), "5h"),
     (t("choice.window.7d"), "7d"),

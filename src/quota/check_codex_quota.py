@@ -256,13 +256,10 @@ def normalize_rate_limit_windows(rate_limit: Any, tz: ZoneInfo) -> dict[str, dic
         seconds = WINDOW_SECONDS["5h"]
         normalized["5h"] = normalize_window(
             "5h",
-            {
-                "used_percent": 0,
-                "limit_window_seconds": seconds,
-                "reset_after_seconds": seconds,
-            },
+            {"used_percent": 0, "limit_window_seconds": seconds, "reset_after_seconds": seconds},
             tz,
         )
+        normalized["5h"]["synthetic"] = True
     return normalized
 
 

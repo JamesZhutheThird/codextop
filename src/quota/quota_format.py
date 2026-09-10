@@ -102,7 +102,14 @@ def token_usage_rows(total: Any, _width: int) -> list[str]:
     return [f"{paint(t('quota.total_usage'), 'dim')} {format_token_count(total)}"]
 
 
-def window_info(account: dict[str, Any], key: str) -> dict[str, Any]:
+def window_info(
+    account: dict[str, Any], key: str, window_scope: str = DEFAULT_WINDOW_SCOPE,
+) -> dict[str, Any]:
+    if window_scope == "auto" and (
+        key in account.get("synthetic_windows", [])
+        or account.get("quota", {}).get(key, {}).get("synthetic")
+    ):
+        return {"left": None, "reset_after": None, "reset_at": "-", "reset_epoch": None}
     if "quota" in account:
         window = account.get("quota", {}).get(key, {})
         reset_after = window.get("reset_after_seconds")
@@ -198,7 +205,9 @@ def quota_rows(
 ) -> list[str]:
     rows: list[str] = []
     keys = window_keys(window_scope)
-    infos = {key: window_info(account, key) for key in keys}
+    infos = {key: window_info(account, key, window_scope) for key in keys}
+    if window_scope == "auto":
+        keys = tuple(key for key in keys if isinstance(infos[key].get("left"), (int, float)))
     primary_color = len(keys) == 1 or sum(
         isinstance(info.get("left"), (int, float)) for info in infos.values()
     ) == 1
@@ -314,7 +323,9 @@ def current_account_quota_summary(
         return account_id
     parts = []
     for key in window_keys(window_scope):
-        left = window_info(account, key).get("left")
+        left = window_info(account, key, window_scope).get("left")
+        if window_scope == "auto" and not isinstance(left, (int, float)):
+            continue
         parts.append(f"{key} {paint(percent_text(left), percent_color(left))}")
     return f"{account_id} ({' '.join(parts)})"
 
@@ -363,13 +374,14 @@ def merged_window_info(
     accounts: list[dict[str, Any]],
     key: str,
     merged_quota_mode: str = DEFAULT_MERGED_QUOTA_MODE,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> dict[str, Any]:
     total = 0.0
     max_left = 0.0
     contributors = 0
     reset_candidates: list[int] = []
     for account in valid_quota_accounts(accounts):
-        info = window_info(account, key)
+        info = window_info(account, key, window_scope)
         left = info.get("left")
         if not isinstance(left, (int, float)):
             continue
@@ -414,12 +426,13 @@ def account_quota_detail_line(
     key: str,
     width: int,
     merged_quota_mode: str = DEFAULT_MERGED_QUOTA_MODE,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> str:
     sortable: list[tuple[float, str]] = []
     for account in valid_quota_accounts(accounts):
         index = account_index(account)
         account_id = str(index) if index is not None else "-"
-        left = window_info(account, key).get("left")
+        left = window_info(account, key, window_scope).get("left")
         if not isinstance(left, (int, float)):
             continue
         value = float(left)
@@ -439,6 +452,7 @@ def merged_quota_detail_reset_line(
     info: dict[str, Any],
     width: int,
     merged_quota_mode: str = DEFAULT_MERGED_QUOTA_MODE,
+    window_scope: str = DEFAULT_WINDOW_SCOPE,
 ) -> str:
     reset_text = t("quota.resets_after_at", countdown=countdown(info["reset_after"]), time=info["reset_at"])
     reset = paint_style(reset_text, quota.reset_after_style(info["reset_after"]))
@@ -452,6 +466,7 @@ def merged_quota_detail_reset_line(
         key,
         detail_width,
         merged_quota_mode,
+        window_scope,
     )
     return fit_ansi(detail, detail_width) + " " + right_ansi(reset, reset_width)
 
@@ -469,9 +484,11 @@ def merged_quota_rows(
     rows: list[str] = []
     keys = window_keys(window_scope)
     infos = {
-        key: merged_window_info(accounts, key, merged_quota_mode)
+        key: merged_window_info(accounts, key, merged_quota_mode, window_scope)
         for key in keys
     }
+    if window_scope == "auto":
+        keys = tuple(key for key in keys if isinstance(infos[key].get("left"), (int, float)))
     primary_color = len(keys) == 1 or sum(
         isinstance(info.get("left"), (int, float)) for info in infos.values()
     ) == 1
@@ -499,6 +516,7 @@ def merged_quota_rows(
                 info,
                 width,
                 merged_quota_mode,
+                window_scope,
             )
         )
         if key != keys[-1] and not compact:

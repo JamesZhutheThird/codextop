@@ -110,7 +110,7 @@ def _render_main_content(
         left_lines.extend([""] * (content_height - 1))
         left_lines = [fit_ansi(line, main_width) for line in left_lines[:content_height]]
     elif state.display_scope == "focus":
-        active = selected_account(accounts, current)
+        active = focus_history_account(state, accounts, current)
         left_width = min(50, max(20, main_width // 3))
         right_width = max(12, main_width - left_width)
         left_width = main_width - right_width
@@ -436,6 +436,8 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
             enriched_accounts.append(enriched)
         accounts = enriched_accounts
     current = current_index(state, records)
+    if accounts:
+        focus_history_account(state, accounts, current)
     last_timestamp = records[-1].get("t") if records else None
     cache_key = (
         state.records_version,
@@ -457,6 +459,8 @@ def render_frame(state: MonitorState, term_width: int, term_height: int) -> tupl
         getattr(state, "usage_axis_scale", DEFAULT_USAGE_AXIS_SCALE),
         state.color_scheme,
         state.summary_offset,
+        current,
+        state.focus_account,
         account_freshness_cache_key(accounts),
         state.history_preload_waiting,
         state.token_preload_waiting,

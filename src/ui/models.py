@@ -44,6 +44,8 @@ class MonitorState:
     records: list[dict[str, Any]] | None = None
     control_path: Path | None = None
     summary_offset: int = 0
+    focus_account: int | str | None = None
+    focus_last_current: int | str | None = None
     settings_mode: str = "normal"
     settings_category_focus: int = 0
     settings_focus: int = 0

@@ -6,7 +6,8 @@ from typing import Any
 
 from core.constants import *
 from core.i18n import t
-from .history import period_bounds, period_context_timestamp, records_for_period, value_at, window_points
+from quota.quota_format import window_info
+from .history import account_at, period_bounds, period_context_timestamp, records_for_period, value_at, window_points
 from .terminal_text import *
 
 def axis_value_text(value: float, suffix: str = "") -> str:
@@ -613,19 +614,23 @@ def chart_lines(
 ) -> list[str]:
     if not records:
         return [paint(t("common.no_history"), "dim")]
+    keys = window_keys(window_scope)
+    if window_scope == "auto":
+        active = account_at(records[-1], index) or {}
+        keys = tuple(key for key in keys if isinstance(window_info(active, key, window_scope).get("left"), (int, float)))
     series_index = getattr(records, "series_index", None)
     if series_index is not None:
         start_ts, end_ts = period_bounds(records, period)
         context_timestamp = period_context_timestamp(records, period, start_ts)
         points = {
             key: series_index.account_window(index, key, context_timestamp)
-            for key in window_keys(window_scope)
+            for key in keys
         }
     else:
         relevant, start_ts, end_ts = records_for_period(records, period)
         points = {
             key: window_points(relevant, index, key)
-            for key in window_keys(window_scope)
+            for key in keys
         }
     return series_chart_lines(points, start_ts, end_ts, width, height, curve_mode, 100.0)
 
