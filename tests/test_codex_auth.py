@@ -564,8 +564,9 @@ class CodexAuthApiAndRenameTests(unittest.TestCase):
         self.assertEqual(codex_auth.sync_registry()["current_provider_number"], 5)
         with patch.dict(codex_auth.os.environ, {"REGISTRY_TEST_KEY": "env-secret"}):
             self.assertEqual(codex_auth.main(["6"]), 0)
-        self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file)["OPENAI_API_KEY"],
-                         "env-secret")
+        self.assertFalse(self.paths.active_auth_file.exists())
+        config = codex_auth.parse_config(self.paths.config_file.read_text())
+        self.assertEqual(config["model_providers"]["codexauth-third-party-api"]["env_key"], "REGISTRY_TEST_KEY")
         self.assertEqual(codex_auth.main(["openai"]), 0)
         self.assertEqual(codex_auth.read_model_provider(), "openai")
         self.assertEqual(codex_auth.resolve_auth_target("5"), "xlance-api")
@@ -582,11 +583,23 @@ class CodexAuthApiAndRenameTests(unittest.TestCase):
         env = self.enter_context(patch.dict(codex_auth.os.environ, {"CODEXAUTH_TEST_KEY": "first-key"}))
         payload = self.add_api(key_env="CODEXAUTH_TEST_KEY")
         self.assertNotIn("OPENAI_API_KEY", payload)
+        self.assertFalse(self.paths.active_auth_file.exists())
+        self.assertFalse(codex_auth.auth_file("my-api").exists())
+        config = codex_auth.parse_config(self.paths.config_file.read_text())
+        self.assertEqual(config["model_providers"]["codexauth-third-party-api"], {
+            "name": "codexauth-third-party-api", "base_url": "https://example.com/v1",
+            "wire_api": "responses", "env_key": "CODEXAUTH_TEST_KEY",
+        })
         codex_auth.command_switch("1", False)
+        self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file), self.chatgpt)
         env["CODEXAUTH_TEST_KEY"] = "rotated-key"
         codex_auth.command_switch("my-api", False)
-        self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file)["OPENAI_API_KEY"], "rotated-key")
+        self.assertFalse(self.paths.active_auth_file.exists())
         self.assertEqual(codex_auth.read_auth_account("my-api")["meta"], payload)
+        for path in self.paths.codex_dir.rglob("*"):
+            if path.is_file():
+                self.assertNotIn("first-key", path.read_text())
+                self.assertNotIn("rotated-key", path.read_text())
         codex_auth.command_switch("1", False)
         before = self.paths.config_file.read_text()
         del env["CODEXAUTH_TEST_KEY"]
@@ -597,6 +610,48 @@ class CodexAuthApiAndRenameTests(unittest.TestCase):
         self.assertEqual(codex_auth.read_current_provider(), "openai-1")
         for path in (self.paths.registry_file, self.paths.config_file):
             self.assertNotIn("rotated-key", path.read_text())
+
+    def test_env_switch_removes_legacy_auth_and_manual_switch_restores_file_auth(self) -> None:
+        self.enter_context(patch.dict(codex_auth.os.environ, {"CODEXAUTH_TEST_KEY": "env-secret"}))
+        self.add_api(key_env="CODEXAUTH_TEST_KEY")
+        codex_auth.atomic_write_json(self.paths.active_auth_file, {
+            "auth_mode": "apikey", "OPENAI_API_KEY": "legacy-env-secret",
+        })
+        codex_auth.command_switch("my-api", False)
+        self.assertFalse(self.paths.active_auth_file.exists())
+        codex_auth.command_rename("my-api", "env-api", False)
+        self.assertFalse(self.paths.active_auth_file.exists())
+        self.add_api("manual-api")
+        config = codex_auth.parse_config(self.paths.config_file.read_text())
+        provider = config["model_providers"]["codexauth-third-party-api"]
+        self.assertNotIn("env_key", provider)
+        self.assertTrue(provider["requires_openai_auth"])
+        self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file)["OPENAI_API_KEY"], "test-secret-key")
+        with patch.object(codex_auth, "confirm_provider_deletion"):
+            codex_auth.command_delete("openai-1", False)
+            codex_auth.command_delete("manual-api", False)
+            self.assertEqual(codex_auth.read_current_provider(), "env-api")
+            self.assertFalse(self.paths.active_auth_file.exists())
+            codex_auth.command_delete("env-api", False)
+        self.assertFalse(self.paths.active_auth_file.exists())
+        self.assertEqual(codex_auth.numbered_accounts(), {})
+
+    def test_env_switch_write_failure_restores_auth_presence_and_config(self) -> None:
+        self.enter_context(patch.dict(codex_auth.os.environ, {"CODEXAUTH_TEST_KEY": "env-secret"}))
+        self.add_api(key_env="CODEXAUTH_TEST_KEY")
+        for source, target in (("my-api", "openai-1"), ("openai-1", "my-api")):
+            with self.subTest(source=source):
+                codex_auth.command_switch(source, False)
+                before = self.paths.config_file.read_bytes()
+                with patch.object(codex_auth, "write_provider_config", side_effect=OSError("write failed")):
+                    with self.assertRaises(OSError):
+                        codex_auth.switch_auth(target)
+                self.assertEqual(self.paths.config_file.read_bytes(), before)
+                self.assertEqual(codex_auth.read_current_provider(), source)
+                if source == "my-api":
+                    self.assertFalse(self.paths.active_auth_file.exists())
+                else:
+                    self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file), self.chatgpt)
 
     def test_switch_to_current_chatgpt_keeps_refreshed_tokens(self) -> None:
         refreshed = auth_payload("owner@example.com", "refreshed")

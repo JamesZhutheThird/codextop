@@ -222,7 +222,9 @@ CODEXAUTH --rename my-api proxy
 添加 API 源时，`CODEXAUTH --new my-api --api` 会打开终端交互界面，选择手动输入 API Key
 （隐藏输入），或在 PATH 中填写环境变量名（如 `OPENAI_API_KEY`，需先在当前终端 export）。
 输入后检查变量是否存在且非空，并显示脱敏密钥（如 `sk-a******z`）；每次切换到该源时
-都会重新读取环境变量。交互界面无外框，与普通 `--new` 风格一致。Base URL 留空默认
+都会重新检查环境变量。此方式仅在 `config.toml` 的 provider 配置中写入 `env_key = "变量名"`，
+由 Codex 在运行时读取密钥，不生成 `auth.json`；切换时会移除当前 `auth.json`，
+原 ChatGPT 凭证保存在账号列表中，切回时恢复。交互界面无外框，与普通 `--new` 风格一致。Base URL 留空默认
 `https://api.openai.com/v1`，第三方源填写其兼容 Responses API 的地址。
 导入后自动切换，后续使用 `CODEXAUTH switch my-api`。凭证以 `0600` 权限保存，API Key
 不写入列表或 JSON 摘要。导入检查本地配置与密钥格式，不发送在线验证请求；API 源不提供
@@ -268,7 +270,7 @@ CODEXTOP_UPDATE --check-only  # 只检测，不更新
 
 ```text
 @JamesZhutheThird
-v3.1.2
+v3.1.3
 
 F11 / 新版本可用
 ```

@@ -1,6 +1,6 @@
 [project]
 name = "codextop"
-version = "3.1.2"
+version = "3.1.3"
 description = "Terminal monitor for Codex quota usage."
 readme = "README.md"
 license = { text = "CC BY-NC-SA 4.0" }

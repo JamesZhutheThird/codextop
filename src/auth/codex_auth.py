@@ -427,10 +427,14 @@ def set_model_provider(provider: str, api_meta: dict[str, Any] | None = None, *,
     if api_meta is not None:
         keyword = provider
         base_url = validate_api_base_url(api_meta.get("base_url", DEFAULT_API_BASE_URL))
+        auth_config = (
+            f'env_key = {json.dumps(api_meta["env_key"])}\n'
+            if api_meta.get("env_key") is not None else 'requires_openai_auth = true\n'
+        )
         content = content.rstrip() + (
             f'\n\n# BEGIN CODEXAUTH {keyword}\n[model_providers.{json.dumps(provider)}]\n'
             f'name = {json.dumps(keyword)}\nbase_url = {json.dumps(base_url)}\n'
-            'wire_api = "responses"\nrequires_openai_auth = true\n'
+            f'wire_api = "responses"\n{auth_config}'
             f'# END CODEXAUTH {keyword}\n'
         )
     content = set_root_config(content, "model_provider", provider)
@@ -548,19 +552,23 @@ def switch_auth(target_provider: str) -> None:
     api = account["auth_type"] == "api"
     active_payload = api_auth_payload(account["meta"]) if api else read_auth_payload(target_auth_file)
     provider = api_provider_id(target_provider) if api else "openai"
+    current_provider = read_current_provider()
     auth_type_changed = (
-        ACTIVE_AUTH_FILE.exists()
-        and is_api_auth(read_auth_payload(ACTIVE_AUTH_FILE)) != api
+        is_api_auth(read_auth_payload(ACTIVE_AUTH_FILE)) != api
+        if ACTIVE_AUTH_FILE.exists() else
+        current_provider in numbered_accounts() and (read_auth_account(current_provider)["auth_type"] == "api") != api
     )
     with preserve_auth_state():
-        current_provider = read_current_provider()
         if current_provider is not None and auth_file(current_provider).exists() and ACTIVE_AUTH_FILE.exists():
             save_active_auth(current_provider)
         if not api:
             # Saving the current slot may have persisted a token refreshed by Codex.
             active_payload = read_auth_payload(target_auth_file)
         set_model_provider(provider, account["meta"] if api else None)
-        atomic_write_json(ACTIVE_AUTH_FILE, active_payload, 0o600)
+        if api and account["meta"].get("env_key") is not None:
+            ACTIVE_AUTH_FILE.unlink(missing_ok=True)
+        else:
+            atomic_write_json(ACTIVE_AUTH_FILE, active_payload, 0o600)
         write_provider_config(provider, target_provider)
     if auth_type_changed:
         print(f"\033[33m{t('auth.session_resume_warning')}\033[0m", file=sys.stderr)

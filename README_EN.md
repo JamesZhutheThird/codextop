@@ -208,7 +208,7 @@ CODEXAUTH --rename my-api proxy
 
 Renaming updates the auth file, backup directory, and current provider marker. Existing quota history keeps its original name.
 
-`CODEXAUTH --new my-api --api` opens a borderless terminal form matching ordinary `--new`. Choose hidden manual API Key input or enter an environment variable name in PATH (e.g. `OPENAI_API_KEY`, exported in the current terminal). The variable is checked for a nonempty value and the key is shown masked (e.g. `sk-a******z`). Each switch to that source rereads the environment variable. Leave Base URL blank for `https://api.openai.com/v1`, or enter a third-party Responses-compatible endpoint.
+`CODEXAUTH --new my-api --api` opens a borderless terminal form matching ordinary `--new`. Choose hidden manual API Key input or enter an environment variable name in PATH (e.g. `OPENAI_API_KEY`, exported in the current terminal). The variable is checked for a nonempty value and the key is shown masked (e.g. `sk-a******z`). Each switch to that source rechecks the environment variable. This mode writes only `env_key = "VARIABLE_NAME"` into the provider section of `config.toml`, so Codex reads the key at runtime without generating `auth.json`. Switching removes the active `auth.json`; saved ChatGPT credentials stay in the account list and are restored when switching back. Leave Base URL blank for `https://api.openai.com/v1`, or enter a third-party Responses-compatible endpoint.
 
 Import switches to the new source immediately; use `CODEXAUTH switch my-api` for later switches. Credential files use `0600` permissions, and keys are excluded from list and JSON summaries. Import validates local configuration and key format without an online request. API sources do not expose ChatGPT subscription quotas or use the `--refresh` device login flow.
 
@@ -251,7 +251,7 @@ The first time you open `CODEXTOP` each day, it reads the GitHub latest release 
 
 ```text
 @JamesZhutheThird
-v3.1.2
+v3.1.3
 
 F11 / New version
 ```

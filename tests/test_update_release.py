@@ -178,7 +178,9 @@ class UpdateReleaseInterfaceTests(unittest.TestCase):
             notes = current_version_changelog()
             self.assertIsNotNone(notes)
             self.assertIn(APP_VERSION, rendered)
-            self.assertIn(notes.splitlines()[0], rendered)
+            # Changelog entries can wrap across multiple rows in the dialog.
+            dialog_text = "".join(strip_ansi(line).split("│")[1].strip() for line in lines if "│" in strip_ansi(line))
+            self.assertIn("".join(notes.splitlines()[0].split()), "".join(dialog_text.split()))
             self.assertIn("<- / Close", rendered)
 
             plain = [strip_ansi(line) for line in lines]
@@ -186,7 +188,7 @@ class UpdateReleaseInterfaceTests(unittest.TestCase):
             art = [next(index for index, line in enumerate(plain) if row in line) for row in CODEXTOP_ASCII_ART]
             author = next(index for index, line in enumerate(plain) if "@JamesZhutheThird" in line)
             version = next(index for index, line in enumerate(plain) if APP_VERSION in line)
-            first_note = next(index for index, line in enumerate(plain) if notes.splitlines()[0] in line)
+            first_note = next(index for index, line in enumerate(plain) if notes.splitlines()[0][:16] in line)
             self.assertEqual(art[0], title + 2)
             self.assertEqual(art, list(range(art[0], art[0] + len(CODEXTOP_ASCII_ART))))
             self.assertEqual(author, art[-1] + 2)
