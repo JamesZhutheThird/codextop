@@ -241,12 +241,46 @@ CODEXAUTH switch my-api
 CODEXAUTH 5                       # API account number
 ```
 
+参数形式为 `CODEXAUTH [--new/--refresh/--delete/--rename/...] provider_name [...] -f`，兼容原有 `switch` 和数字目标。
+
+```bash
+CODEXAUTH work -f
+CODEXAUTH --new work -f
+CODEXAUTH --new my-api --api -f
+CODEXAUTH --refresh work -f
+CODEXAUTH --rename work home -f
+CODEXAUTH --delete home -f
+CODEXAUTH --kill                  # 关闭当前用户的全部 Codex 进程
+```
+
+`--kill` 和 `-f` 共用关闭流程：若 CLI 支持，先执行 `codex app-server daemon stop`，再对剩余独立进程发送 `SIGTERM` 并等待退出；不会使用 `SIGKILL`。进程未能退出时操作报错，账号操作不会继续。`--delete -f` 仍需要完整 ID 确认。
+
+关闭前会记录前台 Codex 所在的终端，成功退出后关闭这些终端的鼠标与焦点事件上报，避免 tmux pane 返回 shell 后出现 `35;23;47M` 等字符。后台进程以及已运行其他前台应用的终端会跳过清理；已关闭或无法访问的终端不影响账号操作。
+
+目标与当前账号相同且不带 `-f` 时，不检查或结束进程，ChatGPT 账号直接将当前 `auth.json` 同步到账号槽，并通知 CODEXTOP 采样器刷新凭证；API 源仍按已保存的配置重新应用凭证。带 `-f` 时先走上述关闭流程。
+
 输入数字时会先找 `auth-1.json`，再找 `auth-openai-1.json`。
 如果目标不存在，错误信息会给出对应的 `CODEXAUTH --new ...` 添加命令。
 
+可选的 `--transfer [-d DURATION | -s SESSION_ID]` 用于迁移历史会话的内部 provider 标记。启用但不指定范围时默认 `1h`；不带这个参数时不会修改会话。
+
+```bash
+CODEXAUTH work --transfer -f          # 切换内部 provider id 时迁移最近 1h 的原 provider 会话
+CODEXAUTH work --transfer -d 12h -f
+CODEXAUTH work --transfer -d 7d -f
+CODEXAUTH work --transfer -d all -f
+CODEXAUTH work --transfer -s SESSION_UUID -f  # 迁移指定会话，可用于修复标记
+CODEXAUTH --transfer -s SESSION_UUID -f       # 单独将指定会话迁移到当前 provider
+CODEXAUTH --transfer -d 1h -f                 # 单独将最近 1h 的会话迁移到当前 provider
+```
+
+批量范围按 SQLite 的最近活动时间筛选；未被索引的旧会话使用 rollout 修改时间。配合 provider 操作时，只有内部 `model_provider` 改变才批量迁移，并仅处理原 provider 的会话；单独使用则将范围内的会话迁移到当前 provider。完整 UUID 不受时间范围限制。范围包含归档会话。
+
+迁移同步修改 rollout 的 `session_meta.model_provider` 和 SQLite 索引，保留消息内容与会话活动时间。原标记备份保存在 `~/.codex/codextop/session_provider_backups/`，完成后输出路径；`--json` 输出包含 `session_provider_update`。迁移要求 Codex 已退出，可配合 `-f` 使用上述关闭流程。
+
 API 账号接在已有数字账号之后编号，可用 `CODEXAUTH list` 查看，并通过 `CODEXAUTH 5` 切换。API 账号的配置与凭证仅保存在 `auth_registry.json` 的 `meta` 中，不再使用独立的 API 账号文件，切换时将当前 API 配置写到 `config.toml` 末尾的 `[model_providers.codexauth-third-party-api]`，并清除 CODEXAUTH 管理的其他 API provider 配置；切回 ChatGPT 时清除这些 API 配置，账号数据仍保留。
 
-如果有命令名以 `codex` 开头的 Codex 主程序正在运行，会拒绝新增、重命名、刷新、删除或切换 provider。
+如果有命令名以 `codex` 开头的 Codex 主程序正在运行，默认会拒绝新增、重命名、刷新、删除或切换到其他 provider；切换支持上述 `-f` 和同账号同步行为。
 
 ### 命令行查询
 
@@ -270,7 +304,7 @@ CODEXTOP_UPDATE --check-only  # 只检测，不更新
 
 ```text
 @JamesZhutheThird
-v3.1.3
+v3.2.0
 
 F11 / 新版本可用
 ```

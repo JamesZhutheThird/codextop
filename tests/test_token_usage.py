@@ -32,6 +32,7 @@ from quota.quota_format import (
 )
 from quota.reset_credits_cache import read_reset_credits_cache
 from quota.token_usage_cache import DailyTokenUsageCacheReader
+from quota.plans import AccountPlan, recorded_quota_multiplier
 from core.constants import HTTP_401_CREDENTIAL_HINT, HTTP_429_FALLBACK_SECONDS
 from core.i18n import t
 from core.paths import monthly_log_path
@@ -179,13 +180,34 @@ class CollectionTests(unittest.TestCase):
 
     def test_plan_labels_and_actual_quota_multipliers(self) -> None:
         self.assertEqual(account_plan({"plan": "plus"}), "Plus")
-        self.assertEqual(account_plan({"plan": "pro"}), "Pro(20x)")
+        self.assertEqual(account_plan({"plan": "pro"}), "Pro(10x)")
         self.assertEqual(account_plan({"plan": "pro-5x"}), "Pro(5x)")
         self.assertEqual(account_plan({"plan": "pro-20x"}), "Pro(20x)")
         self.assertEqual(account_quota_multiplier({"plan": "plus"}), 1)
-        self.assertEqual(account_quota_multiplier({"plan": "pro"}), 20)
+        self.assertEqual(account_quota_multiplier({"plan": "pro"}), 10)
         self.assertEqual(account_quota_multiplier({"plan": "pro-5x"}), 5)
         self.assertEqual(account_quota_multiplier({"plan": "pro-20x"}), 20)
+
+    def test_current_wire_plans_use_enum_for_parsing_labels_and_quota(self) -> None:
+        for key, multiplier, label in (
+            ("plus", 1, "Plus"),
+            ("prolite", 5, "Pro(5x)"),
+            ("pro", 10, "Pro(10x)"),
+            ("promax", 25, "ProMax(25x)"),
+        ):
+            with self.subTest(plan=key):
+                report = quota.normalize_quota_report({"plan_type": f" {key.upper()} "}, {}, "UTC")
+                self.assertEqual(report["plan_type"], key)
+                self.assertEqual(account_quota_multiplier(report), multiplier)
+                self.assertEqual(account_plan(report), label)
+        self.assertEqual(quota.normalize_plan_type("chatgptpro"), "pro")
+        self.assertEqual(quota.normalize_plan_type("pro_20x"), "pro-20x")
+        self.assertEqual(recorded_quota_multiplier({"plan": "pro-20x"}), 20)
+        self.assertEqual(recorded_quota_multiplier({"plan": "promax"}), 25)
+        self.assertIsNone(AccountPlan.UNKNOWN.multiplier)
+        self.assertEqual(quota.normalize_plan_type("future-plan"), "future-plan")
+        self.assertEqual(account_plan({"plan": "future-plan"}), "future-plan")
+        self.assertEqual(account_quota_multiplier({"plan": "future-plan"}), 1)
 
     def test_merged_plan_summary_always_shows_tier_counts_without_truncation(self) -> None:
         accounts = [
@@ -217,12 +239,19 @@ class CollectionTests(unittest.TestCase):
 
         self.assertEqual((percent["left"], percent["max_left"]), (80, 300))
         self.assertEqual((actual["left"], actual["max_left"]), (3.5, 26))
-        legacy_pro = merged_window_info(
+        current_pro = merged_window_info(
             [{"plan": "pro", "q": {"5h": [25, 2_000, 1_000, 18_000]}}],
             "5h",
             "actual",
         )
-        self.assertEqual((legacy_pro["left"], legacy_pro["max_left"]), (5, 20))
+        self.assertEqual((current_pro["left"], current_pro["max_left"]), (2.5, 10))
+        current_plans = [
+            {"plan": plan, "q": {"5h": [50, 2_000, 1_000, 18_000]}}
+            for plan in ("plus", "prolite", "pro", "promax")
+        ]
+        merged = merged_window_info(current_plans, "5h", "actual")
+        self.assertEqual((merged["left"], merged["max_left"]), (20.5, 41))
+        self.assertEqual(merged_plan_text(current_plans), "Plus x1 / Pro(5x) x1 / Pro(10x) x1 / ProMax(25x) x1")
         rendered = "\n".join(
             strip_ansi(
                 line
@@ -423,7 +452,7 @@ class CollectionTests(unittest.TestCase):
         self.assertNotIn("token_usage", bundle["accounts"][0])
         self.assertEqual(bundle["accounts"][0]["quota"]["5h"]["remaining_percent"], 80)
 
-    def test_collection_calls_quota_reset_and_account_endpoints(self) -> None:
+    def test_collection_uses_usage_plan_without_subscription_endpoint(self) -> None:
         urls: list[str] = []
 
         def fake_get_json(url: str, _token: str, *_args) -> dict:
@@ -445,31 +474,27 @@ class CollectionTests(unittest.TestCase):
         self.assertNotIn("error", account)
         self.assertEqual(
             set(urls),
-            {quota.USAGE_URL, quota.RESET_CREDITS_URL, quota.ACCOUNT_INFO_URL},
+            {quota.USAGE_URL, quota.RESET_CREDITS_URL},
         )
         self.assertEqual(account["quota"]["7d"]["remaining_percent"], 60)
 
-    def test_pro_tier_is_resolved_and_cached_once_per_day(self) -> None:
+    def test_fresh_plan_overrides_stale_subscription_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_path = Path(temp_dir) / "token_usage_daily.json"
+            cache_path.write_text(json.dumps({"accounts": {"openai-1": {
+                "account_id": "account", "plan_type": "pro-20x",
+                "subscription_plan": "chatgptprolite", "plan_checked_at_epoch": 1_000,
+            }}}))
             urls: list[str] = []
 
             def fake_get_json(url: str, _token: str, *_args) -> dict:
                 urls.append(url)
                 if url == quota.USAGE_URL:
                     payload = quota_payload()
-                    payload["plan_type"] = "pro"
+                    payload["plan_type"] = "pro" if urls.count(quota.USAGE_URL) == 1 else "promax"
                     return payload
                 if url == quota.RESET_CREDITS_URL:
                     return {"available_count": 0, "credits": []}
-                if url == quota.ACCOUNT_INFO_URL:
-                    return {
-                        "accounts": {
-                            "account": {
-                                "entitlement": {"subscription_plan": "chatgptpro"}
-                            }
-                        }
-                    }
                 return {
                     "stats": {"lifetime_tokens": 123},
                     "metadata": {"generated_at": "2026-08-22T00:00:00Z"},
@@ -494,13 +519,11 @@ class CollectionTests(unittest.TestCase):
                     observed_epoch=1_001,
                 )["accounts"][0]
 
-            self.assertEqual(first["plan_type"], "pro-20x")
-            self.assertEqual(second["plan_type"], "pro-20x")
-            self.assertEqual(urls.count(quota.ACCOUNT_INFO_URL), 1)
-            self.assertEqual(
-                quota.normalize_plan_type("pro", "chatgptprolite"),
-                "pro-5x",
-            )
+            self.assertEqual(first["plan_type"], "pro")
+            self.assertEqual(second["plan_type"], "promax")
+            self.assertEqual(account_quota_multiplier(first), 10)
+            self.assertEqual(account_quota_multiplier(second), 25)
+            self.assertEqual(set(urls), {quota.USAGE_URL, quota.RESET_CREDITS_URL, quota.TOKEN_USAGE_URL})
 
     def test_reset_credit_failure_does_not_discard_fresh_usage(self) -> None:
         def fake_get_json(url: str, _token: str, *_args) -> dict:
@@ -1682,7 +1705,7 @@ class SettingsTests(unittest.TestCase):
             choices for key, _title, choices in setting_items(state) if key == "curve_mode"
         )
         self.assertIn((t("choice.curve.fine_bar"), "fine_bar"), curve_choices)
-        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("3.1.3", "v3.1.3"))
+        self.assertEqual((PACKAGE_VERSION, APP_VERSION), ("3.2.0", "v3.2.0"))
 
 
 class TokenChartTests(unittest.TestCase):

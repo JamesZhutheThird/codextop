@@ -3,7 +3,11 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
+import pty
+import select
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -76,6 +80,198 @@ class FakeProcEntry:
 
 
 class CodexAuthProcessTests(unittest.TestCase):
+    def test_process_terminal_parses_parentheses_and_extended_device_numbers(self) -> None:
+        device = (136 << 8) | (300 & 0xff) | ((300 & ~0xff) << 12)
+        with patch.object(codex_auth.Path, "read_text", return_value=f"101 (codex ) tui) S 1 101 1 {device} 101 0"):
+            self.assertEqual(codex_auth.process_terminal(101), (os.makedev(136, 300), 101))
+
+    def test_shutdown_disables_mouse_reporting_on_real_process_terminal(self) -> None:
+        master, slave = pty.openpty()
+        # Keep a shell-like session leader alive after its foreground child exits.
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import fcntl, os, termios, time; "
+             "fcntl.ioctl(0, termios.TIOCSCTTY, 0); "
+             "child = os.fork(); "
+             "\nif child == 0: time.sleep(30); os._exit(0)"
+             "\nos.write(1, f'\\x1b[?1003h\\x1b[?1006hready:{child}\\n'.encode()); "
+             "os.waitpid(child, 0); time.sleep(30)"],
+            stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+        )
+        child = None
+        try:
+            self.assertTrue(select.select([master], [], [], 5)[0])
+            ready = os.read(master, 4096)
+            child = int(ready.split(b"ready:")[1].strip())
+
+            def running() -> list[dict]:
+                return [{"pid": child, "cmd": "isolated terminal test"}] if Path(f"/proc/{child}").exists() else []
+
+            with (
+                patch.object(codex_auth, "running_codex_processes", side_effect=running),
+                patch.object(codex_auth.subprocess, "run", return_value=CompletedProcess([], 2)),
+            ):
+                codex_auth.kill_running_codex_processes()
+            self.assertFalse(Path(f"/proc/{child}").exists())
+            self.assertTrue(select.select([master], [], [], 1)[0])
+            output = os.read(master, 4096)
+            for mode in (1000, 1002, 1003, 1004, 1005, 1006, 1015, 1016):
+                self.assertIn(f"\x1b[?{mode}l".encode(), output)
+        finally:
+            if child is not None:
+                try:
+                    os.kill(child, codex_auth.signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+            os.close(master)
+            os.close(slave)
+
+    def test_terminal_cleanup_only_resets_original_foreground_or_shell(self) -> None:
+        for foreground, command, expected in (
+            (101, ["codex"], True),
+            (202, ["/bin/zsh"], True),
+            (202, ["-bash"], True),
+            (202, ["vim"], False),
+            (202, [], False),
+        ):
+            with (
+                self.subTest(foreground=foreground, command=command),
+                patch.object(codex_auth.os, "readlink", return_value="/dev/pts/123"),
+                patch.object(codex_auth.os, "open", return_value=10),
+                patch.object(codex_auth.os, "getpgid", return_value=101),
+                patch.object(codex_auth.os, "isatty", return_value=True),
+                patch.object(codex_auth, "process_terminal", side_effect=[(123, 101), (123, foreground)]),
+                patch.object(codex_auth.os, "fstat", return_value=SimpleNamespace(st_rdev=123)),
+                patch.object(codex_auth, "command_for_pid", return_value=command),
+                patch.object(codex_auth.Path, "stat", return_value=SimpleNamespace(st_uid=os.getuid())),
+                patch.object(codex_auth.Path, "iterdir", return_value=[Path("/proc/202")]),
+                patch.object(codex_auth.os, "write") as write,
+                patch.object(codex_auth.os, "close") as close,
+            ):
+                with codex_auth.restore_codex_mouse_modes([{"pid": 101}]):
+                    pass
+                self.assertEqual(write.call_count, int(expected))
+                close.assert_called_once_with(10)
+
+    def test_terminal_cleanup_skips_background_processes(self) -> None:
+        with (
+            patch.object(codex_auth.os, "readlink", return_value="/dev/pts/123"),
+            patch.object(codex_auth.os, "open", return_value=10),
+            patch.object(codex_auth.os, "getpgid", return_value=101),
+            patch.object(codex_auth.os, "isatty", return_value=True),
+            patch.object(codex_auth, "process_terminal", return_value=(123, 202)),
+            patch.object(codex_auth.os, "write") as write,
+            patch.object(codex_auth.os, "close") as close,
+        ):
+            with codex_auth.restore_codex_mouse_modes([{"pid": 101}]):
+                pass
+            write.assert_not_called()
+            close.assert_not_called()
+
+    def test_terminal_cleanup_closes_descriptor_without_reset_on_shutdown_failure(self) -> None:
+        with (
+            patch.object(codex_auth.os, "readlink", side_effect=["/dev/pts/123", OSError(), OSError()]),
+            patch.object(codex_auth.os, "open", return_value=10),
+            patch.object(codex_auth.os, "getpgid", return_value=101),
+            patch.object(codex_auth.os, "isatty", return_value=True),
+            patch.object(codex_auth, "process_terminal", return_value=(123, 101)),
+            patch.object(codex_auth.os, "fstat", return_value=SimpleNamespace(st_rdev=123)),
+            patch.object(codex_auth.os, "write") as write,
+            patch.object(codex_auth.os, "close") as close,
+        ):
+            with self.assertRaises(codex_auth.AuthError):
+                with codex_auth.restore_codex_mouse_modes([{"pid": 101}]):
+                    raise codex_auth.AuthError("still running")
+            write.assert_not_called()
+            close.assert_called_once_with(10)
+
+    def test_shutdown_waits_for_real_isolated_process_to_exit(self) -> None:
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            def running() -> list[dict]:
+                return [{"pid": process.pid, "cmd": "isolated test process"}] if process.poll() is None else []
+
+            with (
+                patch.object(codex_auth, "running_codex_processes", side_effect=running),
+                patch.object(codex_auth.subprocess, "run", return_value=CompletedProcess([], 2)),
+            ):
+                codex_auth.kill_running_codex_processes()
+            self.assertEqual(process.wait(timeout=1), -codex_auth.signal.SIGTERM)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+
+    def test_shutdown_uses_native_command_then_normal_termination_and_waits(self) -> None:
+        processes = [{"pid": 101}, {"pid": 102}]
+        with (
+            patch.object(codex_auth, "running_codex_processes", side_effect=[processes, processes, processes, []]),
+            patch.object(codex_auth.subprocess, "run", return_value=CompletedProcess([], 0)) as run,
+            patch.object(codex_auth.os, "kill", side_effect=[None, ProcessLookupError]) as kill,
+            patch.object(codex_auth.time, "sleep") as sleep,
+        ):
+            codex_auth.kill_running_codex_processes()
+        self.assertEqual(run.call_args_list[0].args[0], ["codex", "app-server", "daemon", "stop", "--help"])
+        self.assertEqual(run.call_args_list[1].args[0], ["codex", "app-server", "daemon", "stop"])
+        self.assertEqual(run.call_args_list[1].kwargs["env"]["CODEX_HOME"], str(codex_auth.CODEX_DIR))
+        self.assertEqual(kill.call_args_list, [call(101, codex_auth.signal.SIGTERM), call(102, codex_auth.signal.SIGTERM)])
+        sleep.assert_called_once()
+
+    def test_native_shutdown_needs_no_signals_when_processes_exit(self) -> None:
+        with (
+            patch.object(codex_auth, "running_codex_processes", side_effect=[[{"pid": 101}], [], []]),
+            patch.object(codex_auth.subprocess, "run", return_value=CompletedProcess([], 0)),
+            patch.object(codex_auth.os, "kill") as kill,
+        ):
+            codex_auth.kill_running_codex_processes()
+        kill.assert_not_called()
+
+    def test_old_cli_uses_normal_termination_without_native_stop(self) -> None:
+        with (
+            patch.object(codex_auth, "running_codex_processes", side_effect=[[{"pid": 101}], [{"pid": 101}], []]),
+            patch.object(codex_auth.subprocess, "run", return_value=CompletedProcess([], 2)) as run,
+            patch.object(codex_auth.os, "kill") as kill,
+        ):
+            codex_auth.kill_running_codex_processes()
+        self.assertEqual(run.call_count, 1)
+        kill.assert_called_once_with(101, codex_auth.signal.SIGTERM)
+
+    def test_force_fails_if_processes_remain(self) -> None:
+        with (
+            patch.object(codex_auth, "running_codex_processes", return_value=[{"pid": 101, "cmd": "codex"}]),
+            patch.object(codex_auth.subprocess, "run", side_effect=FileNotFoundError),
+            patch.object(codex_auth.os, "kill") as kill,
+            patch.object(codex_auth.time, "monotonic", side_effect=[0, 6]),
+            self.assertRaises(codex_auth.AuthError),
+        ):
+            codex_auth.kill_running_codex_processes()
+        kill.assert_called_once_with(101, codex_auth.signal.SIGTERM)
+
+    def test_kill_routes_to_shared_shutdown_and_rejects_other_actions(self) -> None:
+        with patch.object(codex_auth, "kill_running_codex_processes") as shutdown, redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(codex_auth.main(["--kill", "--json"]), 0)
+        shutdown.assert_called_once_with()
+        self.assertEqual(json.loads(output.getvalue()), {"stopped": True})
+        for args in (["--kill", "2"], ["--kill", "--refresh"], ["--kill", "--new", "work"]):
+            with self.subTest(args=args), patch.object(codex_auth, "kill_running_codex_processes") as shutdown:
+                self.assertEqual(codex_auth.main(args), 1)
+                shutdown.assert_not_called()
+
+    def test_trailing_force_is_routed_for_each_provider_action(self) -> None:
+        for args, handler, expected in (
+            (["--new", "work", "-f"], "command_new", ("work", False, True)),
+            (["--new", "work", "--api", "-f"], "command_new_api", ("work", False, True)),
+            (["--refresh", "work", "-f"], "command_refresh", ("work", False, True)),
+            (["--refresh", "-f"], "command_refresh", (None, False, True)),
+            (["--delete", "work", "-f"], "command_delete", ("work", False, True)),
+            (["--rename", "work", "home", "-f"], "command_rename", ("work", "home", False, True)),
+        ):
+            with self.subTest(args=args), patch.object(codex_auth, handler, return_value=0) as operation:
+                self.assertEqual(codex_auth.main(args), 0)
+                operation.assert_called_once_with(*expected)
+
     def test_running_codex_processes_only_checks_current_user(self) -> None:
         entries = [
             FakeProcEntry("101", 1000),
@@ -223,7 +419,7 @@ class CodexAuthNewProviderTests(unittest.TestCase):
     def test_main_routes_new_option(self) -> None:
         with patch.object(codex_auth, "command_new", return_value=0) as command_new:
             self.assertEqual(codex_auth.main(["--new", "4"]), 0)
-        command_new.assert_called_once_with("4", False)
+        command_new.assert_called_once_with("4", False, False)
 
 
 class CodexAuthProviderMutationTests(unittest.TestCase):
@@ -442,11 +638,11 @@ class CodexAuthProviderMutationTests(unittest.TestCase):
     def test_main_routes_refresh_and_delete_options(self) -> None:
         with patch.object(codex_auth, "command_refresh", return_value=0) as refresh:
             self.assertEqual(codex_auth.main(["--refresh"]), 0)
-        refresh.assert_called_once_with(None, False)
+        refresh.assert_called_once_with(None, False, False)
 
         with patch.object(codex_auth, "command_delete", return_value=0) as delete:
             self.assertEqual(codex_auth.main(["--json", "--delete", "openai-2"]), 0)
-        delete.assert_called_once_with("openai-2", True)
+        delete.assert_called_once_with("openai-2", True, False)
 
 
 class CodexAuthApiAndRenameTests(unittest.TestCase):
@@ -470,6 +666,55 @@ class CodexAuthApiAndRenameTests(unittest.TestCase):
         )
         self.paths.config_file.write_text(self.original_config)
         codex_auth.write_provider_config("openai", "openai-1")
+
+    def test_same_target_syncs_live_auth_without_process_checks_or_active_writes(self) -> None:
+        refreshed = auth_payload("owner@example.com", "refreshed")
+        codex_auth.atomic_write_json(self.paths.active_auth_file, refreshed)
+        for args in (["1"], ["switch", "openai-1", "-f"], ["-f", "openai"]):
+            with (
+                self.subTest(args=args),
+                patch.object(codex_auth, "running_codex_processes") as processes,
+                patch.object(codex_auth, "assert_no_running_codex_processes") as guard,
+                patch.object(codex_auth, "kill_running_codex_processes") as shutdown,
+                patch.object(codex_auth, "switch_auth") as switch,
+                patch.object(codex_auth, "request_sampler_refresh") as refresh,
+            ):
+                self.assertEqual(codex_auth.main(args), 0)
+                processes.assert_not_called()
+                guard.assert_not_called()
+                if "-f" in args:
+                    shutdown.assert_called_once_with()
+                else:
+                    shutdown.assert_not_called()
+                switch.assert_not_called()
+                refresh.assert_called_once_with()
+                self.assertEqual(codex_auth.read_auth_payload(codex_auth.auth_file("openai-1")), refreshed)
+                self.assertEqual(self.paths.config_file.read_text(), self.original_config)
+                self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file), refreshed)
+
+    def test_switch_requires_idle_processes_unless_forced(self) -> None:
+        target = auth_payload("other@example.com", "other")
+        codex_auth.atomic_write_json(codex_auth.auth_file("openai-2"), target)
+        with patch.object(codex_auth, "assert_no_running_codex_processes", side_effect=codex_auth.AuthError("running")):
+            self.assertEqual(codex_auth.main(["2"]), 1)
+            self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file), self.chatgpt)
+            with patch.object(codex_auth, "kill_running_codex_processes") as kill:
+                kill.side_effect = lambda: self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file), self.chatgpt)
+                self.assertEqual(codex_auth.main(["-f", "2"]), 0)
+                kill.assert_called_once_with()
+        self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file), target)
+
+    def test_force_errors_leave_auth_unchanged(self) -> None:
+        codex_auth.atomic_write_json(codex_auth.auth_file("openai-2"), auth_payload("other@example.com", "other"))
+        with patch.object(codex_auth, "kill_running_codex_processes", side_effect=PermissionError("denied")) as kill:
+            self.assertEqual(codex_auth.main(["-f", "missing"]), 1)
+            kill.assert_not_called()
+            self.assertEqual(codex_auth.main(["switch", "2", "-f"]), 1)
+            kill.assert_called_once_with()
+        self.assertEqual(codex_auth.read_auth_payload(self.paths.active_auth_file), self.chatgpt)
+        self.assertEqual(codex_auth.read_current_provider(), "openai-1")
+        for args in (["-f"], ["-f", "sync"]):
+            self.assertEqual(codex_auth.main(args), 1)
 
     def add_api(self, name: str = "my-api", *, key_env: str | None = None) -> dict:
         payload = {"auth_mode": "apikey", "base_url": "https://example.com/v1", "wire_api": "responses"}

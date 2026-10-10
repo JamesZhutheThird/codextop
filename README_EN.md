@@ -223,11 +223,45 @@ CODEXAUTH switch my-api
 CODEXAUTH 5                       # API account number
 ```
 
+Use `CODEXAUTH [--new/--refresh/--delete/--rename/...] provider_name [...] -f`. Existing `switch` commands and numeric targets remain supported.
+
+```bash
+CODEXAUTH work -f
+CODEXAUTH --new work -f
+CODEXAUTH --new my-api --api -f
+CODEXAUTH --refresh work -f
+CODEXAUTH --rename work home -f
+CODEXAUTH --delete home -f
+CODEXAUTH --kill                  # Stop all Codex processes owned by the current user
+```
+
+`--kill` and `-f` share a shutdown flow: run `codex app-server daemon stop` when supported, then send `SIGTERM` to remaining standalone processes and wait for exit. No `SIGKILL` is used. If processes remain, the operation fails before changing accounts. `--delete -f` still requires full-ID confirmation.
+
+Before shutdown, the foreground Codex terminals are recorded. After successful exit, mouse and focus reporting are disabled on those terminals to prevent characters such as `35;23;47M` appearing when a tmux pane returns to its shell. Background processes and terminals running another foreground application are skipped; closed or inaccessible terminals do not block account operations.
+
+When the target is already current without `-f`, process checks are skipped, the active ChatGPT `auth.json` is copied into the account slot, and a CODEXTOP sampler refresh is requested. API sources reapply their saved credential configuration. With `-f`, the shared shutdown flow runs first.
+
 For a numeric target, CodexTOP looks for `auth-1.json` first and then `auth-openai-1.json`. If the target does not exist, the error includes the matching `CODEXAUTH --new ...` command.
+
+Use the optional `--transfer [-d DURATION | -s SESSION_ID]` to migrate historical session provider markers. Enabling it without a selector defaults to `1h`; omitting the flag leaves sessions untouched.
+
+```bash
+CODEXAUTH work --transfer -f          # Migrate recent 1h sessions when the internal provider id changes
+CODEXAUTH work --transfer -d 12h -f
+CODEXAUTH work --transfer -d 7d -f
+CODEXAUTH work --transfer -d all -f
+CODEXAUTH work --transfer -s SESSION_UUID -f  # Migrate or repair one session
+CODEXAUTH --transfer -s SESSION_UUID -f       # Migrate to the current provider without switching accounts
+CODEXAUTH --transfer -d 1h -f
+```
+
+Ranges use SQLite's last activity time, with rollout modification time for unindexed legacy sessions. Attached batch migration runs only when the internal `model_provider` changes and selects sessions belonging to the previous provider. Standalone migration assigns all selected sessions to the current provider. A full UUID ignores time limits. Archived sessions are included.
+
+Migration updates both rollout `session_meta.model_provider` and the SQLite index, preserving messages and activity timestamps. Original markers are backed up under `~/.codex/codextop/session_provider_backups/`; the backup path is printed, and `--json` includes `session_provider_update`. Codex must be stopped before migration; use `-f` for the shared shutdown flow.
 
 API accounts are numbered after existing numeric accounts. Run `CODEXAUTH list` to see the numbers and `CODEXAUTH 5` to switch. API sources store configuration and credentials only in the `meta` fields of `auth_registry.json`, without separate API account files; switching writes the active API configuration to `[model_providers.codexauth-third-party-api]` at the end of `config.toml` and removes other CODEXAUTH-managed API provider blocks. Switching back to ChatGPT removes those API blocks while retaining account data.
 
-CodexTOP refuses to add, rename, refresh, delete, or switch providers while a Codex process whose command name starts with `codex` is running.
+By default, CodexTOP refuses to add, rename, refresh, delete, or switch to a different provider while a Codex process whose command name starts with `codex` is running. Switching supports the force and same-target behavior described above.
 
 ### Command-line queries
 
@@ -251,7 +285,7 @@ The first time you open `CODEXTOP` each day, it reads the GitHub latest release 
 
 ```text
 @JamesZhutheThird
-v3.1.3
+v3.2.0
 
 F11 / New version
 ```

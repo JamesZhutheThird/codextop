@@ -11,6 +11,7 @@ import argparse
 import json
 import re
 import sys
+from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +51,7 @@ from quota.token_usage_cache import (
     write_token_usage_cache,
 )
 from quota.windows import WINDOW_SECONDS, window_key_for_seconds
+from quota.plans import normalize_plan_type
 from ui import color_schemes
 
 
@@ -57,7 +59,6 @@ CHATGPT_BACKEND = "https://chatgpt.com/backend-api"
 USAGE_URL = f"{CHATGPT_BACKEND}/wham/usage"
 RESET_CREDITS_URL = f"{CHATGPT_BACKEND}/wham/rate-limit-reset-credits"
 TOKEN_USAGE_URL = f"{CHATGPT_BACKEND}/wham/profiles/me"
-ACCOUNT_INFO_URL = f"{CHATGPT_BACKEND}/accounts/check/v4-2023-04-27"
 AUTH_FILE_RE = re.compile(r"auth-([A-Za-z0-9][A-Za-z0-9_.-]*)\.json$")
 MAX_QUERY_WORKERS = 8
 DEFAULT_PATHS = default_paths()
@@ -311,49 +312,10 @@ def normalize_token_usage(payload: Any) -> dict[str, Any]:
     }
 
 
-def account_subscription_plan(payload: Any, account_id: str | None) -> str | None:
-    accounts = payload.get("accounts") if isinstance(payload, dict) else None
-    if not isinstance(accounts, dict) or not accounts:
-        return None
-    account = accounts.get(account_id) if account_id else None
-    if not isinstance(account, dict) and len(accounts) == 1:
-        account = next(iter(accounts.values()))
-    entitlement = account.get("entitlement") if isinstance(account, dict) else None
-    plan = entitlement.get("subscription_plan") if isinstance(entitlement, dict) else None
-    return plan.strip().lower() if isinstance(plan, str) and plan.strip() else None
-
-
-def normalize_plan_type(plan_type: Any, subscription_plan: Any = None) -> str | None:
-    raw = plan_type.strip().lower() if isinstance(plan_type, str) and plan_type.strip() else None
-    subscription = (
-        subscription_plan.strip().lower()
-        if isinstance(subscription_plan, str) and subscription_plan.strip()
-        else None
-    )
-    if raw == "pro":
-        if subscription == "chatgptprolite":
-            return "pro-5x"
-        if subscription == "chatgptpro":
-            return "pro-20x"
-    return raw
-
-
-def account_plan_query_due(
-    entry: dict[str, Any] | None,
-    observed_epoch: int,
-    ttl_seconds: int = TOKEN_USAGE_CACHE_TTL_SECONDS,
-) -> bool:
-    checked_at = entry.get("plan_checked_at_epoch") if isinstance(entry, dict) else None
-    if not isinstance(checked_at, (int, float)):
-        return True
-    return observed_epoch < checked_at or observed_epoch - checked_at >= max(1, ttl_seconds)
-
-
 def normalize_quota_report(
     usage: Any,
     credits_payload: Any,
     tz_name: str,
-    subscription_plan: str | None = None,
 ) -> dict[str, Any]:
     tz = ZoneInfo(tz_name)
     rate_limit = usage.get("rate_limit", {}) if isinstance(usage, dict) else {}
@@ -369,13 +331,16 @@ def normalize_quota_report(
         "email": usage.get("email") if isinstance(usage, dict) else None,
         "plan_type": normalize_plan_type(
             usage.get("plan_type") if isinstance(usage, dict) else None,
-            subscription_plan,
         ),
         "allowed": rate_limit.get("allowed") if isinstance(rate_limit, dict) else None,
         "limit_reached": rate_limit.get("limit_reached")
         if isinstance(rate_limit, dict)
         else None,
         "quota": normalize_rate_limit_windows(rate_limit, tz),
+        "credits": {
+            key: usage["credits"].get(key)
+            for key in ("has_credits", "unlimited", "balance")
+        } if isinstance(usage, dict) and isinstance(usage.get("credits"), dict) else None,
         "reset_credits": {
             "available_count": credits_payload.get("available_count")
             if isinstance(credits_payload, dict)
@@ -390,33 +355,23 @@ def normalize_quota_report(
 
 
 def collect_quota(auth_path: Path, tz_name: str) -> dict[str, Any]:
-    access_token, account_id = load_auth_credentials(auth_path)
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    access_token, _account_id = load_auth_credentials(auth_path)
+    with ThreadPoolExecutor(max_workers=2) as executor:
         usage_future = executor.submit(get_json, USAGE_URL, access_token)
         credits_future = executor.submit(get_json, RESET_CREDITS_URL, access_token)
-        account_future = executor.submit(get_json, ACCOUNT_INFO_URL, access_token)
         reset_credits_error = None
         try:
             credits_payload = sanitize_reset_credits_payload(credits_future.result())
         except Exception as exc:
             credits_payload = {}
             reset_credits_error = str(exc)
-        plan_type_error = None
-        try:
-            subscription_plan = account_subscription_plan(account_future.result(), account_id)
-        except Exception as exc:
-            subscription_plan = None
-            plan_type_error = str(exc)
         report = normalize_quota_report(
             usage_future.result(),
             credits_payload,
             tz_name,
-            subscription_plan,
         )
         if reset_credits_error:
             report["reset_credits_error"] = reset_credits_error
-        if plan_type_error:
-            report["plan_type_error"] = plan_type_error
         return report
 
 
@@ -566,7 +521,7 @@ def collect_accounts(
         else None
     )
     reset_cache_accounts = reset_cache.get("accounts") if isinstance(reset_cache, dict) else None
-    request_count = max(1, len(configs) * 4)
+    request_count = max(1, len(configs) * 3)
     cache_changed = False
     reset_cache_changed = False
     with ThreadPoolExecutor(max_workers=min(MAX_QUERY_WORKERS, request_count)) as executor:
@@ -585,7 +540,7 @@ def collect_accounts(
                 access_token, account_id = load_auth_credentials(path)
             except Exception as exc:
                 if isinstance(raw_cache_entry, dict):
-                    for key in ("email", "plan_type", "subscription_plan"):
+                    for key in ("email", "plan_type"):
                         if raw_cache_entry.get(key):
                             report[key] = raw_cache_entry[key]
                 report["error"] = str(exc)
@@ -597,19 +552,12 @@ def collect_accounts(
                 else None
             )
             if isinstance(cache_entry, dict):
-                for key in ("email", "plan_type", "subscription_plan"):
+                for key in ("email", "plan_type"):
                     if cache_entry.get(key):
                         report[key] = cache_entry[key]
             cached_usage = cached_token_usage(cache_entry)
             if cached_usage is not None:
                 report["token_usage"] = cached_usage
-            plan_future = None
-            if token_cache is None or account_plan_query_due(
-                cache_entry,
-                observed_epoch,
-                token_cache_ttl_seconds,
-            ):
-                plan_future = executor.submit(get_json, ACCOUNT_INFO_URL, access_token)
             token_future = None
             if token_cache is not None and token_usage_query_due(
                 cache_entry,
@@ -650,36 +598,12 @@ def collect_accounts(
                     "reset_payload": reset_payload,
                     "usage": executor.submit(get_json, USAGE_URL, access_token),
                     "credits": credits_future,
-                    "plan": plan_future,
                     "tokens": token_future,
                 }
             )
 
         for entry in entries:
             report = entry["report"]
-            plan_future = entry.get("plan")
-            if plan_future is not None:
-                try:
-                    subscription_plan = account_subscription_plan(
-                        plan_future.result(),
-                        entry.get("account_id"),
-                    )
-                    if subscription_plan:
-                        report["subscription_plan"] = subscription_plan
-                except Exception as exc:
-                    report["plan_type_error"] = str(exc)
-                if isinstance(cache_accounts, dict):
-                    stored_entry = cache_accounts.get(str(entry["index"]))
-                    if not isinstance(stored_entry, dict):
-                        stored_entry = entry.get("cache_entry")
-                    updated_entry = dict(stored_entry) if isinstance(stored_entry, dict) else {}
-                    if entry.get("account_id"):
-                        updated_entry["account_id"] = entry["account_id"]
-                    updated_entry["plan_checked_at_epoch"] = observed_epoch
-                    if report.get("subscription_plan"):
-                        updated_entry["subscription_plan"] = report["subscription_plan"]
-                    cache_accounts[str(entry["index"])] = updated_entry
-                    cache_changed = True
             token_future = entry.get("tokens")
             if token_future is not None and isinstance(cache_accounts, dict):
                 cache_changed = True
@@ -693,7 +617,7 @@ def collect_accounts(
                 existing_usage = cached_token_usage(cache_entry)
                 if existing_usage is not None:
                     updated_entry["token_usage"] = existing_usage
-                for key in ("email", "plan_type", "subscription_plan"):
+                for key in ("email", "plan_type"):
                     if report.get(key):
                         updated_entry[key] = report[key]
                 try:
@@ -734,9 +658,8 @@ def collect_accounts(
                     usage_future.result(),
                     reset_payload if isinstance(reset_payload, dict) else {},
                     tz_name,
-                    report.get("subscription_plan"),
                 )
-                for key in ("email", "plan_type", "subscription_plan"):
+                for key in ("email", "plan_type"):
                     if not normalized.get(key) and report.get(key):
                         normalized[key] = report[key]
                 report.update(normalized)
@@ -750,7 +673,7 @@ def collect_accounts(
                 updated_entry = dict(stored_entry) if isinstance(stored_entry, dict) else {}
                 if entry.get("account_id"):
                     updated_entry["account_id"] = entry["account_id"]
-                for key in ("email", "plan_type", "subscription_plan"):
+                for key in ("email", "plan_type"):
                     if report.get(key):
                         updated_entry[key] = report[key]
                 if updated_entry != stored_entry:
@@ -839,6 +762,9 @@ def print_text(report: dict[str, Any]) -> None:
     print(f"{t('quota.plain.email')}: {report.get('email')}")
     print(f"{t('quota.plain.plan_type')}: {report.get('plan_type')}")
     print(f"{t('quota.plain.total_usage')}: {lifetime_token_text(report)}")
+    balance = credit_balance_text(report)
+    if balance:
+        print(f"{t('quota.credit_balance')}: {balance}")
     print(f"{t('quota.plain.allowed')}: {report.get('allowed')}")
     print(f"{t('quota.plain.limit_reached')}: {report.get('limit_reached')}")
     print()
@@ -997,6 +923,21 @@ def truncate_text(value: Any, max_width: int) -> str:
     return f"{text[:head]}...{text[-tail:]}"
 
 
+def credit_balance_text(account: dict[str, Any]) -> str | None:
+    credits = account.get("credits")
+    raw = credits.get("balance") if isinstance(credits, dict) else None
+    if not isinstance(raw, (str, int, float)) or isinstance(raw, bool):
+        return None
+    try:
+        balance = Decimal(str(raw))
+    except InvalidOperation:
+        return None
+    if not balance.is_finite() or balance == 0:
+        return None
+    text = format(balance, ",f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
 def lifetime_token_text(account: dict[str, Any]) -> str:
     token_usage = account.get("token_usage")
     value = token_usage.get("lifetime_tokens") if isinstance(token_usage, dict) else None
@@ -1016,6 +957,9 @@ def make_identity_section(account: dict[str, Any], panel_width: int) -> "Table":
     table.add_row(labels[0], truncate_text(account.get("email"), email_width))
     table.add_row(labels[1], str(account.get("plan_type") or "-"))
     table.add_row(labels[2], lifetime_token_text(account))
+    balance = credit_balance_text(account)
+    if balance:
+        table.add_row(t("quota.credit_balance"), balance)
     return table
 
 

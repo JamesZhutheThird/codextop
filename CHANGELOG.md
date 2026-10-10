@@ -1,5 +1,15 @@
 # 更新日志
 
+## v3.2.0 - 2026-10-10
+
+- 新增额度点数查询。
+- 更新账号类型与额度倍率：Plus=1、ProLite=5、Pro=10、ProMax=25。兼容旧 `pro-20x` 历史记录，并补充 Business、Enterprise、Edu 等类型。
+- 账号类型直接读取用量接口，移除额外的订阅详情查询，减少请求并避免该接口的 HTTP 403 报错。
+- `CODEXAUTH` 新增 `-f/--force` 和 `--kill`，支持在账号操作前关闭当前用户的 Codex 进程。
+- 切换到当前账号且不带 `-f` 时，无需退出 Codex 即可同步当前 ChatGPT 凭证并刷新采样器。
+- 新增可选 `--transfer` 会话 provider 标记迁移，支持 `-d all/Nh/Nd`（默认 `1h`）或 `-s SESSION_UUID`，可随账号操作执行或独立迁移到当前 provider。同步更新 rollout 和 SQLite 索引，备份原标记，保留消息内容与活动时间。
+- 修复在tmux中使用 `CODEXAUTH -f` 强制终止进程导致终端显示异常乱码的问题。
+
 ## v3.1.3 - 2026-09-12
 
 - 修复环境变量 API 登录：provider 配置使用 `env_key`，不再将密钥写入 `auth.json`。

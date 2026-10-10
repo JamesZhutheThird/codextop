@@ -4,15 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import io
 import base64
 import json
 import os
 import re
 import shutil
+import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
+import time
+from contextlib import contextmanager, redirect_stdout
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -768,6 +772,130 @@ def assert_no_running_codex_processes() -> None:
     raise AuthError(t("auth.switch_refused_running", processes=rendered))
 
 
+def process_terminal(pid: int) -> tuple[int, int]:
+    # /proc works across sessions; tcgetpgrp rejects another pane's controlling TTY.
+    fields = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
+    device = int(fields[4]) & 0xffffffff
+    return os.makedev((device >> 8) & 0xfff, (device & 0xff) | ((device >> 12) & 0xfff00)), int(fields[5])
+
+
+@contextmanager
+def restore_codex_mouse_modes(processes: list[dict[str, Any]]):
+    terminals: dict[int, tuple[int, int]] = {}
+    try:
+        for process in processes:
+            try:
+                terminal, foreground = process_terminal(process["pid"])
+                if terminal == 0 or foreground != os.getpgid(process["pid"]):
+                    continue
+            except (OSError, ValueError, IndexError):
+                continue
+            if terminal in terminals:
+                continue
+            for number in (0, 1, 2):
+                fd = None
+                try:
+                    path = os.readlink(f"/proc/{process['pid']}/fd/{number}")
+                    if not re.fullmatch(r"/dev/(?:pts/\d+|tty\d+)", path):
+                        continue
+                    fd = os.open(path, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+                    if os.isatty(fd) and os.fstat(fd).st_rdev == terminal:
+                        terminals[terminal] = (fd, foreground)
+                        fd = None
+                        break
+                except OSError:
+                    pass
+                finally:
+                    if fd is not None:
+                        os.close(fd)
+        yield
+        foreground_groups = {}
+        if terminals:
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    if entry.stat().st_uid == os.getuid():
+                        terminal, foreground = process_terminal(int(entry.name))
+                        if terminal in terminals:
+                            foreground_groups[terminal] = foreground
+                except (OSError, ValueError, IndexError):
+                    pass
+        for terminal, (fd, group) in terminals.items():
+            foreground = foreground_groups.get(terminal)
+            if foreground is None:
+                continue
+            if foreground != group:
+                args = command_for_pid(foreground)
+                # The shell may have reclaimed the pane; do not reset a new foreground app.
+                if not args or Path(args[0]).name.lstrip("-") not in {
+                    "bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh",
+                }:
+                    continue
+            try:
+                os.write(
+                    fd,
+                    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l"
+                    b"\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l",
+                )
+            except OSError:
+                # A closed pane must not prevent an otherwise successful account change.
+                pass
+    finally:
+        for fd, _ in terminals.values():
+            os.close(fd)
+
+
+def kill_running_codex_processes() -> None:
+    processes = running_codex_processes()
+    if not processes:
+        return
+    with restore_codex_mouse_modes(processes):
+        stop_codex_processes()
+
+
+def stop_codex_processes() -> None:
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(CODEX_DIR)
+    command = ["codex", "app-server", "daemon", "stop"]
+    try:
+        supported = subprocess.run(
+            [*command, "--help"], env=env, capture_output=True, text=True, timeout=5, check=False,
+        )
+        if supported.returncode == 0:
+            subprocess.run(command, env=env, capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        # Older CLIs and independent sessions still support normal OS termination.
+        pass
+    for process in running_codex_processes():
+        try:
+            os.kill(process["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 5
+    while running_codex_processes():
+        if time.monotonic() >= deadline:
+            assert_no_running_codex_processes()
+            return
+        time.sleep(0.05)
+
+
+def prepare_auth_change(force: bool) -> None:
+    if force:
+        kill_running_codex_processes()
+    else:
+        assert_no_running_codex_processes()
+
+
+def command_kill(as_json: bool) -> int:
+    kill_running_codex_processes()
+    if as_json:
+        print(json.dumps({"stopped": True}))
+    else:
+        print(t("auth.codex_stopped"))
+    return 0
+
+
 def run_device_login(login_home: Path) -> str:
     env = os.environ.copy()
     env["CODEX_HOME"] = str(login_home)
@@ -856,11 +984,11 @@ def command_sync(as_json: bool) -> int:
     return 0
 
 
-def command_new(target: str, as_json: bool) -> int:
+def command_new(target: str, as_json: bool, force: bool = False) -> int:
     keyword = normalize_new_auth_target(target)
     target_auth_file = auth_file(keyword)
     assert_available_target(keyword)
-    assert_no_running_codex_processes()
+    prepare_auth_change(force)
 
     output = sys.stderr if as_json else sys.stdout
     print(
@@ -897,10 +1025,10 @@ def assert_available_target(keyword: str) -> None:
         raise AuthError(t("auth.provider_exists", provider=keyword))
 
 
-def command_new_api(target: str, as_json: bool) -> int:
+def command_new_api(target: str, as_json: bool, force: bool = False) -> int:
     keyword = normalize_new_auth_target(target)
     assert_available_target(keyword)
-    assert_no_running_codex_processes()
+    prepare_auth_change(force)
     meta = prompt_api_source(keyword)
     api_auth_payload(meta)
     meta["base_url"] = validate_api_base_url(meta.get("base_url", DEFAULT_API_BASE_URL))
@@ -920,13 +1048,13 @@ def command_new_api(target: str, as_json: bool) -> int:
     return 0
 
 
-def command_rename(target: str, new_target: str, as_json: bool) -> int:
+def command_rename(target: str, new_target: str, as_json: bool, force: bool = False) -> int:
     keyword = resolve_auth_target(target)
     new_keyword = normalize_new_auth_target(new_target)
     assert_available_target(new_keyword)
     if backup_dir_for(new_keyword).exists():
         raise AuthError(t("auth.provider_exists", provider=new_keyword))
-    assert_no_running_codex_processes()
+    prepare_auth_change(force)
     old_path, new_path = auth_file(keyword), auth_file(new_keyword)
     current = read_current_provider()
     provider = read_model_provider()
@@ -956,13 +1084,13 @@ def command_rename(target: str, new_target: str, as_json: bool) -> int:
     return 0
 
 
-def command_refresh(target: str | None, as_json: bool) -> int:
+def command_refresh(target: str | None, as_json: bool, force: bool = False) -> int:
     keyword = resolve_existing_auth_target(target)
     target_auth_file = auth_file(keyword)
     if read_auth_account(keyword)["auth_type"] == "api":
         raise AuthError(t("auth.api_refresh_unsupported"))
     existing_email = auth_email(target_auth_file)
-    assert_no_running_codex_processes()
+    prepare_auth_change(force)
 
     output = sys.stderr if as_json else sys.stdout
     print(t("auth.refresh_intro", provider=keyword), file=output, flush=True)
@@ -1018,10 +1146,10 @@ def confirm_provider_deletion(keyword: str) -> None:
         raise AuthError(t("auth.delete_confirmation_mismatch", provider=keyword))
 
 
-def command_delete(target: str | None, as_json: bool) -> int:
+def command_delete(target: str | None, as_json: bool, force: bool = False) -> int:
     keyword = resolve_existing_auth_target(target)
     target_auth_file = auth_file(keyword)
-    assert_no_running_codex_processes()
+    prepare_auth_change(force)
     confirm_provider_deletion(keyword)
     api = read_auth_account(keyword)["auth_type"] == "api"
 
@@ -1065,16 +1193,26 @@ def command_delete(target: str | None, as_json: bool) -> int:
     return 0
 
 
-def command_switch(target: str, as_json: bool) -> int:
+def command_switch(target: str, as_json: bool, force: bool = False) -> int:
     value = target.strip().lower()
     target_provider = None
     if value != "openai":
         target_provider = resolve_auth_target(value)
-    assert_no_running_codex_processes()
-    before = sync_registry()
     current_provider = read_current_provider()
+    same_target = current_provider is not None and (
+        target_provider == current_provider
+        or (value == "openai" and read_model_provider() == "openai")
+    )
+    if force or not same_target:
+        prepare_auth_change(force)
+    before = sync_registry()
 
-    if value == "openai":
+    if same_target:
+        if read_auth_account(current_provider)["auth_type"] == "api":
+            switch_auth(current_provider)
+        else:
+            save_active_auth(current_provider)
+    elif value == "openai":
         if current_provider in numbered_accounts() and read_auth_account(current_provider)["auth_type"] == "api":
             current_provider = next(
                 (name for name, _ in discover_auth_files()
@@ -1091,6 +1229,7 @@ def command_switch(target: str, as_json: bool) -> int:
         switch_auth(target_provider or value)
 
     after = sync_registry()
+    request_sampler_refresh()
     if as_json:
         print(json.dumps(after, ensure_ascii=False, indent=2))
     else:
@@ -1099,8 +1238,17 @@ def command_switch(target: str, as_json: bool) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=t("auth.arg.description"))
+    parser = argparse.ArgumentParser(
+        prog="CODEXAUTH", description=t("auth.arg.description"),
+        usage="%(prog)s [--new/--refresh/--delete/--rename/...] [PROVIDER ...] [-f] [--transfer [-d DURATION | -s SESSION_ID]] [--json]",
+    )
+    parser.add_argument("-f", "--force", action="store_true", help=t("auth.arg.force"))
     parser.add_argument("--json", action="store_true", help=t("auth.arg.json"))
+    parser.add_argument("--kill", action="store_true", help=t("auth.arg.kill"))
+    parser.add_argument("--transfer", action="store_true", help=t("auth.arg.transfer"))
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("-d", "--duration", metavar="DURATION", help=t("auth.arg.duration"))
+    selection.add_argument("-s", "--session", dest="session_id", metavar="SESSION_ID", help=t("auth.arg.session"))
     parser.add_argument("--new", metavar="TARGET", help=t("auth.arg.new"))
     parser.add_argument("--api", action="store_true", help=t("auth.arg.api"))
     parser.add_argument("--rename", nargs=2, metavar=("PROVIDER", "NEW_NAME"), help=t("auth.arg.rename"))
@@ -1124,7 +1272,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def dispatch(argv: list[str] | None = None) -> int:
     activate_saved_language(PATHS.log_dir / "codextop_state.json")
     args = build_parser().parse_args(argv)
 
@@ -1133,22 +1281,27 @@ def main(argv: list[str] | None = None) -> int:
             option is not None
             for option in (args.new, args.refresh, args.delete_target, args.rename)
         )
+        action_count += int(args.kill)
+        if args.force and not action_count and args.command in {None, "current", "list", "sync"}:
+            raise AuthError(t("auth.force_requires_switch"))
         if action_count > 1:
             raise AuthError(t("auth.action_conflict"))
         if action_count and (args.command is not None or args.target is not None):
             raise AuthError(t("auth.action_conflict"))
         if args.api and args.new is None:
             raise AuthError(t("auth.api_requires_new"))
+        if args.kill:
+            return command_kill(args.json)
         if args.new is not None:
             if args.api:
-                return command_new_api(args.new, args.json)
-            return command_new(args.new, args.json)
+                return command_new_api(args.new, args.json, args.force)
+            return command_new(args.new, args.json, args.force)
         if args.rename is not None:
-            return command_rename(*args.rename, args.json)
+            return command_rename(*args.rename, args.json, args.force)
         if args.refresh is not None:
-            return command_refresh(args.refresh or None, args.json)
+            return command_refresh(args.refresh or None, args.json, args.force)
         if args.delete_target is not None:
-            return command_delete(args.delete_target or None, args.json)
+            return command_delete(args.delete_target or None, args.json, args.force)
         if not args.command:
             return command_current(args.json)
         if args.command == "current":
@@ -1160,11 +1313,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "switch":
             if not args.target:
                 raise AuthError(t("auth.missing_switch_target"))
-            return command_switch(args.target, args.json)
+            return command_switch(args.target, args.json, args.force)
 
         if args.target is not None:
             raise AuthError(t("auth.unexpected_argument", argument=args.target))
-        return command_switch(args.command, args.json)
+        return command_switch(args.command, args.json, args.force)
     except AuthError as exc:
         from rich.console import Console
         from rich.text import Text
@@ -1175,6 +1328,71 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except OSError as exc:
         print(t("common.error_message", error=t("auth.io_error", error=exc.strerror)), file=sys.stderr)
+        return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    activate_saved_language(PATHS.log_dir / "codextop_state.json")
+    args = build_parser().parse_args(argv)
+    if not args.transfer:
+        if args.duration is not None or args.session_id is not None:
+            print(t("common.error_message", error=t("auth.transfer_required")), file=sys.stderr)
+            return 1
+        return dispatch(argv)
+    from auth.session_provider import SessionProviderUpdate, session_selector
+
+    try:
+        if args.kill or args.command in {"list", "current", "sync"}:
+            raise AuthError(t("auth.sessions_conflict"))
+        standalone = args.command is None and all(
+            value is None for value in (args.new, args.refresh, args.delete_target, args.rename)
+        )
+        if standalone and (args.api or args.target):
+            raise AuthError(t("auth.sessions_conflict"))
+        original_provider = read_model_provider()
+        selector = args.session_id or args.duration or "1h"
+        session_id, _cutoff = session_selector(selector)
+        if (args.session_id is not None and session_id is None) or (args.duration is not None and session_id is not None):
+            raise AuthError(t("auth.transfer_selector_invalid"))
+        SessionProviderUpdate(
+            CODEX_DIR, selector,
+            source=original_provider if not standalone and session_id is None else None,
+        )
+        # Same-account sync normally skips this check; metadata migration cannot.
+        if not args.force:
+            assert_no_running_codex_processes()
+        output = io.StringIO()
+        with preserve_auth_state(), redirect_stdout(output):
+            if standalone:
+                prepare_auth_change(args.force)
+                result = 0
+            else:
+                result = dispatch(argv)
+            if result != 0:
+                return result
+            provider = read_model_provider()
+            if provider in {"unset", "unknown"}:
+                raise AuthError(t("auth.sessions_no_provider"))
+            update = SessionProviderUpdate(
+                CODEX_DIR, selector,
+                source=original_provider if not standalone and session_id is None else None,
+            )
+            summary = (
+                update.apply(provider) if standalone or session_id is not None or provider != original_provider
+                else {"updated": 0, "provider": provider, "backup": None}
+            )
+        if args.json:
+            payload = json.loads(output.getvalue()) if output.getvalue().strip() else {}
+            payload["session_provider_update"] = summary
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(output.getvalue(), end="")
+            print(t("auth.sessions_updated", count=summary["updated"], provider=provider))
+            if summary["backup"]:
+                print(t("auth.sessions_backup", path=summary["backup"]))
+        return 0
+    except (AuthError, ValueError, OSError, sqlite3.Error) as exc:
+        print(t("common.error_message", error=str(exc)), file=sys.stderr)
         return 1
 
 

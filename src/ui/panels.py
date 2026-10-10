@@ -70,6 +70,9 @@ def account_lines(
     )
     for line in token_usage_rows(account_lifetime_tokens(account), inner_width - 2):
         add_text(line)
+    balance = quota.credit_balance_text(account)
+    if balance:
+        add_text(f"{paint(t('quota.credit_balance'), 'dim')} {balance}")
     if error:
         add_section(t("common.error"))
         for error_line in plain_wrap(error, inner_width - 2):
@@ -143,6 +146,9 @@ def account_summary_body(
     )
     for line in token_usage_rows(account_lifetime_tokens(account), inner_width - 2):
         add_text(line)
+    balance = quota.credit_balance_text(account)
+    if balance:
+        add_text(f"{paint(t('quota.credit_balance'), 'dim')} {balance}")
 
     error = account_error(account)
     if error:
@@ -245,6 +251,10 @@ def merged_account_reset_body(
         add_text(f"{label} {line}")
     for line in token_usage_rows(merged_lifetime_tokens(accounts), inner_width - 2):
         add_text(line)
+    for account in accounts:
+        balance = quota.credit_balance_text(account)
+        if balance:
+            add_text(f"{paint(t('quota.credit_balance'), 'dim')} {account_index(account)}: {balance}")
     add_text(
         f"{paint(t('account.current'), 'dim')} "
         f"{current_account_quota_summary(accounts, current, window_scope)}"

@@ -85,6 +85,7 @@ def compact_account(account: dict[str, Any], observed_ts: int) -> dict[str, Any]
         return item
 
     item["ok"] = account.get("allowed")
+    item["credits"] = account.get("credits")
 
     q: dict[str, list[Any]] = {}
     for key in ("5h", "7d"):

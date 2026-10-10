@@ -6,7 +6,7 @@ import time
 from typing import Any
 
 from quota import check_codex_quota as quota
-from quota.plans import account_plan_key, account_quota_multiplier
+from quota.plans import AccountPlan, account_plan_key, account_quota_multiplier
 from core.constants import *
 from core.i18n import t
 from ui.terminal_text import *
@@ -43,21 +43,8 @@ def account_email(account: dict[str, Any], hidden: bool = False) -> str:
 
 
 def account_plan(account: dict[str, Any]) -> str:
-    plan = account_plan_key(account)
-    names = {
-        "plus": "Plus",
-        "chatgptplus": "Plus",
-        "pro": "Pro(20x)",
-        "pro-5x": "Pro(5x)",
-        "pro_5x": "Pro(5x)",
-        "pro5x": "Pro(5x)",
-        "chatgptprolite": "Pro(5x)",
-        "pro-20x": "Pro(20x)",
-        "pro_20x": "Pro(20x)",
-        "pro20x": "Pro(20x)",
-        "chatgptpro": "Pro(20x)",
-    }
-    return names.get(plan, str(account.get("plan_type") or account.get("plan") or "-"))
+    plan = AccountPlan.from_key(account_plan_key(account))
+    return plan.label if plan else str(account.get("plan_type") or account.get("plan") or "-")
 
 
 def account_lifetime_tokens(account: dict[str, Any]) -> int | None:
@@ -266,8 +253,8 @@ def merged_plan_text(accounts: list[dict[str, Any]]) -> str:
         counts[plan] = counts.get(plan, 0) + 1
     if not counts:
         return "-"
-    order = {"Plus": 0, "Pro(5x)": 1, "Pro(20x)": 2}
-    plans = sorted(counts.items(), key=lambda item: (order.get(item[0], 3), item[0]))
+    order = {plan.label: i for i, plan in enumerate(AccountPlan)}
+    plans = sorted(counts.items(), key=lambda item: (order.get(item[0], len(order)), item[0]))
     return " / ".join(f"{plan} x{count}" for plan, count in plans)
 
 

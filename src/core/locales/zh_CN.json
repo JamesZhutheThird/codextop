@@ -232,6 +232,7 @@
   "account.email": "账号邮箱",
   "account.type": "账号类型",
   "account.current": "当前账号",
+  "quota.credit_balance": "额度点数",
   "section.reset_credits": "重置次数",
   "section.current_quota": "当前额度",
   "section.quota_history": "额度历史",
@@ -384,6 +385,8 @@
   "auth.delete_confirmation_mismatch": "确认内容与 {provider} 不完全一致；未删除任何内容",
   "auth.provider_deleted": "已删除 provider【{provider}】及其 auth 备份",
   "auth.arg.description": "管理 CodexTOP auth 槽位、provider 状态和切换。",
+  "auth.arg.force": "修改 provider 或凭证前，先正常关闭运行中的 Codex 进程。",
+  "auth.force_requires_switch": "-f/--force 需要配合 provider 操作或 --kill。",
   "auth.arg.json": "输出 JSON。",
   "auth.arg.new": "通过 Codex device auth 添加 provider。",
   "auth.arg.refresh": "刷新已有 provider；未指定时使用当前 provider。",
@@ -391,7 +394,7 @@
   "auth.arg.command": "current、list、sync、switch 或旧版 provider 目标。",
   "auth.arg.target": "switch 的目标 provider，或旧版切换值。",
   "auth.new_conflict": "--new 不能和其他命令同时使用",
-  "auth.action_conflict": "--new、--refresh、--delete 和 --rename 不能彼此组合，也不能和其他命令同时使用",
+  "auth.action_conflict": "--new、--refresh、--delete、--rename 和 --kill 不能彼此组合，也不能和其他命令同时使用",
   "auth.missing_switch_target": "缺少 switch 目标",
   "auth.unexpected_argument": "多余参数：{argument}",
 
@@ -427,5 +430,16 @@
   "update.arg.allow_dirty": "允许在工作树有改动时更新，请谨慎使用。",
   "update.arg.allow_non_github": "允许非 GitHub remote，用于本地测试。",
   "update.arg.json": "输出机器可读的 JSON。",
-  "update.failed": "CodexTOP 更新失败：{error}"
+  "update.failed": "CodexTOP 更新失败：{error}",
+  "auth.arg.kill": "关闭当前用户的全部 Codex 进程；优先使用原生 daemon stop 命令。",
+  "auth.codex_stopped": "当前用户的全部 Codex 进程已关闭。",
+  "auth.arg.transfer": "迁移 session provider 标记；默认最近 1h。",
+  "auth.arg.duration": "迁移范围：all、Nh 或 Nd（默认 1h）；需配合 --transfer。",
+  "auth.arg.session": "通过完整 UUID 迁移指定 session；需配合 --transfer。",
+  "auth.transfer_required": "-d/--duration 和 -s/--session 需要配合 --transfer。",
+  "auth.transfer_selector_invalid": "请用 -d 指定 all/Nh/Nd，或用 -s 指定 session UUID。",
+  "auth.sessions_conflict": "--transfer 需要配合 provider 操作，或单独迁移 session。",
+  "auth.sessions_no_provider": "当前未配置 Codex model provider。",
+  "auth.sessions_updated": "已将 {count} 个 session 的 provider 标记更新为 {provider}。",
+  "auth.sessions_backup": "原 session 元数据备份：{path}"
 }

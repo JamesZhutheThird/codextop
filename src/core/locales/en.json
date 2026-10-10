@@ -232,6 +232,7 @@
   "account.email": "Account email",
   "account.type": "Account type",
   "account.current": "Current account",
+  "quota.credit_balance": "Credits",
   "section.reset_credits": "Reset credits",
   "section.current_quota": "Current quota",
   "section.quota_history": "Quota history",
@@ -384,6 +385,8 @@
   "auth.delete_confirmation_mismatch": "confirmation did not exactly match {provider}; nothing was deleted",
   "auth.provider_deleted": "Deleted provider [{provider}] and its auth backups",
   "auth.arg.description": "Manage CodexTOP auth slots, provider state, and provider switching.",
+  "auth.arg.force": "Stop running Codex processes before changing providers or credentials.",
+  "auth.force_requires_switch": "-f/--force requires a provider operation or --kill.",
   "auth.arg.json": "Print JSON output.",
   "auth.arg.new": "Add a provider with Codex device authentication.",
   "auth.arg.refresh": "Refresh an existing provider; defaults to the current provider.",
@@ -391,7 +394,7 @@
   "auth.arg.command": "current, list, sync, switch, or legacy provider target.",
   "auth.arg.target": "Target provider for `switch`, or legacy switch value.",
   "auth.new_conflict": "--new cannot be combined with another command",
-  "auth.action_conflict": "--new, --refresh, --delete, and --rename cannot be combined with each other or another command",
+  "auth.action_conflict": "--new, --refresh, --delete, --rename, and --kill cannot be combined with each other or another command",
   "auth.missing_switch_target": "missing switch target",
   "auth.unexpected_argument": "unexpected extra argument: {argument}",
 
@@ -427,5 +430,16 @@
   "update.arg.allow_dirty": "Allow update with a dirty worktree. Use with care.",
   "update.arg.allow_non_github": "Allow a non-GitHub remote for local testing.",
   "update.arg.json": "Print machine-readable JSON.",
-  "update.failed": "CodexTOP update failed: {error}"
+  "update.failed": "CodexTOP update failed: {error}",
+  "auth.arg.kill": "Stop all Codex processes owned by the current user; prefer the native daemon stop command.",
+  "auth.codex_stopped": "All Codex processes owned by the current user have stopped.",
+  "auth.arg.transfer": "Migrate session provider markers; defaults to the last 1h.",
+  "auth.arg.duration": "Transfer scope: all, Nh, or Nd (default: 1h); requires --transfer.",
+  "auth.arg.session": "Transfer one session by full UUID; requires --transfer.",
+  "auth.transfer_required": "-d/--duration and -s/--session require --transfer.",
+  "auth.transfer_selector_invalid": "Use -d for all/Nh/Nd, or -s for a session UUID.",
+  "auth.sessions_conflict": "--transfer requires a provider operation or standalone session migration.",
+  "auth.sessions_no_provider": "No current Codex model provider is configured.",
+  "auth.sessions_updated": "Updated {count} session provider markers to {provider}.",
+  "auth.sessions_backup": "Original session metadata backup: {path}"
 }
